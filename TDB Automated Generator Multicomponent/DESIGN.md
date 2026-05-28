@@ -204,7 +204,144 @@ larger and `C(pool, k)` explodes. **Replacement strategy:**
 3. Accept the lowest-complexity model whose max |error| ≤ cutoff (parsimony /
    AIC-like preference), subject to the overfit guard.
 
-This turns an exponential search into a small, ordered ladder per phase.
+This turns an exponential search into a small, ordered ladder per phase. The
+ladder is a **deterministic parsimony heuristic**. Its uncertainty-aware
+Bayesian upgrade is Section 6a, which is the **recommended path** for
+multicomponent; the ladder is kept as a fallback for tiny configuration
+grids (small binaries) where fitting a surrogate costs more than brute force.
+
+## 6a. Feasibility-first active-learning search (recommended Stage-1 strategy)
+
+The deterministic complexity ladder is a parsimony heuristic. Its
+**uncertainty-aware Bayesian** analogue — *constraint-satisfaction active
+learning (CS-AL)* — scales better when the configuration space is large and
+matches recent practice in alloy design (Maguire et al., *Good Enough is
+Better: Feasibility vs. Pareto-Optimality in Alloy Design*, arXiv:2510.20125,
+2025). The framing fits our problem cleanly: the goal isn't to enumerate every
+acceptable fit, but to find a small handful as fast as possible — i.e. minimize
+**Time-to-First-Feasible (TTFF)**.
+
+### 6a.1 Constraints and stage-gates
+
+A Stage-1 configuration must satisfy:
+
+| Constraint | Type | Cost to evaluate |
+|---|---|---|
+| c1: `sqs2tdb -fit` returns rc=0 and emits a TDB | binary | **expensive** (run the fit) |
+| c2: `max\|E_err\| ≤ E_cut` in `fit_energy.out` | continuous → threshold | expensive |
+| c3: `max\|svib_err\| ≤ S_cut` (Stage 2 only) | continuous → threshold | expensive |
+| c4: `n_data > n_params` (overfit guard) | binary | **cheap** (combinatorial) |
+| c5: endmember svib included when svib considered | binary | cheap |
+
+**Stage-gate the cheap constraints first** — the paper's "is it BCC?" gate
+analogue. c4 and c5 are deterministic; apply them as hard pre-filters before
+any GPC query. Never propose a configuration that fails them. The surrogate
+machinery is only needed for c1–c3.
+
+### 6a.2 Surrogate models
+
+- **c1 (categorical):** Gaussian Process Classifier with logistic link
+  (§2.3 of the paper). Outputs `p₁(x) = P(fit succeeds | x)`.
+- **c2, c3 (continuous-thresholded):** GP regressor on **log-error**,
+  converted to feasibility probability via the Gaussian CDF (§2.4):
+  `p_c(x) = Φ((log T_c − μ_c(x)) / σ_c(x))`. The log transform stabilizes the
+  heavy-tailed error distribution.
+
+Joint feasibility under conditional independence (§2.5):
+`PoF(x) = p₁(x) · p₂(x) · p₃(x)`.
+
+### 6a.3 Configuration encoding
+
+Each candidate is summarized by an interpretable feature vector (one of the
+two practical encodings the paper validates — ARD-RBF over hand-engineered
+features). For Route B (per binary edge):
+
+| Feature | Why it matters |
+|---|---|
+| `n_sqs` (subset size including endmembers) | data volume |
+| `n_params` (computed from `terms.in`) | model capacity |
+| `dof = n_data − n_params` | direct overfit margin |
+| `comp_range` = `max(x_A) − min(x_A)` over the subset | composition coverage |
+| `comp_var` (variance of `x_A` over the subset) | uniformity of coverage |
+| `terms_order_binary` (RK degree for `2,L`) | binary flexibility |
+| `terms_order_ternary` (RK degree for `3,L`; 0 if absent) | ternary flexibility |
+| `n_svib_used` | svib data availability |
+| `has_endmember_svib` (0/1) | c5 status |
+
+Use an ARD-RBF kernel (§2.2) over these features so the GPs learn per-feature
+length-scales from the data.
+
+### 6a.4 Informative prior means (where the paper's biggest win lives)
+
+The paper's headline result is that **physics-based prior means halve TTFF**
+(8 → 4 iterations). We have priors we can write down without any data:
+
+- **c1 latent mean** ↑ with `dof` (positive) — fits with comfortable degrees
+  of freedom rarely crash `sqs2tdb`.
+- **c2 latent mean (log-error)** ↓ with `dof` and `comp_range` (more data /
+  wider coverage → lower error), ↑ with `terms_order` at fixed `dof`
+  (more params at fixed data → noisier fit).
+- **c3 latent mean** same shape as c2, scaled to svib-error magnitudes.
+
+Encode as additive linear-in-features priors,
+`m(x) = β₀ + Σ βᵢ φᵢ(x)`, with signs fixed by physics and magnitudes
+calibrated from a handful of warm-start queries. This matches the paper's
+"Maresca–Curtin / Pugh-ratio prior" approach (§2.10), mapped to our domain.
+
+### 6a.5 Acquisition and loop
+
+Acquisition function (paper §2.8): `a(x) = PoF(x)` — no separate exploration
+term, justified the same way the paper does when feasibility is rare.
+
+```
+warm-start: query a small, physics-stratified set of configurations
+            (one per (n_sqs, terms_order) cell)
+loop until N_feasible survivors collected OR budget exhausted:
+    1. enumerate configurations that pass cheap gates c4, c5
+    2. compute PoF(x) for each from current GPCs
+    3. x* = argmax PoF(x)
+    4. run sqs2tdb -fit on x*; observe (c1, max|E_err|, max|svib_err|)
+    5. update all GPCs
+    6. if x* satisfies c1..c3 → add to survivor list
+report: survivors (feed Stage 3) + TTFF + final PoF map
+```
+
+**Stopping rule:** `--n-feasible k` (default 5–10) per phase, with `--max-fits`
+as a hard budget guard. The paper's pure TTFF corresponds to `k=1`; we need a
+few survivors to seed Stage-3 cross-phase combination.
+
+### 6a.6 Caveats and when not to use CS-AL
+
+- **Conditional independence is shakier here than in the alloy case.** c1, c2,
+  and the overfit risk all couple to the same underlying axis (model capacity
+  vs data volume). The paper flags the same caveat for correlated constraints
+  (§2.5); validate calibration on the binary regression case (Section 12)
+  before trusting CS-AL in ternary.
+- **Warm-start matters.** A bad init kills the early iterations (paper §3.1).
+  Use a small physics-stratified seed, not a random one.
+- **Surrogate overhead.** Fitting GPCs costs seconds per iteration. Only
+  worthwhile when the configuration grid is at least ~hundreds of candidates.
+  **Use deterministic ladder (Section 6) for small binaries; CS-AL for
+  ternary+.** The pipeline should auto-select based on grid size
+  (`--search-strategy {auto,ladder,csal}`).
+- **Discrete subset features.** If subset *identity* (not summary features)
+  dominates fit outcomes, switch to a set/intersection kernel. Out of scope
+  for P2; revisit if engineered features prove insufficient.
+
+### 6a.7 Stage 3 hybrid CS → MOO
+
+The paper explicitly recommends a hybrid in §4: CS to enter the feasible
+region, then optimization to refine within it. We apply it to combo scoring
+(Section 9):
+
+1. **CS phase:** treat `base_score ≥ T_base` AND `boundary_penalty ≤ T_bp`
+   as constraints; find the first `k` feasible combos via `a(x) = PoF(x)`.
+2. **MOO refinement:** within that feasible set, run a small **pEHVI** loop
+   (paper §2.9) over the two objectives (`base_score`, `1 − boundary_penalty`)
+   to identify the best feasible combo for the user.
+
+This avoids scoring every combo when survivor counts blow up the Cartesian
+product.
 
 ## 7. SQS discovery in the simplex (`discover_sqs` generalization)
 
@@ -237,8 +374,10 @@ The hard part: a ternary equilibrium grid is 2-D in composition, quaternary 3-D.
   for a full 2-D grid this is a boundary-curve distance (expensive) — prefer the
   isopleth route first.
 - **Reference equilibrium:** keep the just-fixed "compute once, reuse" pattern.
-- **Combinatorics of cross-phase combos** is unchanged (Cartesian product of
-  per-phase survivors); `--max-combos` sampling still applies.
+- **Combinatorics of cross-phase combos** is unchanged in principle (Cartesian
+  product of per-phase survivors); apply `--max-combos` sampling, or — for
+  large survivor counts — switch to the **CS → MOO hybrid** of Section 6a.7
+  to avoid scoring the whole product.
 - **Independent validation:** optionally cross-check the winning TDB's phase
   diagram against ATAT `emc2`/`phb` for the same system.
 
@@ -250,11 +389,12 @@ The hard part: a ternary equilibrium grid is 2-D in composition, quaternary 3-D.
 | Binary subsystems | 1 | C(N,2) |
 | Ternary subsystems | 0 | C(N,3) |
 | `n_params` | order+3 | K + ΣC(K,r)(Lr+1) |
-| Stage-1 search | subsets × 3 | **complexity ladder** (Section 6) |
+| Stage-1 search | subsets × 3 (brute) | **CS-AL** (Section 6a), ladder fallback |
 
-Mitigations: subsystem decomposition (Route B), escalating-complexity search,
-`-ew` weighting instead of subset pruning, `--max-combos` sampling, and
-parsimony selection.
+Mitigations: subsystem decomposition (Route B), CS-AL with informative priors
+(Section 6a), the deterministic complexity ladder as fallback, `-ew` weighting
+instead of subset pruning, `--max-combos` sampling, and the Stage-3 CS → MOO
+hybrid (Section 6a.7).
 
 ## 11. Proposed file layout (this directory)
 
@@ -262,11 +402,16 @@ parsimony selection.
 TDB Automated Generator Multicomponent/
   DESIGN.md                       # this document
   select_endmembers_mc.py         # Stage 0  (N corners + subsystem map)
-  sqs2tdb_pipeline_mc.py          # Stage 1/2 (complexity ladder, N-element terms.in)
-  score_tdb_combinations_mc.py    # Stage 3  (isopleth/section scoring)
+  sqs2tdb_pipeline_mc.py          # Stage 1/2 (orchestrator: ladder OR csal)
+  csal_search.py                  # Stage 1 CS-AL: GPC/GPR + PoF acquisition (Section 6a)
+  score_tdb_combinations_mc.py    # Stage 3  (isopleth scoring + CS→MOO hybrid)
   subsystems.py                   # shared: enumerate binaries/ternaries, parse N-comp
   README.md
 ```
+
+Surrogates use `scikit-learn` (GPC/GPR with ARD-RBF) for P2.5 — adequate for our
+~10² feature dim and config-grid sizes. If we later need batched/pEHVI
+properly, swap in `botorch`/`gpytorch`.
 
 Shared, phase-agnostic helpers (`robust_copytree`, `find_svib_ht`,
 `element_case`, fit-file parsing) should be lifted into `subsystems.py` (or a
@@ -300,7 +445,31 @@ so logic isn't duplicated. The binary scripts stay where they are; we only
 - **P1:** `subsystems.py` + `select_endmembers_mc.py` (N corners, subsystem map,
   `system.yaml`). Pure parsing/IO — testable without DFT.
 - **P2:** `sqs2tdb_pipeline_mc.py` Route B (orchestrate binary pipeline per edge)
-  + generalized `terms.in`/param-count + complexity ladder.
+  + generalized `terms.in`/param-count + **deterministic complexity ladder**
+  (Section 6) as the baseline strategy.
+- **P2.5:** **CS-AL search layer** (Section 6a) — GPC/GPR surrogates over the
+  configuration features, informative priors, `a(x) = PoF(x)` loop, `--n-feasible`
+  stopping rule, `--search-strategy {auto,ladder,csal}` switch. Validate
+  calibration against P2 ladder outputs on the binary regression case before
+  enabling by default for ternary.
 - **P3:** ternary-term fitting (interior SQS) and `--full-simplex` Route A.
-- **P4:** `score_tdb_combinations_mc.py` isopleth scoring + `emc2`/`phb` check.
+- **P4:** `score_tdb_combinations_mc.py` isopleth scoring + CS → MOO hybrid
+  (Section 6a.7) + `emc2`/`phb` check.
 - **P5:** Co-Cr-Ni validation, docs, regression test vs binary pipeline.
+
+---
+
+## References
+
+1. Maguire, Hardcastle, Hastings, Arróyave, Vela. *Good Enough is Better:
+   Feasibility vs. Pareto-Optimality in Alloy Design.* arXiv:2510.20125v1
+   (2025). — Constraint-satisfaction vs. multi-objective optimization for
+   alloy design; TTFF metric; informative-prior GPCs; the §4 hybrid
+   CS → MOO recommendation underlying Sections 6a and 6a.7.
+2. Hardcastle, O'Mullan, Arróyave, Vela. *Physics-informed Gaussian process
+   classification for constraint-aware alloy design.* Digital Discovery (2025).
+   — Method details for informative-prior GPCs used here.
+3. Hickman, Tom, Zou, Aldeghi, Aspuru-Guzik. *ANUBIS: Bayesian optimization
+   with unknown feasibility constraints for scientific experimentation.*
+   Digital Discovery (2025). — Alternative joint feasibility/objective BO
+   formulation referenced by Maguire et al.
