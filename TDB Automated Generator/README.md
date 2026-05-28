@@ -188,3 +188,8 @@ tail -f pipeline_Co-Cr_*.log   # live progress while the job runs
 To run for a different binary, copy the file (e.g.
 `cp submit_CoCr.pbs submit_FeNi.pbs`) and edit the USER CONFIG block —
 nothing below that block should need to change.
+
+For a brand-new binary with no Co-Cr defaults to overwrite, use
+`submit_template.pbs` instead. Every value in its USER CONFIG block is
+prefixed `TODO_`; the script bails out at submit time if any placeholder
+is still present, so you can't accidentally submit a half-edited job.
