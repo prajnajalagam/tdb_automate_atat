@@ -126,7 +126,7 @@ def boundary_misplacement_penalty(
 
 def score_tdb(
     test_tdb_path: str,
-    ref_db: Database,
+    NP_ref,
     comps: List[str],
     phases: List[str],
     conds: dict,
@@ -136,8 +136,12 @@ def score_tdb(
     boundary_power: float = 1.0,
 ) -> dict:
     """
-    Score a test TDB against a reference database.
+    Score a test TDB against a precomputed reference phase-fraction array.
     Returns dict with base_score, boundary_penalty, final_score.
+
+    NP_ref is the reference equilibrium phase-fraction DataArray, computed
+    once by the caller and reused across all combinations (it is identical
+    for every test TDB).
     """
     try:
         test_db = Database(test_tdb_path)
@@ -146,11 +150,7 @@ def score_tdb(
 
     try:
         test_eq = equilibrium(test_db, comps, phases, conds, output="NP")
-        # ref_eq is computed once externally and passed via ref_db
-        ref_eq = equilibrium(ref_db, comps, phases, conds, output="NP")
-
         NP_test = build_phase_fraction_array(test_eq, phases, P)
-        NP_ref = build_phase_fraction_array(ref_eq, phases, P)
 
         # Base score: L1 distance
         l1 = np.abs(NP_test - NP_ref).sum("phase")
@@ -252,7 +252,7 @@ def evaluate_combo(
     combo_id: int,
     phase_tdb_paths: Dict[str, str],
     work_root: Path,
-    ref_tdb_path: str,
+    NP_ref,
     comps: List[str],
     phases: List[str],
     conds: dict,
@@ -262,7 +262,7 @@ def evaluate_combo(
     boundary_weight: float,
     boundary_power: float,
 ) -> ComboResult:
-    """Combine per-phase TDBs, score against reference."""
+    """Combine per-phase TDBs, score against the precomputed reference."""
 
     combo_dir = work_root / f"combo_{combo_id:06d}"
 
@@ -274,9 +274,8 @@ def evaluate_combo(
                 combined_tdb=None, base_score=0.0, boundary_penalty=1.0,
                 final_score=0.0, error="sqs2tdb -tdb failed")
 
-        ref_db = Database(ref_tdb_path)
         result = score_tdb(
-            str(combined), ref_db, comps, phases, conds,
+            str(combined), NP_ref, comps, phases, conds,
             P=P, stable_tol=stable_tol,
             boundary_weight=boundary_weight,
             boundary_power=boundary_power)
@@ -395,6 +394,18 @@ def main():
     print(f"  Workers: {args.n_workers}")
     print(f"{'='*70}\n")
 
+    # ── Reference equilibrium (computed ONCE, reused for every combo) ─
+    # The reference is identical across all combinations, so computing it
+    # per-combo wastes one full pycalphad equilibrium call per candidate.
+    print("  Computing reference equilibrium (once)...")
+    try:
+        ref_db = Database(args.ref_tdb)
+        ref_eq = equilibrium(ref_db, comps, eq_phases, conds, output="NP")
+        NP_ref = build_phase_fraction_array(ref_eq, eq_phases, args.P)
+    except Exception as exc:
+        sys.exit(f"  ERROR: reference equilibrium failed: {exc}")
+    print("  Reference equilibrium ready.\n")
+
     # ── Run scoring ──────────────────────────────────────────────
     results: List[ComboResult] = []
     t0 = time.time()
@@ -413,7 +424,7 @@ def main():
         for cid, combo in enumerate(all_combos):
             ptdbs = dict(zip(phases_ordered, combo))
             r = evaluate_combo(
-                cid, ptdbs, work_root, args.ref_tdb,
+                cid, ptdbs, work_root, NP_ref,
                 comps, eq_phases, conds, el1, el2,
                 args.P, args.stable_tol,
                 args.boundary_weight, args.boundary_power)
@@ -433,7 +444,7 @@ def main():
                 ptdbs = dict(zip(phases_ordered, combo))
                 fut = pool.submit(
                     evaluate_combo,
-                    cid, ptdbs, work_root, args.ref_tdb,
+                    cid, ptdbs, work_root, NP_ref,
                     comps, eq_phases, conds, el1, el2,
                     args.P, args.stable_tol,
                     args.boundary_weight, args.boundary_power)

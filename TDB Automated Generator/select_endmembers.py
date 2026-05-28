@@ -24,10 +24,12 @@ from typing import Optional, Dict, Tuple, List
 PHASE_TOKENS = {
     "FCC_A1":    ["FCC_A1", "FCC"],
     "BCC_A2":    ["BCC_A2", "BCC"],
-    "HCP_A3":    ["HCP_A3", "HCP"]
+    "HCP_A3":    ["HCP_A3", "HCP"],
+    "SIGMA_D8B": ["SIGMA_D8B", "SIGMA"],
     }
 
 # SIGMA sublattice multiplicities (from rndstr.skel: aj=10, g=4, ii=16)
+SIGMA_SUBLATTICE_MULT = {"aj": 10, "g": 4, "ii": 16}
 
 # Wyckoff site used for the single-sublattice phases
 SITE_FOR_PHASE = {
@@ -39,6 +41,11 @@ SITE_FOR_PHASE = {
 
 _SCI_FLOAT_RE = re.compile(
     r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eEdD][-+]?\d+)?")
+
+# sqs2tdb -cp has emitted both "sqs_lev=N_..." and "sqsdb_lev=N_..." across
+# ATAT versions; accept either prefix so the scan doesn't silently find zero.
+SQS_DIR_RE = re.compile(r"sqs(?:db)?_lev=(\d+)")
+SQS_PREFIX_RE = re.compile(r"^sqs(?:db)?_lev=\d+_")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -107,13 +114,13 @@ def parse_sqs_name(name: str, phase: str, elA: str, elB: str):
     """
     elA, elB = elA.upper(), elB.upper()
 
-    m = re.search(r"sqs_lev=(\d+)", name)
+    m = SQS_DIR_RE.match(name)
     if not m:
         return None
     lev = int(m.group(1))
 
     # Strip prefix to get the composition tokens
-    comp_str = re.sub(r"^sqs_lev=\d+_", "", name)
+    comp_str = SQS_PREFIX_RE.sub("", name)
     # Parse all site_Element=value tokens
     tokens = re.findall(r"([a-z]+)_([A-Za-z]+)=([0-9.]+)", comp_str)
     if not tokens:
@@ -159,7 +166,7 @@ def sigma_config_key(name: str) -> str:
     Two directories with the same occupation pattern are duplicates.
     e.g. sqs_lev=0_aj_Co=1,g_Co=1,ii_Cr=1 → "aj_Co=1,g_Co=1,ii_Cr=1"
     """
-    return re.sub(r"^sqs_lev=\d+_", "", name)
+    return SQS_PREFIX_RE.sub("", name)
 
 
 def sigma_pick_best(cands: list) -> Tuple:
@@ -216,7 +223,7 @@ def main():
             except ValueError:
                 continue
 
-            if "sqs_lev=0" not in p.name:
+            if not SQS_DIR_RE.match(p.name):
                 continue
 
             phase = infer_phase(p)
