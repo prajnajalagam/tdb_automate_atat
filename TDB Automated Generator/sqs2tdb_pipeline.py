@@ -82,6 +82,11 @@ PHASE_TOKENS = {
     "SIGMA_D8B": ["SIGMA_D8B", "SIGMA"],
 }
 
+# sqs2tdb -cp has emitted both "sqs_lev=N_..." and "sqsdb_lev=N_..." across
+# ATAT versions; accept either prefix so discovery doesn't silently find zero.
+SQS_DIR_RE = re.compile(r"sqs(?:db)?_lev=(\d+)")
+SQS_PREFIX_RE = re.compile(r"^sqs(?:db)?_lev=\d+_")
+
 
 # ====================================================================
 # Data classes
@@ -125,6 +130,7 @@ class FitResult:
     task_id: int
     stage: int
     terms: str
+    terms_order: int
     n_sqs: int
     sqs_names: List[str]
     endmember_svib: bool
@@ -255,14 +261,11 @@ def discover_sqs(data_roots: List[Path], phase: str,
         # Walk looking for sqs_lev=N directories under phase dirs
         for dirpath, dirnames, _ in os.walk(root):
             p = Path(dirpath)
-            if not p.name.startswith("sqs_lev="):
+            m = SQS_DIR_RE.match(p.name)
+            if not m:
                 continue
             if infer_phase(p) != phase:
                 skip("wrong_phase")
-                continue
-
-            m = re.search(r"sqs_lev=(\d+)", p.name)
-            if not m:
                 continue
             lev = int(m.group(1))
             if lev == 0:
@@ -276,7 +279,7 @@ def discover_sqs(data_roots: List[Path], phase: str,
                 continue
 
             # Parse composition from directory name
-            comp_str = re.sub(r"^sqs_lev=\d+_", "", p.name)
+            comp_str = SQS_PREFIX_RE.sub("", p.name)
             tokens = re.findall(r"([a-z]+)_([A-Za-z]+)=([0-9.]+)", comp_str)
             if not tokens:
                 skip("unparseable_name")
@@ -480,6 +483,7 @@ def do_one_fit(task: FitTask) -> FitResult:
         shutil.rmtree(fit_dir, ignore_errors=True)
         return FitResult(
             phase=phase, task_id=tid, stage=task.stage, terms=terms_str,
+            terms_order=task.terms_order,
             n_sqs=len(task.sqs_list),
             sqs_names=[s.name for s in task.sqs_list],
             endmember_svib=task.endmember_svib,
@@ -558,6 +562,7 @@ def do_one_fit(task: FitTask) -> FitResult:
 
         return FitResult(
             phase=phase, task_id=tid, stage=task.stage, terms=terms_str,
+            terms_order=task.terms_order,
             n_sqs=len(task.sqs_list),
             sqs_names=[s.name for s in task.sqs_list],
             endmember_svib=task.endmember_svib,
@@ -673,9 +678,7 @@ def gen_stage2_tasks(
                 tasks.append(FitTask(
                     phase=phase, task_id=tid, work_root=work_root,
                     endmembers=endmembers, sqs_list=combo,
-                    terms_order=win.terms[1] if isinstance(win.terms, tuple)
-                                else int(win.terms.split("2,")[-1][0])
-                                if "2," in win.terms else 0,
+                    terms_order=win.terms_order,
                     svib_include={s.name for s in svib_sub},
                     endmember_svib=True,
                     el1=el1, el2=el2,
