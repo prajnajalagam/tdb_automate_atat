@@ -128,10 +128,17 @@ def parse_sqs_name(name: str, phase: str, elA: str, elB: str):
 
     if phase in ("FCC_A1", "BCC_A2", "HCP_A3"):
         expected_site = SITE_FOR_PHASE[phase]
+        allowed = {elA, elB}
         comp = {}
         for site, elem, val in tokens:
-            if site == expected_site:
-                comp[elem.upper()] = float(val)
+            if site != expected_site:
+                continue
+            e = elem.upper()
+            if e not in allowed:
+                # Foreign element on the mixing sublattice — reject so
+                # data roots from other binaries (e.g. Co-Ni) don't leak in.
+                return None
+            comp[e] = float(val)
         xA = comp.get(elA, 0.0)
         xB = comp.get(elB, 0.0)
         total = xA + xB
@@ -140,6 +147,17 @@ def parse_sqs_name(name: str, phase: str, elA: str, elB: str):
         return lev, xA / total, xB / total
 
     if phase == "SIGMA_D8B":
+        # Every SIGMA sublattice must be occupied by elA or elB only;
+        # otherwise this is not a binary A-B endmember. Without this check,
+        # configs like aj_Co=1,g_Cr=1,ii_Ni=1 silently leak in from data
+        # roots containing other systems (Ni's weight is dropped and the
+        # remaining Co/Cr fraction is renormalized to look binary).
+        allowed = {elA, elB}
+        for site, elem, val in tokens:
+            if site not in SIGMA_SUBLATTICE_MULT:
+                continue
+            if elem.upper() not in allowed:
+                return None
         # Weight each site occupation by multiplicity
         xA = 0.0
         xB = 0.0
