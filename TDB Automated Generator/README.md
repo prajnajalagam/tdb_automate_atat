@@ -172,3 +172,19 @@ python score_tdb_combinations.py \
 
 For the N-component (ternary+) extension, see
 `../TDB Automated Generator Multicomponent/DESIGN.md`.
+
+## HPC submission
+
+`submit_CoCr.pbs` is a ready-to-submit PBS script that runs Steps 2 and 3
+end-to-end on a 128-core Milan/AIT node (24 h walltime, queue `long`,
+group `a1485`). All paths, cutoffs, and parallelism settings live in a
+clearly delineated **USER CONFIG** block at the top of the file.
+
+```bash
+qsub submit_CoCr.pbs
+tail -f pipeline_Co-Cr_*.log   # live progress while the job runs
+```
+
+To run for a different binary, copy the file (e.g.
+`cp submit_CoCr.pbs submit_FeNi.pbs`) and edit the USER CONFIG block —
+nothing below that block should need to change.
