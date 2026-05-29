@@ -187,13 +187,23 @@ def sigma_config_key(name: str) -> str:
     return SQS_PREFIX_RE.sub("", name)
 
 
+def _sigma_sort_key(t):
+    """
+    Sort key for SIGMA candidates of the same occupation: prefer has-svib,
+    then lowest energy, then shortest path. Works with either
+    (path, energy, svib_path) or (path, energy, svib_path, xA, xB) tuples.
+    """
+    p, e, sv = t[0], t[1], t[2]
+    return (
+        0 if sv else 1,
+        e if e is not None else float("inf"),
+        len(str(p)),
+    )
+
+
 def sigma_pick_best(cands: list) -> Tuple:
-    """Pick best SIGMA candidate: prefer has-svib, then lowest energy, then shortest path."""
-    def key(t):
-        path, energy, svib_path = t
-        e = energy if energy is not None else float("inf")
-        return (0 if svib_path else 1, e, len(str(path)))
-    return sorted(cands, key=key)[0]
+    """Pick best SIGMA candidate (see _sigma_sort_key)."""
+    return sorted(cands, key=_sigma_sort_key)[0]
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -208,6 +218,10 @@ def main():
     ap.add_argument("--scan-depth", type=int, default=6,
                     help="Max os.walk depth (default 6)")
     ap.add_argument("--out", default="endmembers.yaml")
+    ap.add_argument("--auto-sigma", action="store_true",
+                    help="Auto-pick SIGMA candidates per occupation pattern "
+                         "(skip the per-config interactive prompt). Useful "
+                         "for batch scripts; matches the pre-2026 behavior.")
     args = ap.parse_args()
 
     elA, elB = sorted([args.element1.upper(), args.element2.upper()])
@@ -317,27 +331,71 @@ def main():
         print(f"    {elA}: {selections[ph][elA]}")
         print(f"    {elB}: {selections[ph][elB]}")
 
-    # ── SIGMA (auto-deduplicated) ────────────────────────────────
+    # ── SIGMA (per-config interactive selection) ────────────────
+    # Each SIGMA "configuration" is a unique site-occupation pattern (one
+    # corner of the 2^N_sublattices binary endmember set). Multiple data
+    # roots can contain DFT runs of the SAME pattern with different VASP
+    # settings/convergence — they should NOT be silently collapsed; the
+    # user picks which run to use, the same way FCC/BCC/HCP work.
     if sigma_bins:
         print(f"\n{'='*60}")
         print(f"  Phase: SIGMA_D8B  ({len(sigma_bins)} unique configurations)")
         print(f"{'='*60}")
+        if not args.auto_sigma:
+            print(f"  Configs with >1 DFT candidate prompt for a choice;")
+            print(f"  single-candidate configs are auto-selected.")
+            print(f"  Press <Enter> to accept index 0 "
+                  f"(recommended: has-svib, then lowest E).")
+            print(f"  Pass --auto-sigma to skip prompts entirely.")
 
         sigma_selected = []
         for cfg in sorted(sigma_bins.keys()):
-            cands = sigma_bins[cfg]
+            cands = sorted(sigma_bins[cfg], key=_sigma_sort_key)
             xA, xB = cands[0][3], cands[0][4]
-            best_path, best_e, best_sv = sigma_pick_best(
-                [(p, e, sv) for p, e, sv, _, _ in cands])
 
-            e_str = f"{best_e:+.6f}" if best_e is not None else "N/A"
-            sv_str = "YES" if best_sv else "NO"
-            n_dup = len(cands)
-            print(f"  {cfg}")
-            print(f"    x({elA})={xA:.4f}  E={e_str}  svib={sv_str}"
-                  f"  ({n_dup} duplicate{'s' if n_dup>1 else ''})")
-            print(f"    -> {best_path}")
-            sigma_selected.append(str(best_path))
+            if len(cands) == 1 or args.auto_sigma:
+                # Auto-pick: only one candidate, or batch mode.
+                p, e, sv, _, _ = cands[0]
+                e_str = f"{e:+.6f}" if e is not None else "N/A"
+                sv_str = "YES" if sv else "NO"
+                print(f"\n  {cfg}")
+                print(f"    x({elA})={xA:.4f}  E={e_str}  svib={sv_str}")
+                if len(cands) > 1:
+                    print(f"    auto-picked from {len(cands)} candidates "
+                          f"(omit --auto-sigma to choose manually)")
+                print(f"    -> {p}")
+                sigma_selected.append(str(p))
+                continue
+
+            # Interactive: multiple distinct DFT runs of the same pattern.
+            print(f"\n  {cfg}   x({elA})={xA:.4f}   "
+                  f"({len(cands)} candidates)")
+            for i, (p, e, sv, _, _) in enumerate(cands):
+                e_str = f"{e:+.6f}" if e is not None else "N/A"
+                sv_str = "YES" if sv else "NO"
+                tag = "  (default)" if i == 0 else ""
+                print(f"    [{i}] E={e_str}  svib={sv_str}{tag}")
+                print(f"        {p}")
+
+            while True:
+                try:
+                    s = input(f"    Select index [0-{len(cands)-1}] "
+                              f"(default 0): ").strip()
+                except EOFError:
+                    # Piped/non-tty: fall back to default.
+                    s = ""
+                if not s:
+                    sel = 0
+                    break
+                try:
+                    sel = int(s)
+                    if 0 <= sel < len(cands):
+                        break
+                    print(f"    ERROR: index out of range")
+                except ValueError:
+                    print(f"    ERROR: enter an integer")
+
+            sigma_selected.append(str(cands[sel][0]))
 
         if sigma_selected:
             selections["SIGMA_D8B"] = {"ALL": sigma_selected}

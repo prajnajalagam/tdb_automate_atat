@@ -1,0 +1,253 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -N TODO_JOBNAME              # <-- change to e.g. FeNi_sqs2tdb
+#PBS -q long
+#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o sqs2tdb_pbs.log
+#PBS -W group_list=a1485
+
+# ============================================================================
+#  GENERIC binary TDB pipeline submission template (Milan/AIT, 128 cores)
+# ----------------------------------------------------------------------------
+#  Copy this file to e.g. submit_FeNi.pbs and edit every line marked TODO.
+#  Nothing below the USER CONFIG block should normally need changes.
+#
+#  WORKFLOW
+#     0. Run select_endmembers.py interactively to make endmembers.yaml
+#        (see README.md). Submitting this job before that step will fail
+#        the sanity check below.
+#     1. Edit USER CONFIG (and the #PBS -N line above).
+#     2. From the directory containing the Python scripts and this file:
+#           qsub submit_<binary>.pbs
+#     3. Watch progress live:
+#           tail -f pipeline_<A>-<B>_*.log
+# ============================================================================
+
+set -euo pipefail
+
+# ───────────────────────── USER CONFIG (edit me) ────────────────────────────
+# Element pair (used only for the work-dir prefix and log filename).
+ELEMENT_A="TODO_A"                # e.g. "Fe"
+ELEMENT_B="TODO_B"                # e.g. "Ni"
+
+# Endmember YAML produced by select_endmembers.py for this binary.
+ENDMEMBERS_YAML="TODO_PATH/endmembers.yaml"
+
+# Comma-separated data roots containing sqs_lev=* DFT outputs.
+# IMPORTANT: list ONLY directories that belong to this binary. Mixing in
+# roots from other systems can leak foreign-element structures into
+# discovery — the rejection guard catches the obvious cases, but cross-
+# binary roots remain a foot-gun.
+DATA_ROOTS="TODO_PATH/root1,\
+TODO_PATH/root2"
+
+# Where Stage-1/2 work directories will be created.
+# (Pipeline appends _0, _1, ... so re-runs don't clobber.)
+WORKDIR_PREFIX="TODO_PATH/${ELEMENT_A}-${ELEMENT_B}_automate"
+
+# Reference TDB to score against in Stage 3. Leave empty ("") to skip Stage 3.
+REF_TDB=""                        # e.g. "TODO_PATH/reference.tdb"
+
+# Composition element for the Stage-3 X axis (usually one of A/B).
+# Must match sqs2tdb's element-symbol case (upper, e.g. "FE").
+COMP_ELEMENT="TODO_ELEM_UPPER"    # e.g. "FE"
+
+# ── Fitting search range and cutoffs (Stage 1/2) ────────────────────────────
+MIN_SQS=3
+MAX_SQS=7
+ENERGY_CUTOFF=0.10        # eV;  max |error| in fit_energy.out col 5
+SVIB_CUTOFF=10.0          #      max |error| in fit_svib_ht.out col 5
+
+# ── Stage-3 equilibrium conditions ──────────────────────────────────────────
+EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"  # phases to include in the equilibrium calc
+T_RANGE="500,1200,50"             # T_min,T_max,T_step (K)
+X_GRID=0.005
+BOUNDARY_WEIGHT=0.25
+MAX_COMBOS=500                    # cap on cross-phase combos to score
+
+# ── Parallelism ─────────────────────────────────────────────────────────────
+# Stage 1/2: each sqs2tdb -fit is single-threaded; workers ≈ #cores is OK.
+# On a 128-core mil_ait node, 64 is a comfortable default; bump higher
+# if benchmarking shows headroom.
+FIT_WORKERS=64
+
+# Stage 3: keep at 1. pycalphad's equilibrium() uses Cython global state
+# that is NOT safe for ProcessPoolExecutor on most installations.
+SCORE_WORKERS=1
+
+# ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
+VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
+ATAT_BIN="/home7/pjalagam/bin"
+
+# Where the Python scripts live. Defaults to the directory the job was
+# submitted from. Override with an absolute path if you submit elsewhere.
+SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
+
+# ───────────────────────── END USER CONFIG ──────────────────────────────────
+
+
+# ============================================================================
+#  Below this line you should not normally need to edit.
+# ============================================================================
+
+# Bail out early if anything in USER CONFIG was left as a placeholder.
+if [[ "${ELEMENT_A}" == TODO* || "${ELEMENT_B}" == TODO* \
+    || "${ENDMEMBERS_YAML}" == TODO* || "${DATA_ROOTS}" == *TODO* \
+    || "${WORKDIR_PREFIX}" == *TODO* || "${COMP_ELEMENT}" == TODO* ]]; then
+    echo "ERROR: USER CONFIG still contains TODO placeholders. Edit them first." >&2
+    exit 1
+fi
+
+# Turn on command tracing AFTER the placeholder check so the trace doesn't
+# drown the useful header lines.
+set -x
+
+# ── Environment ─────────────────────────────────────────────────────────────
+module purge
+module load python3
+module load gcc
+
+if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "ERROR: venv activate script not found: $VENV_ACTIVATE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$VENV_ACTIVATE"
+
+# ATAT executables on PATH
+export PATH="${ATAT_BIN}:${PATH}"
+
+# Pin per-process BLAS/OpenMP threads so FIT_WORKERS doesn't oversubscribe.
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# ── Workdir & log file ──────────────────────────────────────────────────────
+WORKDIR="${PBS_O_WORKDIR:-$PWD}"
+cd "$WORKDIR"
+
+PIPELINE_LOG="${WORKDIR}/pipeline_${ELEMENT_A}-${ELEMENT_B}_$(date +%Y%m%d_%H%M%S).log"
+
+# ── Sanity checks (fail fast with clear messages) ───────────────────────────
+for f in \
+    "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+    "${SCRIPT_DIR}/score_tdb_combinations.py" \
+    "$ENDMEMBERS_YAML"
+do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: required file not found: $f" >&2
+        exit 1
+    fi
+done
+
+if ! command -v sqs2tdb >/dev/null 2>&1; then
+    echo "ERROR: 'sqs2tdb' not on PATH after loading modules + venv." >&2
+    echo "       Check ATAT_BIN in the USER CONFIG block." >&2
+    exit 1
+fi
+
+# ── Header ──────────────────────────────────────────────────────────────────
+{
+echo "=========================================================="
+echo "  ${ELEMENT_A}-${ELEMENT_B} TDB pipeline submission"
+echo "=========================================================="
+echo "  Job started     : $(date)"
+echo "  Host            : $(hostname)"
+echo "  Node model      : mil_ait (128 cores)"
+echo "  Workdir         : ${WORKDIR}"
+echo "  Script dir      : ${SCRIPT_DIR}"
+echo "  Pipeline log    : ${PIPELINE_LOG}"
+echo "  Python          : $(which python)"
+echo "  sqs2tdb         : $(which sqs2tdb)"
+echo "  Fit workers     : ${FIT_WORKERS}"
+echo "  Score workers   : ${SCORE_WORKERS}"
+echo "  Endmembers YAML : ${ENDMEMBERS_YAML}"
+echo "  Reference TDB   : ${REF_TDB:-<Stage 3 will be skipped>}"
+echo "=========================================================="
+} | tee "${PIPELINE_LOG}"
+
+# ============================================================================
+#  Stages 1 + 2: per-phase fitting
+# ============================================================================
+python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+    --endmembers-yaml "${ENDMEMBERS_YAML}" \
+    --data-roots "${DATA_ROOTS}" \
+    --workdir-prefix "${WORKDIR_PREFIX}" \
+    --min-sqs "${MIN_SQS}" \
+    --max-sqs "${MAX_SQS}" \
+    --energy-cutoff "${ENERGY_CUTOFF}" \
+    --svib-cutoff "${SVIB_CUTOFF}" \
+    --n-workers "${FIT_WORKERS}" \
+    2>&1 | tee -a "${PIPELINE_LOG}"
+
+PIPELINE_RC=${PIPESTATUS[0]}
+
+{
+echo ""
+echo "=========================================================="
+echo "  sqs2tdb_pipeline.py exit code: ${PIPELINE_RC}"
+echo "=========================================================="
+} | tee -a "${PIPELINE_LOG}"
+
+if [ "${PIPELINE_RC}" -ne 0 ]; then
+    echo "ERROR: Stage 1/2 failed. See ${PIPELINE_LOG} and per-phase failures.log" | tee -a "${PIPELINE_LOG}"
+    exit "${PIPELINE_RC}"
+fi
+
+# ── Skip Stage 3 if no reference TDB was supplied ───────────────────────────
+if [ -z "${REF_TDB}" ]; then
+    echo "Stage 3 skipped (REF_TDB unset in USER CONFIG)." | tee -a "${PIPELINE_LOG}"
+    exit 0
+fi
+
+if [ ! -f "${REF_TDB}" ]; then
+    echo "ERROR: Reference TDB not found: ${REF_TDB}" | tee -a "${PIPELINE_LOG}"
+    exit 1
+fi
+
+# ============================================================================
+#  Stage 3: cross-phase combination & scoring
+# ============================================================================
+AUTODIR=$(ls -1td "${WORKDIR_PREFIX}"_* 2>/dev/null | head -1)
+
+if [ -z "${AUTODIR}" ] || [ ! -f "${AUTODIR}/tdb_manifest.json" ]; then
+    echo "ERROR: No tdb_manifest.json found under ${WORKDIR_PREFIX}_*" | tee -a "${PIPELINE_LOG}"
+    exit 1
+fi
+
+{
+echo ""
+echo "=========================================================="
+echo "  Stage 3 — TDB scoring"
+echo "  Manifest : ${AUTODIR}/tdb_manifest.json"
+echo "  Ref TDB  : ${REF_TDB}"
+echo "=========================================================="
+} | tee -a "${PIPELINE_LOG}"
+
+python "${SCRIPT_DIR}/score_tdb_combinations.py" \
+    --manifest "${AUTODIR}/tdb_manifest.json" \
+    --ref-tdb "${REF_TDB}" \
+    --comp-element "${COMP_ELEMENT}" \
+    --eq-phases "${EQ_PHASES}" \
+    --T-range "${T_RANGE}" \
+    --X-grid "${X_GRID}" \
+    --boundary-weight "${BOUNDARY_WEIGHT}" \
+    --n-workers "${SCORE_WORKERS}" \
+    --max-combos "${MAX_COMBOS}" \
+    2>&1 | tee -a "${PIPELINE_LOG}"
+
+SCORE_RC=${PIPESTATUS[0]}
+
+{
+echo ""
+echo "=========================================================="
+echo "  Job finished    : $(date)"
+echo "  Stage 3 rc      : ${SCORE_RC}"
+echo "  Pipeline log    : ${PIPELINE_LOG}"
+echo "  Best TDB lives in : ${AUTODIR}/stage3_scoring/"
+echo "=========================================================="
+} | tee -a "${PIPELINE_LOG}"
+
+exit "${SCORE_RC}"
