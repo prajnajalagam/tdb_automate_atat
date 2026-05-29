@@ -398,12 +398,53 @@ def main():
     # The reference is identical across all combinations, so computing it
     # per-combo wastes one full pycalphad equilibrium call per candidate.
     print("  Computing reference equilibrium (once)...")
-    try:
-        ref_db = Database(args.ref_tdb)
-        ref_eq = equilibrium(ref_db, comps, eq_phases, conds, output="NP")
-        NP_ref = build_phase_fraction_array(ref_eq, eq_phases, args.P)
-    except Exception as exc:
-        sys.exit(f"  ERROR: reference equilibrium failed: {exc}")
+    ref_db = Database(args.ref_tdb)
+
+    def _try_ref_eq(phase_set: List[str]):
+        try:
+            eq = equilibrium(ref_db, comps, phase_set, conds, output="NP")
+            return build_phase_fraction_array(eq, phase_set, args.P)
+        except Exception as exc:
+            return exc
+
+    NP_ref = _try_ref_eq(eq_phases)
+    if isinstance(NP_ref, Exception):
+        first_err = NP_ref
+        print(f"  Initial reference equilibrium failed: {first_err}")
+        print(f"  Retrying with reduced phase subsets...")
+
+        # Try every subset of eq_phases of decreasing size, preferring those
+        # that drop fewer phases. Stops at the first working subset. This
+        # handles TDBs where one phase (often SIGMA) has a sublattice model
+        # that pycalphad cannot construct for the requested comp restriction.
+        working_set: Optional[List[str]] = None
+        for n_keep in range(len(eq_phases) - 1, 0, -1):
+            for subset in itertools.combinations(eq_phases, n_keep):
+                cand = list(subset)
+                result = _try_ref_eq(cand)
+                if not isinstance(result, Exception):
+                    NP_ref = result
+                    working_set = cand
+                    dropped = sorted(set(eq_phases) - set(cand))
+                    print(f"  Succeeded with phases: {cand}")
+                    print(f"  Dropped (incompatible with ref TDB): {dropped}")
+                    break
+            if working_set is not None:
+                break
+
+        if working_set is None:
+            sys.exit(
+                f"  ERROR: reference equilibrium failed for every subset of "
+                f"{eq_phases}.\n"
+                f"  First error was: {first_err}\n"
+                f"  Check the reference TDB and the --eq-phases / "
+                f"--comp-element settings."
+            )
+
+        # Use the working set everywhere downstream — test equilibria must
+        # match the reference's phase coverage for the L1 / boundary metrics
+        # to be meaningful.
+        eq_phases = working_set
     print("  Reference equilibrium ready.\n")
 
     # ── Run scoring ──────────────────────────────────────────────

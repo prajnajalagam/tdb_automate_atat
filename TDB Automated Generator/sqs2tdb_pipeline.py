@@ -207,6 +207,83 @@ def find_svib_ht(d: Path) -> Optional[Path]:
     return None
 
 
+def maybe_rename_energy_off(d: Path) -> bool:
+    """
+    If a directory has `energy.off` but no `energy`, rename energy.off
+    to energy so sqs2tdb can use it. Returns True if a rename happened.
+
+    `energy.off` is the ATAT convention for a "disabled" energy file
+    (manually parked, e.g. because of a suspect DFT run). The user can
+    re-enable everything in one pass with this rename.
+    """
+    energy = d / "energy"
+    energy_off = d / "energy.off"
+    if energy.is_file():
+        return False
+    if not energy_off.is_file():
+        return False
+    try:
+        energy_off.rename(energy)
+        return True
+    except OSError:
+        return False
+
+
+def find_oszicar(d: Path) -> Optional[Path]:
+    """Locate an OSZICAR file in the SQS directory (or under vol_0)."""
+    direct = d / "OSZICAR"
+    if direct.is_file():
+        return direct
+    vol_0 = d / "vol_0"
+    if vol_0.is_dir():
+        for item in vol_0.rglob("OSZICAR"):
+            if item.is_file():
+                return item
+    return None
+
+
+# Lazy-loaded OSZICAR scorer module (sits one directory up).
+_OSZICAR_SCORER = None
+
+
+def _load_oszicar_scorer():
+    """Import oszicar_convergence_scorer once. Returns the module or None."""
+    global _OSZICAR_SCORER
+    if _OSZICAR_SCORER is not None:
+        return _OSZICAR_SCORER if _OSZICAR_SCORER is not False else None
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        import oszicar_convergence_scorer as _mod   # type: ignore
+        _OSZICAR_SCORER = _mod
+        return _mod
+    except Exception as exc:
+        print(f"  WARNING: oszicar_convergence_scorer not importable "
+              f"({exc}); --oszicar-min-score will be ignored.")
+        _OSZICAR_SCORER = False
+        return None
+
+
+def oszicar_score(d: Path) -> Optional[float]:
+    """
+    Score the OSZICAR convergence for an SQS directory.
+    Returns the total score in [0, 100], or None if no OSZICAR or scoring
+    failed (caller should treat None as 'no information available').
+    """
+    osz = find_oszicar(d)
+    if osz is None:
+        return None
+    mod = _load_oszicar_scorer()
+    if mod is None:
+        return None
+    try:
+        report = mod.score_oszicar(str(osz))
+        return float(report.total_score)
+    except Exception:
+        return None
+
+
 def has_mandatory_files(d: Path) -> bool:
     """str.out and energy must exist. str_relax.out is checked but not required."""
     return (d / "energy").is_file() and (d / "str.out").is_file()
@@ -243,12 +320,32 @@ def infer_phase(path: Path) -> Optional[str]:
 
 def discover_sqs(data_roots: List[Path], phase: str,
                  el1: str, el2: str,
-                 verbose: bool = True) -> List[SQSData]:
-    """Find all lev>0 SQS for a phase/binary, one per composition."""
+                 verbose: bool = True,
+                 rename_energy_off: bool = True,
+                 oszicar_min_score: float = 0.0) -> List[SQSData]:
+    """Find all lev>0 SQS for a phase/binary, one per composition.
+
+    Energy handling
+    ---------------
+    - If `rename_energy_off`, an `energy.off` file (ATAT's "parked" energy)
+      is renamed to `energy` so the SQS can participate in the fit.
+    - SQS whose `energy` is genuinely missing (or whose `energy` file is
+      empty / unparseable) are dropped from the pool *before* sqs2tdb is
+      ever asked to fit them. This prevents the "5 SQS offered but only
+      3 energies available" failure mode the user reported.
+
+    Convergence filter
+    ------------------
+    - When `oszicar_min_score > 0`, each candidate's OSZICAR is scored
+      (if present) via oszicar_convergence_scorer; SQS scoring below the
+      threshold are rejected. If the scorer is unavailable or no OSZICAR
+      is present, the SQS is accepted (no information ≠ failure).
+    """
     el1, el2 = el1.upper(), el2.upper()
     found = []
     seen_comp: set = set()
     skipped_reasons: Dict[str, int] = {}
+    rename_count = 0
 
     def skip(reason):
         skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
@@ -271,12 +368,37 @@ def discover_sqs(data_roots: List[Path], phase: str,
             if lev == 0:
                 continue  # endmembers handled separately
 
+            # Bring energy.off back into the pool before requiring energy.
+            if rename_energy_off and maybe_rename_energy_off(p):
+                rename_count += 1
+                if verbose:
+                    print(f"      RENAMED energy.off -> energy in {p.name}")
+
             ok, missing = has_all_files(p)
             if not ok:
                 if verbose:
                     print(f"      SKIP {p.name}: missing {', '.join(missing)}")
-                skip(f"missing_files")
+                skip("missing_files")
                 continue
+
+            # Reject SQS whose energy file exists but is empty / unparseable.
+            # sqs2tdb would otherwise silently fit with a wrong/zero value.
+            if read_float_file(p / "energy") is None:
+                if verbose:
+                    print(f"      SKIP {p.name}: energy file empty or "
+                          f"unparseable")
+                skip("unparseable_energy")
+                continue
+
+            # Convergence quality gate.
+            if oszicar_min_score > 0.0:
+                score = oszicar_score(p)
+                if score is not None and score < oszicar_min_score:
+                    if verbose:
+                        print(f"      SKIP {p.name}: OSZICAR score "
+                              f"{score:.1f} < {oszicar_min_score}")
+                    skip("oszicar_below_threshold")
+                    continue
 
             # Parse composition from directory name
             comp_str = SQS_PREFIX_RE.sub("", p.name)
@@ -317,6 +439,9 @@ def discover_sqs(data_roots: List[Path], phase: str,
                 has_svib=svib_path is not None,
                 svib_path=svib_path))
 
+    if verbose and rename_count:
+        print(f"      Renamed energy.off -> energy in {rename_count} "
+              f"directories")
     if verbose and skipped_reasons:
         print(f"      Discovery skip summary: {dict(skipped_reasons)}")
 
@@ -695,21 +820,43 @@ def gen_stage2_tasks(
 # ====================================================================
 
 def run_tasks_parallel(tasks: List[FitTask], n_workers: int,
-                       label: str) -> List[FitResult]:
+                       label: str,
+                       max_successes: Optional[int] = None) -> List[FitResult]:
+    """
+    Submit `tasks` to a ProcessPoolExecutor and wait for completion.
+
+    First-feasible mode: when `max_successes` is set, the runner stops
+    submitting / cancels pending tasks once that many successful fits
+    are observed. Already-running tasks are allowed to finish (we cannot
+    forcibly kill running futures). This is the pragmatic CS-style
+    short-circuit suggested by Maguire et al. (2025) for the binary case
+    where the cost of fitting a GPC surrogate isn't justified.
+    """
     if not tasks:
         print(f"    No {label} tasks to run.")
         return []
 
-    print(f"    {label}: {len(tasks)} tasks, {n_workers} workers")
-    results = []
+    print(f"    {label}: {len(tasks)} tasks, {n_workers} workers"
+          + (f", stop after {max_successes} successes" if max_successes else ""))
+    results: List[FitResult] = []
     t0 = time.time()
     done = 0
     ok = 0
+    early_stopped = False
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futs = {pool.submit(do_one_fit, t): t for t in tasks}
+        try:
+            from concurrent.futures import CancelledError
+        except ImportError:
+            CancelledError = Exception  # type: ignore
+
         for fut in as_completed(futs):
-            r = fut.result()
+            try:
+                r = fut.result()
+            except CancelledError:
+                # A task we cancelled below — don't count it, don't record.
+                continue
             results.append(r)
             done += 1
             if r.success:
@@ -721,8 +868,24 @@ def run_tasks_parallel(tasks: List[FitTask], n_workers: int,
                 print(f"      {done}/{len(tasks)}  ok={ok}  "
                       f"{rate:.1f} fits/s  ETA {eta/60:.1f}m")
 
+            if (max_successes is not None
+                    and ok >= max_successes
+                    and not early_stopped):
+                # Cancel everything still in the queue. Tasks currently
+                # executing on a worker cannot be cancelled and will run
+                # to completion; their results are still recorded above.
+                cancelled = 0
+                for f in futs:
+                    if not f.done() and f.cancel():
+                        cancelled += 1
+                early_stopped = True
+                print(f"      Reached {max_successes} successes; "
+                      f"cancelled {cancelled} pending tasks")
+
     elapsed = time.time() - t0
-    print(f"    {label} done: {ok}/{len(tasks)} passed in {elapsed:.0f}s\n")
+    suffix = " (stopped early)" if early_stopped else ""
+    print(f"    {label} done: {ok}/{len(tasks)} passed in {elapsed:.0f}s"
+          f"{suffix}\n")
     return results
 
 
@@ -765,6 +928,21 @@ def main():
                     help="Skip Stage 2 (svib_ht fitting)")
     ap.add_argument("--phases", default=None,
                     help="Comma-separated phase list (default: all in YAML)")
+    ap.add_argument("--max-survivors-per-phase", type=int, default=None,
+                    help="First-feasible mode: stop a stage once N successful "
+                         "fits are found per phase. Pending tasks are "
+                         "cancelled. Drastically reduces compute when the "
+                         "configuration grid is large. Default: unlimited.")
+    ap.add_argument("--oszicar-min-score", type=float, default=0.0,
+                    help="Skip SQS whose OSZICAR convergence score (0-100) "
+                         "is below this threshold. Uses "
+                         "../oszicar_convergence_scorer.py. SQS with no "
+                         "OSZICAR found are accepted. Default 0 (disabled).")
+    ap.add_argument("--keep-energy-off", action="store_true",
+                    help="Do NOT auto-rename energy.off files to energy "
+                         "during discovery (the rename is on by default so "
+                         "ATAT-parked energies are brought back into the "
+                         "fitting pool).")
     args = ap.parse_args()
 
     # ── Load inputs ──────────────────────────────────────────────
@@ -791,6 +969,11 @@ def main():
     print(f"  Workers       : {args.n_workers}")
     print(f"  Min/Max SQS   : {args.min_sqs} / {args.max_sqs}")
     print(f"  Skip svib     : {args.skip_svib}")
+    print(f"  Max survivors : "
+          f"{args.max_survivors_per_phase if args.max_survivors_per_phase else 'unlimited'}")
+    print(f"  OSZICAR min   : "
+          f"{args.oszicar_min_score if args.oszicar_min_score > 0 else 'disabled'}")
+    print(f"  Rename .off   : {not args.keep_energy_off}")
     print(f"  Phases        : {', '.join(requested_phases)}")
     print(f"{'='*70}\n")
 
@@ -819,16 +1002,37 @@ def main():
         else:
             endmembers = [Path(em_data[el1]), Path(em_data[el2])]
 
-        # Validate endmembers exist and have mandatory files
+        # Validate endmembers exist and have mandatory files. Apply the
+        # same energy.off rename we use for mixing SQS. Endmembers are
+        # structural anchors and we don't drop them on OSZICAR score
+        # alone — only warn — because losing an endmember kills the phase.
         bad_ems = []
         for em in endmembers:
-            ok, missing = has_all_files(em)
-            if not ok:
-                print(f"    WARNING: endmember {em.name} missing: {', '.join(missing)}")
-                bad_ems.append(em)
-            elif not em.is_dir():
+            if not em.is_dir():
                 print(f"    WARNING: endmember path does not exist: {em}")
                 bad_ems.append(em)
+                continue
+            if not args.keep_energy_off:
+                if maybe_rename_energy_off(em):
+                    print(f"    RENAMED energy.off -> energy in "
+                          f"endmember {em.name}")
+            ok, missing = has_all_files(em)
+            if not ok:
+                print(f"    WARNING: endmember {em.name} missing: "
+                      f"{', '.join(missing)}")
+                bad_ems.append(em)
+                continue
+            if read_float_file(em / "energy") is None:
+                print(f"    WARNING: endmember {em.name} energy is empty / "
+                      f"unparseable")
+                bad_ems.append(em)
+                continue
+            if args.oszicar_min_score > 0.0:
+                score = oszicar_score(em)
+                if score is not None and score < args.oszicar_min_score:
+                    print(f"    WARNING: endmember {em.name} OSZICAR score "
+                          f"{score:.1f} < {args.oszicar_min_score} "
+                          f"(kept anyway — endmember is structural anchor)")
         if bad_ems:
             print(f"    Continuing with available endmembers...\n")
             endmembers = [em for em in endmembers if em not in bad_ems]
@@ -842,7 +1046,11 @@ def main():
             print(f"      {em.name}  ({sv})")
 
         # ── Discover mixing SQS ──────────────────────────────────
-        sqs_list = discover_sqs(data_roots, phase, el1, el2)
+        sqs_list = discover_sqs(
+            data_roots, phase, el1, el2,
+            rename_energy_off=not args.keep_energy_off,
+            oszicar_min_score=args.oszicar_min_score,
+        )
         print(f"    Mixing SQS : {len(sqs_list)}")
         for s in sqs_list:
             sv = "svib=YES" if s.has_svib else "svib=NO"
@@ -861,7 +1069,10 @@ def main():
             start_id=global_tid)
         global_tid += len(s1_tasks)
 
-        s1_results = run_tasks_parallel(s1_tasks, args.n_workers, "Stage 1")
+        s1_results = run_tasks_parallel(
+            s1_tasks, args.n_workers, "Stage 1",
+            max_successes=args.max_survivors_per_phase,
+        )
         s1_pass = [r for r in s1_results if r.success]
         print(f"    Stage 1 survivors: {len(s1_pass)}")
 
@@ -876,7 +1087,10 @@ def main():
                 start_id=global_tid)
             global_tid += len(s2_tasks)
 
-            s2_results = run_tasks_parallel(s2_tasks, args.n_workers, "Stage 2")
+            s2_results = run_tasks_parallel(
+                s2_tasks, args.n_workers, "Stage 2",
+                max_successes=args.max_survivors_per_phase,
+            )
             s2_pass = [r for r in s2_results if r.success]
             print(f"    Stage 2 survivors: {len(s2_pass)}")
             phase_results["stage2"] = [asdict(r) for r in s2_results]
