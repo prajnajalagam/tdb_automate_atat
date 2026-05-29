@@ -73,6 +73,25 @@ MAX_SQS=7
 ENERGY_CUTOFF=0.10        # eV;  max |error| in fit_energy.out col 5
 SVIB_CUTOFF=10.0          #      max |error| in fit_svib_ht.out col 5
 
+# ── Search-space controls (NEW: first-feasible / discovery hygiene) ─────────
+# Stop each stage once this many successful fits are found per phase.
+# Prevents the cross-phase combo explosion the user saw (161 x 857 x 1804
+# = 249M combos at Stage 3). A value of 10 here typically yields at most
+# 10^3 = 1000 Stage-3 combos, well within MAX_COMBOS below. Set to 0 or
+# leave empty to disable (run every configuration to completion).
+MAX_SURVIVORS_PER_PHASE=10
+
+# OSZICAR convergence quality gate. Skips SQS whose convergence score
+# (0-100, via ../oszicar_convergence_scorer.py) is below this threshold.
+# SQS without an OSZICAR file are accepted (absence of info != failure).
+# Typical thresholds: 60-70 ("C or better"). 0 disables the filter.
+OSZICAR_MIN_SCORE=60
+
+# Auto-rename energy.off -> energy during discovery so ATAT-parked DFT
+# runs are brought back into the fitting pool. Set to "yes" to opt OUT
+# of the rename (i.e. honor energy.off as "do not use"). Default: rename.
+KEEP_ENERGY_OFF="no"
+
 # ── Stage-3 equilibrium conditions ──────────────────────────────────────────
 EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"
 T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)
@@ -167,6 +186,9 @@ echo "  Python          : $(which python)"
 echo "  sqs2tdb         : $(which sqs2tdb)"
 echo "  Fit workers     : ${FIT_WORKERS}"
 echo "  Score workers   : ${SCORE_WORKERS}"
+echo "  Max survivors   : ${MAX_SURVIVORS_PER_PHASE:-unlimited} per phase"
+echo "  OSZICAR min     : ${OSZICAR_MIN_SCORE} (0 = disabled)"
+echo "  Rename .off     : $([ "${KEEP_ENERGY_OFF}" = "yes" ] && echo "no (keep)" || echo "yes")"
 echo "  Endmembers YAML : ${ENDMEMBERS_YAML}"
 echo "  Reference TDB   : ${REF_TDB:-<Stage 3 will be skipped>}"
 echo "=========================================================="
@@ -175,6 +197,18 @@ echo "=========================================================="
 # ============================================================================
 #  Stages 1 + 2: per-phase fitting
 # ============================================================================
+# Build optional flags so empty / zero values don't get passed to argparse.
+EXTRA_FLAGS=()
+if [ -n "${MAX_SURVIVORS_PER_PHASE:-}" ] && [ "${MAX_SURVIVORS_PER_PHASE}" -gt 0 ] 2>/dev/null; then
+    EXTRA_FLAGS+=(--max-survivors-per-phase "${MAX_SURVIVORS_PER_PHASE}")
+fi
+if [ -n "${OSZICAR_MIN_SCORE:-}" ]; then
+    EXTRA_FLAGS+=(--oszicar-min-score "${OSZICAR_MIN_SCORE}")
+fi
+if [ "${KEEP_ENERGY_OFF:-no}" = "yes" ]; then
+    EXTRA_FLAGS+=(--keep-energy-off)
+fi
+
 python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
     --endmembers-yaml "${ENDMEMBERS_YAML}" \
     --data-roots "${DATA_ROOTS}" \
@@ -184,6 +218,7 @@ python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
     --energy-cutoff "${ENERGY_CUTOFF}" \
     --svib-cutoff "${SVIB_CUTOFF}" \
     --n-workers "${FIT_WORKERS}" \
+    "${EXTRA_FLAGS[@]}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 PIPELINE_RC=${PIPESTATUS[0]}
