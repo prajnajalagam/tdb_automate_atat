@@ -163,6 +163,21 @@ if ! command -v sqs2tdb >/dev/null 2>&1; then
     exit 1
 fi
 
+# Guard against the "PBS overwrote my python file" trap.
+for src in \
+    "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+    "${SCRIPT_DIR}/score_tdb_combinations.py"
+do
+    first_line=$(head -1 "$src" 2>/dev/null || true)
+    if ! printf '%s' "$first_line" | grep -qE '^#!.*python|^"""|^#|^from |^import '; then
+        echo "ERROR: $src does not look like a python source file."
+        echo "       First line was: $first_line"
+        echo "       Was it overwritten by a PBS log? Restore from the"
+        echo "       repo checkout and check for a stray '#PBS -o $src'."
+        exit 1
+    fi
+done
+
 # ── Header ──────────────────────────────────────────────────────────────────
 {
 echo "=========================================================="
