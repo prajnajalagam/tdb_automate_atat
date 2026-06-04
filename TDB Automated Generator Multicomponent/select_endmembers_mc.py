@@ -16,7 +16,7 @@ Output: system.yaml consumed by sqs2tdb_pipeline_mc.py (Stage 1/2).
 
 Usage
 -----
-    python select_endmembers_mc.py \
+    python3 select_endmembers_mc.py \
         --elements Co,Cr,Ni \
         --data-roots /path/to/CoCrNi_data,/path/to/CoCr_data,... \
         --out system.yaml

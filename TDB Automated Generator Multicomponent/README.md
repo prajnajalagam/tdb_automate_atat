@@ -48,7 +48,7 @@ from the binary code, plus the new multicomponent pieces:
 Interactive endmember selection:
 
 ```bash
-python select_endmembers_mc.py \
+python3 select_endmembers_mc.py \
     --elements Co,Cr,Ni \
     --data-roots /path/to/CoCrNi_data,/path/to/CoCr_data \
     --out system.yaml
@@ -70,7 +70,7 @@ in a tempdir and verify parsing, composition, subsystem-tagging, SIGMA
 corner identification, parameter counting, and end-to-end scanning.
 
 ```bash
-python test_subsystems.py
+python3 test_subsystems.py
 ```
 
 Exit code 0 = all pass. **38 tests currently passing.**

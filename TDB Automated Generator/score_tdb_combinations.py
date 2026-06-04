@@ -11,7 +11,7 @@ This is designed to run as a SEPARATE step after the fitting pipeline
 completes, potentially on a different node with pycalphad installed.
 
 Usage:
-  python score_tdb_combinations.py \
+  python3 score_tdb_combinations.py \
     --manifest /path/to/tdb_manifest.json \
     --ref-tdb /path/to/reference.tdb \
     --phases FCC_A1,HCP_A3,BCC_A2 \
@@ -149,7 +149,12 @@ def score_tdb(
         return {"error": f"Cannot load TDB: {exc}", "final_score": 0.0}
 
     try:
-        test_eq = equilibrium(test_db, comps, phases, conds, output="NP")
+        # NOTE: do NOT pass output="NP". pycalphad 0.11.x has a regression
+        # in that code path (TypeError: only 0-dimensional arrays can be
+        # converted to Python scalars). NP is present in the default
+        # Dataset alongside GM/MU/X/Y/Phase, which is what we need.
+        test_eq = equilibrium(test_db, comps, phases, conds)
+
         NP_test = build_phase_fraction_array(test_eq, phases, P)
 
         # Base score: L1 distance
@@ -402,7 +407,10 @@ def main():
 
     def _try_ref_eq(phase_set: List[str]):
         try:
-            eq = equilibrium(ref_db, comps, phase_set, conds, output="NP")
+            # Default-output form, not output="NP" — see test_eq comment
+            # in score_tdb above; the NP-only path is broken in
+            # pycalphad 0.11.x.
+            eq = equilibrium(ref_db, comps, phase_set, conds)
             return build_phase_fraction_array(eq, phase_set, args.P)
         except Exception as exc:
             return exc

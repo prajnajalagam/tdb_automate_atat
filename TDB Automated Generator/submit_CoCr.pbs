@@ -228,7 +228,7 @@ if [ "${KEEP_ENERGY_OFF:-no}" = "yes" ]; then
     EXTRA_FLAGS+=(--keep-energy-off)
 fi
 
-python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+python3 "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
     --endmembers-yaml "${ENDMEMBERS_YAML}" \
     --data-roots "${DATA_ROOTS}" \
     --workdir-prefix "${WORKDIR_PREFIX}" \
@@ -285,7 +285,7 @@ echo "  Ref TDB  : ${REF_TDB}"
 echo "=========================================================="
 } | tee -a "${PIPELINE_LOG}"
 
-python "${SCRIPT_DIR}/score_tdb_combinations.py" \
+python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --manifest "${AUTODIR}/tdb_manifest.json" \
     --ref-tdb "${REF_TDB}" \
     --comp-element "${COMP_ELEMENT}" \

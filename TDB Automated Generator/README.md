@@ -39,7 +39,7 @@ validates each has the files `sqs2tdb -fit` needs, and lets you interactively
 pick the A-rich and B-rich endmember per phase. Writes `endmembers.yaml`.
 
 ```bash
-python select_endmembers.py \
+python3 select_endmembers.py \
   --element1 Co \
   --element2 Cr \
   --data-roots /data/CoCr/fcc,/data/CoCr/bcc,/data/CoCr/hcp \
@@ -70,7 +70,7 @@ Reads `endmembers.yaml`, discovers the mixing SQS (`lev>0`) per phase, and runs:
   `fit_svib_ht.out`. Skipped for SIGMA and with `--skip-svib`.
 
 ```bash
-python sqs2tdb_pipeline.py \
+python3 sqs2tdb_pipeline.py \
   --endmembers-yaml endmembers.yaml \
   --data-roots /data/CoCr/fcc,/data/CoCr/bcc,/data/CoCr/hcp \
   --energy-cutoff 0.10 \
@@ -105,7 +105,7 @@ phase-boundary-misplacement penalty). Ranks combos, copies the best to
 `BEST_<A>_<B>.tdb`.
 
 ```bash
-python score_tdb_combinations.py \
+python3 score_tdb_combinations.py \
   --manifest <prefix>_0/tdb_manifest.json \
   --ref-tdb /refs/CoCr_reference.tdb \
   --comp-element Co \
@@ -142,16 +142,16 @@ python score_tdb_combinations.py \
 cd "TDB Automated Generator"
 
 # 1. pick endmembers (interactive)
-python select_endmembers.py --element1 Co --element2 Cr \
+python3 select_endmembers.py --element1 Co --element2 Cr \
   --data-roots /data/CoCr --out CoCr.yaml
 
 # 2. fit
-python sqs2tdb_pipeline.py --endmembers-yaml CoCr.yaml \
+python3 sqs2tdb_pipeline.py --endmembers-yaml CoCr.yaml \
   --data-roots /data/CoCr --n-workers 8
 # -> creates Co-Cr_automate_0/ with tdb_manifest.json
 
 # 3. score against a reference
-python score_tdb_combinations.py \
+python3 score_tdb_combinations.py \
   --manifest Co-Cr_automate_0/tdb_manifest.json \
   --ref-tdb /refs/CoCr.tdb --comp-element Co --n-workers 1
 # -> Co-Cr_automate_0/stage3_scoring/BEST_Co_Cr.tdb

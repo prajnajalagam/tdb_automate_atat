@@ -11,7 +11,7 @@ Builds synthetic sqs2tdb-style directory trees in a tempdir and exercises:
   - terms.in parameter counting
   - scan_sqs end-to-end
 
-Run with:  python test_subsystems.py
+Run with:  python3 test_subsystems.py
 Exit code 0 = all tests passed.
 """
 

@@ -23,7 +23,7 @@ This narrows down whether the failure is:
 
 Usage
 -----
-  python diagnose_ref_tdb.py \\
+  python3 diagnose_ref_tdb.py \\
       --ref-tdb /path/to/AlCoCrNi.TDB \\
       --comp-element CO \\
       --extra-comps CR
