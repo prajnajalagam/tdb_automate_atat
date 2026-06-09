@@ -97,7 +97,14 @@ EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"
 T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)
 X_GRID=0.005
 BOUNDARY_WEIGHT=0.25
-MAX_COMBOS=500            # cap on cross-phase combinations to score
+MAX_COMBOS=0              # 0 = unlimited; KEEP_TOP cleanup bounds disk
+
+# Streaming top-N cleanup. Only the top KEEP_TOP combo dirs survive on
+# disk; every loser + failure dir is deleted as it finishes. Every combo
+# score/error is still recorded in scoring_results.json — only the
+# per-combo scratch dirs go away. Default 1; bump to 5/10 to keep some
+# alternatives for manual inspection.
+KEEP_TOP=1
 
 # ── Parallelism ─────────────────────────────────────────────────────────────
 # Stage 1/2: each sqs2tdb -fit is single-threaded, so workers ≈ #cores is OK.
@@ -299,6 +306,7 @@ python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --boundary-weight "${BOUNDARY_WEIGHT}" \
     --n-workers "${SCORE_WORKERS}" \
     --max-combos "${MAX_COMBOS}" \
+    --keep-top "${KEEP_TOP}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 SCORE_RC=${PIPESTATUS[0]}

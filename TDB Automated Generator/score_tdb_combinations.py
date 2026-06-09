@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import heapq
 import itertools
 import json
 import os
@@ -373,6 +374,73 @@ class ComboResult:
     error: Optional[str]
 
 
+class _TopNTracker:
+    """
+    Streaming top-N tracker for combo directories.
+
+    For each completed combo we either:
+      - keep the combo's directory on disk if it's among the top-N
+        by final_score so far (initially everything fits while we're
+        below N; afterwards a new combo only replaces the current
+        worst-kept if it strictly beats that worst_score), or
+      - delete the directory immediately to bound disk usage.
+
+    Failed combos (error not None, or no combined_tdb) are always
+    deleted — the JSON results record retains the per-combo error
+    message either way, so nothing is lost beyond the scratch dir.
+    """
+
+    def __init__(self, n: int, enabled: bool = True):
+        self.n = max(1, n)
+        self.enabled = enabled
+        # min-heap of (score, combo_id, combo_dir) — heap[0] is the worst kept
+        self._heap: List[Tuple[float, int, Path]] = []
+        self.kept_count = 0
+        self.evicted_count = 0
+        self.failed_deleted = 0
+
+    def consider(self, r: "ComboResult", work_root: Path) -> None:
+        if not self.enabled:
+            return
+        combo_dir = work_root / f"combo_{r.combo_id:06d}"
+
+        # Failures: always delete, never count toward top-N.
+        if r.error is not None or r.combined_tdb is None:
+            shutil.rmtree(combo_dir, ignore_errors=True)
+            self.failed_deleted += 1
+            return
+
+        if len(self._heap) < self.n:
+            heapq.heappush(self._heap,
+                           (r.final_score, r.combo_id, combo_dir))
+            self.kept_count += 1
+            return
+
+        worst_score = self._heap[0][0]
+        if r.final_score > worst_score:
+            # Evict the current worst kept; promote this one in.
+            ev_score, ev_id, ev_dir = heapq.heappop(self._heap)
+            shutil.rmtree(ev_dir, ignore_errors=True)
+            self.evicted_count += 1
+            heapq.heappush(self._heap,
+                           (r.final_score, r.combo_id, combo_dir))
+        else:
+            shutil.rmtree(combo_dir, ignore_errors=True)
+            self.evicted_count += 1
+
+    def summary(self) -> str:
+        if not self.enabled:
+            return "cleanup disabled (--no-cleanup-losers)"
+        lines = [
+            f"kept {len(self._heap)} top-N combo dir(s); "
+            f"deleted {self.evicted_count} loser dir(s), "
+            f"{self.failed_deleted} failed dir(s)"
+        ]
+        for score, cid, cdir in sorted(self._heap, reverse=True):
+            lines.append(f"    combo_{cid:06d}  score={score:.4f}  -> {cdir}")
+        return "\n  ".join(lines)
+
+
 def evaluate_combo(
     combo_id: int,
     phase_tdb_paths: Dict[str, str],
@@ -450,6 +518,17 @@ def main():
                     help="Cap on number of combinations (0 = unlimited)")
     ap.add_argument("--workdir", default=None,
                     help="Working directory (default: next to manifest)")
+    ap.add_argument("--keep-top", type=int, default=1,
+                    help="Preserve only the top-N combo directories by "
+                         "final_score; loser dirs are deleted as soon as "
+                         "they finish. This bounds disk usage to N combos "
+                         "regardless of how many combinations were evaluated, "
+                         "so you can leave --max-combos at 0 (unlimited). "
+                         "Default 1 (keep only the best).")
+    ap.add_argument("--no-cleanup-losers", action="store_true",
+                    help="Disable the running-best cleanup. Every combo dir "
+                         "stays on disk forever; use only when debugging "
+                         "with a small --max-combos.")
     ap.add_argument("--phase-aliases", default=None,
                     help="Additional phase-alias groups, beyond the built-in "
                          "default ([SIGMA, SIGMA_D8B, SIGMA_SGTE]). Format: "
@@ -535,7 +614,12 @@ def main():
         all_combos = [all_combos[i] for i in sorted(indices)]
 
     print(f"\n  Total combinations to evaluate: {len(all_combos)}")
-    print(f"  Workers: {args.n_workers}")
+    print(f"  Workers       : {args.n_workers}")
+    if args.no_cleanup_losers:
+        print(f"  Cleanup       : disabled (every combo dir kept on disk)")
+    else:
+        print(f"  Cleanup       : keep top-{args.keep_top}, "
+              f"delete losers + failures as they finish")
     print(f"{'='*70}\n")
 
     # ── Reference equilibrium (computed ONCE, reused for every combo) ─
@@ -641,6 +725,28 @@ def main():
     # which we don't use). Use --n-workers as high as your node allows;
     # set 1 only as a fallback if a worker pool hangs on your build.
 
+    # Streaming top-N cleanup keeps disk bounded: only the top
+    # --keep-top combo directories survive; everything else is deleted
+    # as it finishes. The scoring_results.json record below still has
+    # every combo's score and error, so no information is lost — only
+    # the per-combo scratch dirs.
+    tracker = _TopNTracker(args.keep_top,
+                           enabled=not args.no_cleanup_losers)
+
+    def _record_and_cleanup(r: ComboResult) -> None:
+        nonlocal done, ok
+        results.append(r)
+        done += 1
+        if r.error is None:
+            ok += 1
+        tracker.consider(r, work_root)
+        if done % max(1, len(all_combos) // 20) == 0 or done == len(all_combos):
+            elapsed = time.time() - t0
+            rate = done / elapsed if elapsed > 0 else 0
+            best = max((r2.final_score for r2 in results), default=0)
+            print(f"  {done}/{len(all_combos)}  ok={ok}  "
+                  f"{rate:.2f}/s  best={best:.4f}")
+
     if args.n_workers <= 1:
         # Sequential
         for cid, combo in enumerate(all_combos):
@@ -651,15 +757,7 @@ def main():
                 args.P, args.stable_tol,
                 args.boundary_weight, args.boundary_power,
                 alias_groups=alias_groups)
-            results.append(r)
-            done += 1
-            if r.error is None:
-                ok += 1
-            if done % max(1, len(all_combos) // 20) == 0 or done == len(all_combos):
-                elapsed = time.time() - t0
-                rate = done / elapsed if elapsed > 0 else 0
-                print(f"  {done}/{len(all_combos)}  ok={ok}  "
-                      f"{rate:.2f}/s  best={max((r2.final_score for r2 in results), default=0):.4f}")
+            _record_and_cleanup(r)
     else:
         with ProcessPoolExecutor(max_workers=args.n_workers) as pool:
             futs = {}
@@ -676,15 +774,7 @@ def main():
 
             for fut in as_completed(futs):
                 r = fut.result()
-                results.append(r)
-                done += 1
-                if r.error is None:
-                    ok += 1
-                if done % max(1, len(all_combos) // 20) == 0 or done == len(all_combos):
-                    elapsed = time.time() - t0
-                    rate = done / elapsed if elapsed > 0 else 0
-                    print(f"  {done}/{len(all_combos)}  ok={ok}  "
-                          f"{rate:.2f}/s  best={max((r2.final_score for r2 in results), default=0):.4f}")
+                _record_and_cleanup(r)
 
     # ── Sort and report ──────────────────────────────────────────
     results.sort(key=lambda r: -r.final_score)
@@ -711,8 +801,11 @@ def main():
     with open(out_file, "w") as f:
         json.dump([asdict(r) for r in results], f, indent=2, default=str)
 
-    # Save best TDB path for convenience
-    if results and results[0].combined_tdb:
+    # Save best TDB path for convenience. The top-N tracker preserves
+    # the best combo's directory, so results[0].combined_tdb is still
+    # on disk and shutil.copy2 succeeds.
+    if results and results[0].combined_tdb \
+            and Path(results[0].combined_tdb).is_file():
         best_tdb = Path(results[0].combined_tdb)
         best_link = work_root / f"BEST_{el1}_{el2}.tdb"
         if best_link.exists():
@@ -721,6 +814,7 @@ def main():
         print(f"  Best TDB: {best_link}")
 
     print(f"  Full results: {out_file}")
+    print(f"  Disk: {tracker.summary()}")
     print(f"{'='*70}\n")
 
 

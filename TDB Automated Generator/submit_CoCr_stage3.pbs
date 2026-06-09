@@ -62,7 +62,20 @@ EQ_PHASES="FCC_A1,HCP_A3,BCC_A2,SIGMA_D8B"
 T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)
 X_GRID=0.005
 BOUNDARY_WEIGHT=0.25
-MAX_COMBOS=500            # cap on cross-phase combinations to score
+
+# Cross-phase combination cap. With KEEP_TOP cleanup below, disk usage
+# stays bounded regardless of how many combos we evaluate, so set this
+# to 0 (unlimited) by default. Set a positive number only when you
+# specifically want to subsample (e.g. for a fast debug run).
+MAX_COMBOS=0
+
+# Streaming top-N cleanup. Only the top KEEP_TOP combo directories by
+# final_score are kept on disk; every other combo dir (loser + failure)
+# is deleted as it finishes. Every combo's score/error is still in
+# scoring_results.json — only the per-combo scratch dirs go away.
+# Default 1 (best only). Bump to 5 or 10 if you want a few alternatives
+# on disk for manual inspection.
+KEEP_TOP=1
 
 # Stage 3 parallelism. Each combo is an independent (pycalphad equilibrium
 # + sqs2tdb -tdb) pair, so we can use almost the whole node.
@@ -200,6 +213,7 @@ python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --boundary-weight "${BOUNDARY_WEIGHT}" \
     --n-workers "${SCORE_WORKERS}" \
     --max-combos "${MAX_COMBOS}" \
+    --keep-top "${KEEP_TOP}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 SCORE_RC=${PIPESTATUS[0]}
