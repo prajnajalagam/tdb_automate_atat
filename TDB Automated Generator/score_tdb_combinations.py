@@ -222,79 +222,133 @@ def boundary_misplacement_penalty(
         dims=other_dims, name="boundary_penalty")
 
 
-def score_tdb(
-    test_tdb_path: str,
+def enumerate_phase_pairs(phases: List[str]) -> List[Tuple[str, ...]]:
+    """All canonical (sorted) 2-phase combinations of `phases`."""
+    return [tuple(sorted([phases[i], phases[j]]))
+            for i in range(len(phases))
+            for j in range(i + 1, len(phases))]
+
+
+def phase_set_label(phase_set: Tuple[str, ...]) -> str:
+    """Human-readable key for a phase set, e.g. ('BCC_A2','FCC_A1') -> 'BCC_A2+FCC_A1'."""
+    return "+".join(phase_set)
+
+
+def _score_one_phase_set(
+    test_db,
+    phase_set: Tuple[str, ...],
     NP_ref,
     comps: List[str],
-    phases: List[str],
+    conds: dict,
+    P: float,
+    stable_tol: float,
+    boundary_weight: float,
+    boundary_power: float,
+    alias_groups: List[List[str]],
+) -> dict:
+    """
+    Score one phase set (full or pair) for a single test DB.
+    Returns a dict with base_score / boundary_penalty / final_score / error.
+    """
+    test_phase_names = set(test_db.phases.keys())
+    actual_per_request = {
+        req: resolve_phase_for_db(req, test_phase_names, alias_groups)
+        for req in phase_set
+    }
+    active_actuals = [a for a in actual_per_request.values() if a]
+    if not active_actuals:
+        return {"error": f"None of {list(phase_set)} present in test TDB",
+                "base_score": 0.0, "boundary_penalty": 1.0,
+                "final_score": 0.0}
+    try:
+        # See full-file comment on output="NP" — broken in pycalphad 0.11.x;
+        # NP comes back in the default Dataset.
+        test_eq = equilibrium(test_db, comps, active_actuals, conds)
+        NP_test = build_phase_fraction_array(
+            test_eq, list(phase_set), P,
+            actual_per_request={r: a for r, a in actual_per_request.items() if a},
+        )
+        l1 = np.abs(NP_test - NP_ref).sum("phase")
+        base = (1.0 - 0.5 * l1).clip(min=0.0, max=1.0)
+        bp = boundary_misplacement_penalty(NP_test, NP_ref, stable_tol)
+        final = (base - boundary_weight * (bp ** boundary_power)
+                 ).clip(min=0.0, max=1.0)
+        return {
+            "base_score": float(base.mean()),
+            "boundary_penalty": float(bp.mean()),
+            "final_score": float(final.mean()),
+            "error": None,
+        }
+    except Exception as exc:
+        return {"error": str(exc),
+                "base_score": 0.0, "boundary_penalty": 1.0,
+                "final_score": 0.0}
+
+
+def score_tdb(
+    test_tdb_path: str,
+    NP_refs: Dict[Tuple[str, ...], object],
+    comps: List[str],
     conds: dict,
     P: float = 101325,
     stable_tol: float = 1e-6,
     boundary_weight: float = 0.25,
     boundary_power: float = 1.0,
     alias_groups: Optional[List[List[str]]] = None,
+    pair_aggregate: str = "mean",
 ) -> dict:
     """
-    Score a test TDB against a precomputed reference phase-fraction array.
-    Returns dict with base_score, boundary_penalty, final_score.
+    Score a test TDB against multiple precomputed reference phase-fraction
+    arrays — one per phase set the caller wants evaluated (full, pairs,
+    or both per --scoring-mode).
 
-    NP_ref is the reference equilibrium phase-fraction DataArray, computed
-    once by the caller and reused across all combinations (it is identical
-    for every test TDB).
-
-    `alias_groups` lets requested phase names match different actual names
-    in this database (e.g. requested SIGMA_D8B → tagged SIGMA_SGTE). See
-    resolve_phase_for_db / DEFAULT_PHASE_ALIAS_GROUPS.
+    For each phase set we run a fresh equilibrium restricted to those
+    phases (alias-resolved to the names this test DB actually uses),
+    compute L1 + boundary-penalty against the matching reference array,
+    and aggregate the per-set final_scores via `pair_aggregate`:
+      "mean" -> arithmetic mean of valid per-set final_scores
+      "min"  -> worst valid per-set final_score (rewards "no weak link")
+    The aggregated final_score is what the top-N tracker / ranking uses;
+    the per-set breakdown is returned in `per_set_scores` so the JSON
+    record retains every pair's score.
     """
     try:
         test_db = Database(test_tdb_path)
     except Exception as exc:
-        return {"error": f"Cannot load TDB: {exc}", "final_score": 0.0}
+        return {"error": f"Cannot load TDB: {exc}", "final_score": 0.0,
+                "per_set_scores": {}}
 
-    try:
-        # Resolve which actual phase name in this test DB corresponds to
-        # each requested phase (so requested SIGMA_D8B can match a test TDB
-        # that calls it SIGMA, etc.). Phases absent from the test DB get
-        # a zero column in the NP array.
-        groups = alias_groups or DEFAULT_PHASE_ALIAS_GROUPS
-        test_phase_names = set(test_db.phases.keys())
-        actual_per_request = {
-            req: resolve_phase_for_db(req, test_phase_names, groups)
-            for req in phases
-        }
-        active_actuals = [a for a in actual_per_request.values() if a]
-        if not active_actuals:
-            return {"error": f"None of {phases} present in test TDB",
-                    "final_score": 0.0}
+    groups = alias_groups or DEFAULT_PHASE_ALIAS_GROUPS
 
-        # NOTE: do NOT pass output="NP". pycalphad 0.11.x has a regression
-        # in that code path (TypeError: only 0-dimensional arrays can be
-        # converted to Python scalars). NP is present in the default
-        # Dataset alongside GM/MU/X/Y/Phase, which is what we need.
-        test_eq = equilibrium(test_db, comps, active_actuals, conds)
-
-        NP_test = build_phase_fraction_array(
-            test_eq, phases, P,
-            actual_per_request={req: a for req, a in actual_per_request.items() if a},
+    per_set_scores: Dict[str, dict] = {}
+    for phase_set, NP_ref in NP_refs.items():
+        per_set_scores[phase_set_label(phase_set)] = _score_one_phase_set(
+            test_db, phase_set, NP_ref, comps, conds, P,
+            stable_tol, boundary_weight, boundary_power, groups,
         )
 
-        # Base score: L1 distance
-        l1 = np.abs(NP_test - NP_ref).sum("phase")
-        base_score = (1.0 - 0.5 * l1).clip(min=0.0, max=1.0)
+    # Aggregate over valid per-set results.
+    valid = [s for s in per_set_scores.values() if s["error"] is None]
+    if not valid:
+        return {"error": "all phase-set scorings failed",
+                "base_score": 0.0, "boundary_penalty": 1.0, "final_score": 0.0,
+                "per_set_scores": per_set_scores}
 
-        # Boundary penalty
-        bp = boundary_misplacement_penalty(NP_test, NP_ref, stable_tol)
-        final_score = (base_score - boundary_weight * (bp ** boundary_power)
-                       ).clip(min=0.0, max=1.0)
-
-        return {
-            "base_score": float(base_score.mean()),
-            "boundary_penalty": float(bp.mean()),
-            "final_score": float(final_score.mean()),
-            "error": None,
-        }
-    except Exception as exc:
-        return {"error": str(exc), "final_score": 0.0}
+    finals = [s["final_score"] for s in valid]
+    bases = [s["base_score"] for s in valid]
+    bps = [s["boundary_penalty"] for s in valid]
+    if pair_aggregate == "min":
+        agg = {"final_score": min(finals),
+               "base_score": min(bases),
+               "boundary_penalty": max(bps)}
+    else:  # mean (default)
+        n = len(valid)
+        agg = {"final_score": sum(finals) / n,
+               "base_score": sum(bases) / n,
+               "boundary_penalty": sum(bps) / n}
+    agg["per_set_scores"] = per_set_scores
+    agg["error"] = None
+    return agg
 
 
 # ====================================================================
@@ -372,6 +426,11 @@ class ComboResult:
     boundary_penalty: float
     final_score: float
     error: Optional[str]
+    # Per-phase-set breakdown when scoring-mode != 'full'.
+    # Keys are "PhaseA+PhaseB" (or the full set's label); values are
+    # {base_score, boundary_penalty, final_score, error} dicts. Empty
+    # for the legacy full-only mode.
+    per_set_scores: Optional[Dict[str, dict]] = None
 
 
 class _TopNTracker:
@@ -445,9 +504,8 @@ def evaluate_combo(
     combo_id: int,
     phase_tdb_paths: Dict[str, str],
     work_root: Path,
-    NP_ref,
+    NP_refs: Dict[Tuple[str, ...], object],
     comps: List[str],
-    phases: List[str],
     conds: dict,
     el1: str, el2: str,
     P: float,
@@ -455,8 +513,13 @@ def evaluate_combo(
     boundary_weight: float,
     boundary_power: float,
     alias_groups: Optional[List[List[str]]] = None,
+    pair_aggregate: str = "mean",
 ) -> ComboResult:
-    """Combine per-phase TDBs, score against the precomputed reference."""
+    """Combine per-phase TDBs, score against the precomputed references.
+
+    NP_refs is {phase_set_tuple: NP_ref_array} — one entry per phase set
+    the caller wants scored (full and/or pairs, per --scoring-mode).
+    """
 
     combo_dir = work_root / f"combo_{combo_id:06d}"
 
@@ -466,14 +529,16 @@ def evaluate_combo(
             return ComboResult(
                 combo_id=combo_id, phase_tdbs=phase_tdb_paths,
                 combined_tdb=None, base_score=0.0, boundary_penalty=1.0,
-                final_score=0.0, error="sqs2tdb -tdb failed")
+                final_score=0.0, error="sqs2tdb -tdb failed",
+                per_set_scores=None)
 
         result = score_tdb(
-            str(combined), NP_ref, comps, phases, conds,
+            str(combined), NP_refs, comps, conds,
             P=P, stable_tol=stable_tol,
             boundary_weight=boundary_weight,
             boundary_power=boundary_power,
-            alias_groups=alias_groups)
+            alias_groups=alias_groups,
+            pair_aggregate=pair_aggregate)
 
         return ComboResult(
             combo_id=combo_id,
@@ -482,13 +547,15 @@ def evaluate_combo(
             base_score=result.get("base_score", 0.0),
             boundary_penalty=result.get("boundary_penalty", 1.0),
             final_score=result.get("final_score", 0.0),
-            error=result.get("error"))
+            error=result.get("error"),
+            per_set_scores=result.get("per_set_scores"))
 
     except Exception as exc:
         return ComboResult(
             combo_id=combo_id, phase_tdbs=phase_tdb_paths,
             combined_tdb=None, base_score=0.0, boundary_penalty=1.0,
-            final_score=0.0, error=str(exc))
+            final_score=0.0, error=str(exc),
+            per_set_scores=None)
 
 
 # ====================================================================
@@ -537,6 +604,21 @@ def main():
                          "'FCC#1,FCC_A1;BCC#1,BCC_A2'. Phases inside a group "
                          "are treated as the same column when scoring test "
                          "vs reference TDBs that label them differently.")
+    ap.add_argument("--scoring-mode", default="pairs",
+                    choices=["full", "pairs", "both"],
+                    help="full = one equilibrium per combo with all "
+                         "--eq-phases together (legacy). pairs (default) = "
+                         "C(N,2) equilibria per combo, one per phase pair; "
+                         "exposes each phase's free-energy description "
+                         "wherever it competes with every other phase, "
+                         "instead of only when it is the global minimum. "
+                         "both = full + all pairs.")
+    ap.add_argument("--pair-aggregate", default="mean",
+                    choices=["mean", "min"],
+                    help="How to combine per-phase-set final_scores into "
+                         "the combo score that the top-N tracker uses. "
+                         "'mean' (default) is smooth; 'min' is the worst-"
+                         "pair score (rewards combos with no weak link).")
     args = ap.parse_args()
 
     # Merge user-supplied alias groups (if any) with the built-in defaults.
@@ -672,23 +754,50 @@ def main():
         except Exception as exc:
             return exc
 
-    NP_ref = _try_ref_eq(eq_phases)
-    if isinstance(NP_ref, Exception):
-        first_err = NP_ref
-        print(f"  Initial reference equilibrium failed: {first_err}")
-        print(f"  Retrying with reduced phase subsets...")
+    # ── Build the list of phase sets to score per --scoring-mode ───
+    # NP_refs maps each phase-set tuple to its precomputed reference NP
+    # array. A phase set is either the full eq_phases (legacy "full")
+    # or one of the C(N,2) phase pairs (default "pairs"); "both" does
+    # both. score_tdb computes one test-side equilibrium per phase set
+    # per combo and aggregates per --pair-aggregate.
+    requested_sets: List[Tuple[str, ...]] = []
+    if args.scoring_mode in ("full", "both"):
+        requested_sets.append(tuple(sorted(eq_phases)))
+    if args.scoring_mode in ("pairs", "both"):
+        requested_sets.extend(enumerate_phase_pairs(eq_phases))
+    # de-dupe preserving order (so "both" with N=2 doesn't ask the same
+    # equilibrium twice — full and pair are identical there)
+    seen: set = set()
+    requested_sets = [s for s in requested_sets if not (s in seen or seen.add(s))]
+    print(f"  Scoring mode  : {args.scoring_mode} "
+          f"({len(requested_sets)} phase set(s) per combo)")
+    print(f"  Aggregate     : {args.pair_aggregate}")
+    for s in requested_sets:
+        print(f"    -> {phase_set_label(s)}")
 
-        # Try every subset of eq_phases of decreasing size, preferring those
-        # that drop fewer phases. Stops at the first working subset. This
-        # handles TDBs where one phase (often SIGMA) has a sublattice model
-        # that pycalphad cannot construct for the requested comp restriction.
+    NP_refs: Dict[Tuple[str, ...], object] = {}
+    failed_sets: List[Tuple[Tuple[str, ...], Exception]] = []
+    for phase_set in requested_sets:
+        result = _try_ref_eq(list(phase_set))
+        if isinstance(result, Exception):
+            print(f"  Ref eq for {phase_set_label(phase_set)} failed: {result}")
+            failed_sets.append((phase_set, result))
+            continue
+        NP_refs[phase_set] = result
+
+    if not NP_refs:
+        # Same resilient fallback as before, but only triggered when EVERY
+        # requested phase set failed: drop phases one at a time and retry
+        # the full set.
+        print("  Every requested phase-set ref equilibrium failed; "
+              "retrying full set with reduced subsets...")
         working_set: Optional[List[str]] = None
         for n_keep in range(len(eq_phases) - 1, 0, -1):
             for subset in itertools.combinations(eq_phases, n_keep):
                 cand = list(subset)
                 result = _try_ref_eq(cand)
                 if not isinstance(result, Exception):
-                    NP_ref = result
+                    NP_refs[tuple(sorted(cand))] = result
                     working_set = cand
                     dropped = sorted(set(eq_phases) - set(cand))
                     print(f"  Succeeded with phases: {cand}")
@@ -696,8 +805,8 @@ def main():
                     break
             if working_set is not None:
                 break
-
-        if working_set is None:
+        if not NP_refs:
+            first_err = failed_sets[0][1] if failed_sets else "unknown"
             sys.exit(
                 f"  ERROR: reference equilibrium failed for every subset of "
                 f"{eq_phases}.\n"
@@ -705,12 +814,9 @@ def main():
                 f"  Check the reference TDB and the --eq-phases / "
                 f"--comp-element settings."
             )
-
-        # Use the working set everywhere downstream — test equilibria must
-        # match the reference's phase coverage for the L1 / boundary metrics
-        # to be meaningful.
-        eq_phases = working_set
-    print("  Reference equilibrium ready.\n")
+        # Restrict eq_phases to the working set going forward.
+        eq_phases = working_set or eq_phases
+    print(f"  Reference equilibria ready: {len(NP_refs)} phase set(s).\n")
 
     # ── Run scoring ──────────────────────────────────────────────
     results: List[ComboResult] = []
@@ -752,11 +858,12 @@ def main():
         for cid, combo in enumerate(all_combos):
             ptdbs = dict(zip(phases_ordered, combo))
             r = evaluate_combo(
-                cid, ptdbs, work_root, NP_ref,
-                comps, eq_phases, conds, el1, el2,
+                cid, ptdbs, work_root, NP_refs,
+                comps, conds, el1, el2,
                 args.P, args.stable_tol,
                 args.boundary_weight, args.boundary_power,
-                alias_groups=alias_groups)
+                alias_groups=alias_groups,
+                pair_aggregate=args.pair_aggregate)
             _record_and_cleanup(r)
     else:
         with ProcessPoolExecutor(max_workers=args.n_workers) as pool:
@@ -765,11 +872,11 @@ def main():
                 ptdbs = dict(zip(phases_ordered, combo))
                 fut = pool.submit(
                     evaluate_combo,
-                    cid, ptdbs, work_root, NP_ref,
-                    comps, eq_phases, conds, el1, el2,
+                    cid, ptdbs, work_root, NP_refs,
+                    comps, conds, el1, el2,
                     args.P, args.stable_tol,
                     args.boundary_weight, args.boundary_power,
-                    alias_groups)
+                    alias_groups, args.pair_aggregate)
                 futs[fut] = cid
 
             for fut in as_completed(futs):
@@ -794,6 +901,15 @@ def main():
             print(f"         {ph}: .../{Path(tdb).parent.parent.name}/{Path(tdb).parent.name}/{Path(tdb).name}")
         if r.combined_tdb:
             print(f"         combined: {r.combined_tdb}")
+        if r.per_set_scores:
+            print(f"         per-phase-set scores:")
+            for label, s in sorted(r.per_set_scores.items()):
+                if s.get("error"):
+                    print(f"             {label:30s}  FAILED: {s['error']}")
+                else:
+                    print(f"             {label:30s}  final={s['final_score']:.4f}"
+                          f"  base={s['base_score']:.4f}"
+                          f"  bndry_pen={s['boundary_penalty']:.4f}")
         print()
 
     # ── Save results ─────────────────────────────────────────────

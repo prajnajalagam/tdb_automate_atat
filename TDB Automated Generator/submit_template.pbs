@@ -86,6 +86,10 @@ MAX_COMBOS=0                      # 0 = unlimited; KEEP_TOP bounds disk
 # disk; losers + failures are deleted as they finish. Default 1.
 KEEP_TOP=1
 
+# Scoring strategy. pairs (default) / full / both; aggregate mean / min.
+SCORING_MODE="pairs"
+PAIR_AGGREGATE="mean"
+
 # ── Parallelism ─────────────────────────────────────────────────────────────
 # Stage 1/2: each sqs2tdb -fit is single-threaded; workers ≈ #cores is OK.
 # On a 128-core mil_ait node, 64 is a comfortable default; bump higher
@@ -288,6 +292,8 @@ python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --n-workers "${SCORE_WORKERS}" \
     --max-combos "${MAX_COMBOS}" \
     --keep-top "${KEEP_TOP}" \
+    --scoring-mode "${SCORING_MODE}" \
+    --pair-aggregate "${PAIR_AGGREGATE}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 SCORE_RC=${PIPESTATUS[0]}

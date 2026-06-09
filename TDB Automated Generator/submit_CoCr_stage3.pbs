@@ -58,6 +58,22 @@ COMP_ELEMENT="CO"
 # diagnose_ref_tdb.py against it.
 EQ_PHASES="FCC_A1,HCP_A3,BCC_A2,SIGMA_D8B"
 
+# ── Scoring strategy ────────────────────────────────────────────────────────
+# pairs = score each C(N,2) phase pair separately and aggregate. Each pair
+#         equilibrium stress-tests one phase's free-energy description against
+#         every other phase, regardless of whether some third phase is the
+#         global minimum. Gives every pair (including SIGMA_D8B+anything) a
+#         vote in the combo's final score.
+# full   = legacy "one big equilibrium with all phases" — only checks the
+#         global minimum at each (T, X); pairs that aren't globally stable
+#         contribute nothing.
+# both   = full + pairs, aggregated together.
+SCORING_MODE="pairs"
+
+# Aggregation across phase sets.  mean = average score across all pairs;
+# min = worst-pair score (rewards combos with no weak link).
+PAIR_AGGREGATE="mean"
+
 # ── Stage-3 equilibrium conditions ──────────────────────────────────────────
 T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)
 X_GRID=0.005
@@ -197,6 +213,8 @@ echo "  Comp element    : ${COMP_ELEMENT}"
 echo "  T range         : ${T_RANGE}"
 echo "  X grid          : ${X_GRID}"
 echo "  Max combos      : ${MAX_COMBOS}"
+echo "  Scoring mode    : ${SCORING_MODE}"
+echo "  Pair aggregate  : ${PAIR_AGGREGATE}"
 echo "=========================================================="
 } | tee "${PIPELINE_LOG}"
 
@@ -214,6 +232,8 @@ python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --n-workers "${SCORE_WORKERS}" \
     --max-combos "${MAX_COMBOS}" \
     --keep-top "${KEEP_TOP}" \
+    --scoring-mode "${SCORING_MODE}" \
+    --pair-aggregate "${PAIR_AGGREGATE}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 SCORE_RC=${PIPESTATUS[0]}
