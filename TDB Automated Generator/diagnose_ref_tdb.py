@@ -14,6 +14,13 @@ output tells you:
   - Whether a small range-based equilibrium (the form Stage 3 uses)
     succeeds
 
+NOTE: equilibrium() is called without output="NP" anywhere in this
+script. pycalphad 0.11.x has a regression in its NP-only property
+path (TypeError: only 0-dimensional arrays can be converted to Python
+scalars). The default Dataset already contains NP, GM, MU, X, Y, and
+Phase — which is everything we need. score_tdb_combinations.py was
+patched the same way in commit 848c36f.
+
 This narrows down whether the failure is:
   (a) phase-name case / spelling mismatch (FCC vs FCC_A1 vs FCC_A1#1)
   (b) a missing component
@@ -183,7 +190,7 @@ def main() -> int:
     for ph in test_phases:
         print(f"\n  → Phase: {ph}")
         try:
-            eq = equilibrium(db, comps, [ph], conds_scalar, output="NP")
+            eq = equilibrium(db, comps, [ph], conds_scalar)
             print("    SUCCESS")
             _print_eq_output(eq)
             succeeded_singly.append(ph)
@@ -198,7 +205,7 @@ def main() -> int:
     # ── [6] All test phases at once ─────────────────────────────
     print(f"\n[6] Combined equilibrium: phases={test_phases}")
     try:
-        eq = equilibrium(db, comps, test_phases, conds_scalar, output="NP")
+        eq = equilibrium(db, comps, test_phases, conds_scalar)
         print("    SUCCESS")
         _print_eq_output(eq)
     except Exception as exc:
@@ -219,7 +226,7 @@ def main() -> int:
     print(f"    conds = {conds_range}")
     try:
         eq = equilibrium(db, comps, succeeded_singly or test_phases,
-                         conds_range, output="NP")
+                         conds_range)
         print("    SUCCESS")
         print(f"    NP shape: {eq.NP.values.shape}")
     except Exception as exc:
@@ -236,7 +243,7 @@ def main() -> int:
     print(f"    conds = {conds_zero}")
     try:
         eq = equilibrium(db, comps, succeeded_singly or test_phases,
-                         conds_zero, output="NP")
+                         conds_zero)
         print("    SUCCESS — Stage 3's form works after all; failure must")
         print("    have been phase-/X-grid-specific.")
     except Exception as exc:
