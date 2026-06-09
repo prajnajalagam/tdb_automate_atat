@@ -60,12 +60,35 @@ MAX_SQS=7
 ENERGY_CUTOFF=0.10        # eV;  max |error| in fit_energy.out col 5
 SVIB_CUTOFF=10.0          #      max |error| in fit_svib_ht.out col 5
 
+# ── Search-space controls (first-feasible / discovery hygiene) ──────────────
+# Stop each stage once this many successful fits are found per phase.
+# Caps the Stage-3 cross-phase combo explosion (N^n_phases instead of
+# the full Cartesian product of all survivors). Empty or 0 = disabled.
+MAX_SURVIVORS_PER_PHASE=10
+
+# OSZICAR convergence-quality gate (0..100; uses ../oszicar_convergence_scorer.py).
+# SQS scoring below the threshold are skipped at discovery time. 0 = disabled.
+# Typical thresholds: 60-70 ("C or better").
+OSZICAR_MIN_SCORE=60
+
+# Auto-rename energy.off -> energy during discovery so ATAT-parked DFT
+# runs come back into the fitting pool. Set to "yes" to opt OUT.
+KEEP_ENERGY_OFF="no"
+
 # ── Stage-3 equilibrium conditions ──────────────────────────────────────────
 EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"  # phases to include in the equilibrium calc
 T_RANGE="500,1200,50"             # T_min,T_max,T_step (K)
 X_GRID=0.005
 BOUNDARY_WEIGHT=0.25
-MAX_COMBOS=500                    # cap on cross-phase combos to score
+MAX_COMBOS=0                      # 0 = unlimited; KEEP_TOP bounds disk
+
+# Streaming top-N cleanup. Only the top KEEP_TOP combo dirs survive on
+# disk; losers + failures are deleted as they finish. Default 1.
+KEEP_TOP=1
+
+# Scoring strategy. pairs (default) / full / both; aggregate mean / min.
+SCORING_MODE="pairs"
+PAIR_AGGREGATE="mean"
 
 # ── Parallelism ─────────────────────────────────────────────────────────────
 # Stage 1/2: each sqs2tdb -fit is single-threaded; workers ≈ #cores is OK.
@@ -73,9 +96,11 @@ MAX_COMBOS=500                    # cap on cross-phase combos to score
 # if benchmarking shows headroom.
 FIT_WORKERS=64
 
-# Stage 3: keep at 1. pycalphad's equilibrium() uses Cython global state
-# that is NOT safe for ProcessPoolExecutor on most installations.
-SCORE_WORKERS=1
+# Stage 3 parallelism. Each combo is an independent pycalphad
+# equilibrium + sqs2tdb -tdb call; ProcessPoolExecutor gives each
+# worker its own interpreter, so per-process Cython state is fresh.
+# Drop to 1 only as a debugging fallback if a worker pool ever hangs.
+SCORE_WORKERS=64
 
 # ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
@@ -148,6 +173,21 @@ if ! command -v sqs2tdb >/dev/null 2>&1; then
     exit 1
 fi
 
+# Guard against the "PBS overwrote my python file" trap.
+for src in \
+    "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+    "${SCRIPT_DIR}/score_tdb_combinations.py"
+do
+    first_line=$(head -1 "$src" 2>/dev/null || true)
+    if ! printf '%s' "$first_line" | grep -qE '^#!.*python|^"""|^#|^from |^import '; then
+        echo "ERROR: $src does not look like a python source file."
+        echo "       First line was: $first_line"
+        echo "       Was it overwritten by a PBS log? Restore from the"
+        echo "       repo checkout and check for a stray '#PBS -o $src'."
+        exit 1
+    fi
+done
+
 # ── Header ──────────────────────────────────────────────────────────────────
 {
 echo "=========================================================="
@@ -163,6 +203,9 @@ echo "  Python          : $(which python)"
 echo "  sqs2tdb         : $(which sqs2tdb)"
 echo "  Fit workers     : ${FIT_WORKERS}"
 echo "  Score workers   : ${SCORE_WORKERS}"
+echo "  Max survivors   : ${MAX_SURVIVORS_PER_PHASE:-unlimited} per phase"
+echo "  OSZICAR min     : ${OSZICAR_MIN_SCORE} (0 = disabled)"
+echo "  Rename .off     : $([ "${KEEP_ENERGY_OFF}" = "yes" ] && echo "no (keep)" || echo "yes")"
 echo "  Endmembers YAML : ${ENDMEMBERS_YAML}"
 echo "  Reference TDB   : ${REF_TDB:-<Stage 3 will be skipped>}"
 echo "=========================================================="
@@ -171,7 +214,18 @@ echo "=========================================================="
 # ============================================================================
 #  Stages 1 + 2: per-phase fitting
 # ============================================================================
-python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
+EXTRA_FLAGS=()
+if [ -n "${MAX_SURVIVORS_PER_PHASE:-}" ] && [ "${MAX_SURVIVORS_PER_PHASE}" -gt 0 ] 2>/dev/null; then
+    EXTRA_FLAGS+=(--max-survivors-per-phase "${MAX_SURVIVORS_PER_PHASE}")
+fi
+if [ -n "${OSZICAR_MIN_SCORE:-}" ]; then
+    EXTRA_FLAGS+=(--oszicar-min-score "${OSZICAR_MIN_SCORE}")
+fi
+if [ "${KEEP_ENERGY_OFF:-no}" = "yes" ]; then
+    EXTRA_FLAGS+=(--keep-energy-off)
+fi
+
+python3 "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
     --endmembers-yaml "${ENDMEMBERS_YAML}" \
     --data-roots "${DATA_ROOTS}" \
     --workdir-prefix "${WORKDIR_PREFIX}" \
@@ -180,6 +234,7 @@ python "${SCRIPT_DIR}/sqs2tdb_pipeline.py" \
     --energy-cutoff "${ENERGY_CUTOFF}" \
     --svib-cutoff "${SVIB_CUTOFF}" \
     --n-workers "${FIT_WORKERS}" \
+    "${EXTRA_FLAGS[@]}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 PIPELINE_RC=${PIPESTATUS[0]}
@@ -226,7 +281,7 @@ echo "  Ref TDB  : ${REF_TDB}"
 echo "=========================================================="
 } | tee -a "${PIPELINE_LOG}"
 
-python "${SCRIPT_DIR}/score_tdb_combinations.py" \
+python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --manifest "${AUTODIR}/tdb_manifest.json" \
     --ref-tdb "${REF_TDB}" \
     --comp-element "${COMP_ELEMENT}" \
@@ -236,6 +291,9 @@ python "${SCRIPT_DIR}/score_tdb_combinations.py" \
     --boundary-weight "${BOUNDARY_WEIGHT}" \
     --n-workers "${SCORE_WORKERS}" \
     --max-combos "${MAX_COMBOS}" \
+    --keep-top "${KEEP_TOP}" \
+    --scoring-mode "${SCORING_MODE}" \
+    --pair-aggregate "${PAIR_AGGREGATE}" \
     2>&1 | tee -a "${PIPELINE_LOG}"
 
 SCORE_RC=${PIPESTATUS[0]}

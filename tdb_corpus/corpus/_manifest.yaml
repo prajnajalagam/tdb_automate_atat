@@ -1,0 +1,8 @@
+schema_version: 1
+generated_utc: '2026-06-09T23:00:57.163513+00:00'
+corpus_dir: /home/user/tdb_automate_atat/tdb_corpus/corpus
+n_files: 0
+n_loaded_ok: 0
+n_failed: 0
+pycalphad_available: false
+entries: []
