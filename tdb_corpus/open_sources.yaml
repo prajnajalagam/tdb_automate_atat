@@ -1,0 +1,64 @@
+# Registry of open-licensed TDB sources.
+#
+# Each entry MUST have an explicit `license` field. The fetcher
+# (tdbdb_fetch_open.py) refuses to download anything that's not
+# listed here, so the redistribution risk stays bounded.
+#
+# Fields:
+#   name        - short identifier used as the saved filename
+#   system      - element list this TDB covers (uppercase)
+#   url         - direct URL to the .tdb / .TDB file (no HTML pages)
+#   license     - one of: CC-BY-4.0, MIT, BSD-3-Clause, public-domain,
+#                 by-permission (means: do NOT auto-download)
+#   citation    - human-readable attribution
+#   doi         - if available
+#   notes       - optional free text
+#
+# PRs adding new entries welcome. Verify the license at the source
+# BEFORE adding — the fetcher takes this file at face value.
+
+sources:
+  # ── PyCalphad's bundled examples (MIT licensed via pycalphad's repo) ──
+  - name: pycalphad_AlNiMo_lin1992
+    system: [AL, MO, NI]
+    url: https://raw.githubusercontent.com/pycalphad/pycalphad/develop/examples/NI-AL-MO_DUPIN.tdb
+    license: MIT
+    citation: "PyCalphad examples (Dupin Ni-Al-Mo, redistributed under PyCalphad MIT)"
+    doi: null
+    notes: "Bundled in pycalphad/examples; verify license still MIT before relying on it."
+
+  # ── ESPEI test fixtures (MIT) ──
+  - name: espei_CuMg
+    system: [CU, MG]
+    url: https://raw.githubusercontent.com/phasesresearchlab/espei/master/espei/tests/testing_data/Cu-Mg-input.tdb
+    license: MIT
+    citation: "Bocklund et al., MRS Communications 9 (2019) — ESPEI Cu-Mg example"
+    doi: 10.1557/mrc.2019.59
+    notes: "Skeleton TDB used in the ESPEI Cu-Mg tutorial."
+
+  # ── Add additional confirmed-open sources below this line ──
+  # Hint: when you find a source, copy the template:
+  #
+  # - name: <ShortID>
+  #   system: [EL1, EL2, ...]
+  #   url: https://...
+  #   license: CC-BY-4.0
+  #   citation: "..."
+  #   doi: 10.xxxx/yyyy
+  #   notes: "..."
+
+# ── Citations only — no auto-download ────────────────────────────────
+# Anything with license: by-permission, publisher-paywalled, etc. goes
+# here as a citation only. The fetcher will print these so you know
+# what to grab manually via your library proxy.
+references_no_auto_download:
+  - system: [CO, CR]
+    citation: "Andersson & Sundman, Calphad 11 (1987) 83-92"
+    doi: 10.1016/0364-5916(87)90021-6
+    license: publisher-paywalled
+    notes: "Foundational Co-Cr assessment; fetch via Elsevier through your library."
+  - system: [AL, MG]
+    citation: "Hallstedt, Calphad 31 (2007) 292-302"
+    doi: 10.1016/j.calphad.2006.09.001
+    license: publisher-paywalled
+    notes: "Open via author's page in the past; verify availability before fetching."
