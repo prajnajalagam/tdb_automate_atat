@@ -1079,7 +1079,15 @@ def main():
         phase_results = {"stage1": [asdict(r) for r in s1_results]}
 
         # ── Stage 2: svib_ht ─────────────────────────────────────
-        if not args.skip_svib and s1_pass and phase != "SIGMA_D8B":
+        # Stage 2 also runs for SIGMA_D8B even though SIGMA has no mixing
+        # SQS in a binary — gen_stage2_tasks naturally produces exactly
+        # one task (empty SQS-svib subset, endmember_svib=True). This
+        # ensures SIGMA's free-energy zero-point is normalized the same
+        # way as FCC/BCC/HCP for Stage-3 phase-fraction scoring;
+        # otherwise SIGMA endmembers are referenced to E only while the
+        # other phases include the vibrational contribution, biasing
+        # phase stability comparisons.
+        if not args.skip_svib and s1_pass:
             print(f"\n  ── Stage 2: adding svib_ht ──")
             s2_tasks = gen_stage2_tasks(
                 phase, endmembers, s1_pass, sqs_list, workdir,
@@ -1096,7 +1104,7 @@ def main():
             phase_results["stage2"] = [asdict(r) for r in s2_results]
         else:
             if not args.skip_svib:
-                print(f"    Skipping Stage 2 (no Stage 1 survivors or SIGMA)")
+                print(f"    Skipping Stage 2 (no Stage 1 survivors)")
 
         all_results[phase] = phase_results
         print()
