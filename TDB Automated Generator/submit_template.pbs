@@ -88,9 +88,11 @@ MAX_COMBOS=500                    # cap on cross-phase combos to score
 # if benchmarking shows headroom.
 FIT_WORKERS=64
 
-# Stage 3: keep at 1. pycalphad's equilibrium() uses Cython global state
-# that is NOT safe for ProcessPoolExecutor on most installations.
-SCORE_WORKERS=1
+# Stage 3 parallelism. Each combo is an independent pycalphad
+# equilibrium + sqs2tdb -tdb call; ProcessPoolExecutor gives each
+# worker its own interpreter, so per-process Cython state is fresh.
+# Drop to 1 only as a debugging fallback if a worker pool ever hangs.
+SCORE_WORKERS=64
 
 # ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"

@@ -1,9 +1,9 @@
 #!/bin/bash
 #PBS -S /bin/bash
 #PBS -N CoCr_score
-#PBS -q long
-#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
-#PBS -l walltime=12:00:00
+#PBS -q normal
+#PBS -l select=1:ncpus=40:model=sky_ele
+#PBS -l walltime=04:00:00
 #PBS -j oe
 #PBS -o sqs2tdb_pbs_stage3.log
 #PBS -W group_list=a1485
@@ -16,10 +16,11 @@
 #  patching score_tdb_combinations.py, after tweaking --eq-phases or
 #  --max-combos, or after swapping the reference TDB.
 #
-#  Stage 3 is single-threaded by design (pycalphad's equilibrium() uses
-#  Cython global state that isn't process-safe for ProcessPoolExecutor),
-#  so a 128-core node is mostly idle. You can drop to a smaller model
-#  (e.g. sky_ele with ncpus=20) if you want to save hours.
+#  Why sky_ele 40 cores (not mil_ait 128 like submit_CoCr.pbs):
+#    Stage 3 is embarrassingly parallel — every cross-phase combo is an
+#    independent pycalphad equilibrium + sqs2tdb -tdb call, and
+#    ProcessPoolExecutor gives each worker its own interpreter. We
+#    saturate the cores we ask for and not a single extra.
 #
 #  USAGE
 #     qsub submit_CoCr_stage3.pbs
@@ -65,8 +66,11 @@ X_GRID=0.005
 BOUNDARY_WEIGHT=0.25
 MAX_COMBOS=500            # cap on cross-phase combinations to score
 
-# Stage 3 must stay at 1 worker; see comment at top of file.
-SCORE_WORKERS=1
+# Stage 3 parallelism. Each combo is an independent (pycalphad equilibrium
+# + sqs2tdb -tdb) pair, so we can use almost the whole node.
+# Leave a couple of cores for the orchestrator + I/O; 32 of 40 is safe.
+# Drop to 1 only as a debugging fallback if a worker pool ever hangs.
+SCORE_WORKERS=32
 
 # ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
@@ -168,7 +172,8 @@ echo "  ${ELEMENT_A}-${ELEMENT_B} TDB pipeline — Stage 3 only"
 echo "=========================================================="
 echo "  Job started     : $(date)"
 echo "  Host            : $(hostname)"
-echo "  Node model      : mil_ait (128 cores, only 1 used)"
+echo "  Node model      : sky_ele (40 cores)"
+echo "  Score workers   : ${SCORE_WORKERS}"
 echo "  Workdir         : ${WORKDIR}"
 echo "  Script dir      : ${SCRIPT_DIR}"
 echo "  Stage 3 log     : ${PIPELINE_LOG}"

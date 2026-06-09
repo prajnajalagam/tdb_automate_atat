@@ -105,9 +105,13 @@ MAX_COMBOS=500            # cap on cross-phase combinations to score
 # for the orchestrator + scratch IO); bump to 100+ if you've benchmarked it.
 FIT_WORKERS=64
 
-# Stage 3: keep at 1. pycalphad's equilibrium() uses Cython global state that
-# is NOT safe for ProcessPoolExecutor on most installations.
-SCORE_WORKERS=1
+# Stage 3 parallelism. Each combo is an independent pycalphad
+# equilibrium + sqs2tdb -tdb call; ProcessPoolExecutor gives each worker
+# its own interpreter, so the per-process Cython state is fresh. We can
+# use almost the whole node here too — 64 of 128 leaves headroom for
+# the orchestrator. Drop to 1 only as a debugging fallback if a worker
+# pool ever hangs on your pycalphad build.
+SCORE_WORKERS=64
 
 # ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"

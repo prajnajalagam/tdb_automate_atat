@@ -461,12 +461,12 @@ def main():
     done = 0
     ok = 0
 
-    # Note: pycalphad's equilibrium() uses global Cython state that
-    # doesn't parallelize well across processes.  For safety, we use
-    # sequential execution.  If you need speed, set --n-workers=1 and
-    # rely on the scoring being the fast part (each eq calc is ~seconds).
-    # Alternatively, use ProcessPoolExecutor if your pycalphad build
-    # is process-safe.
+    # Stage 3 is embarrassingly parallel: each combo is an independent
+    # pycalphad equilibrium + sqs2tdb -tdb pair, and ProcessPoolExecutor
+    # gives every worker its own interpreter (so per-process pycalphad
+    # state is fresh — the only concern with Cython state was threads,
+    # which we don't use). Use --n-workers as high as your node allows;
+    # set 1 only as a fallback if a worker pool hangs on your build.
 
     if args.n_workers <= 1:
         # Sequential
