@@ -49,16 +49,14 @@ REF_TDB="/nobackupp27/pjalagam/AlCoCrNi.TDB"
 COMP_ELEMENT="CO"
 
 # ── Equilibrium phase list ──────────────────────────────────────────────────
-# IMPORTANT: this list must match phase names that exist in BOTH the
-# reference TDB and the candidate (combined) TDBs you're scoring.
-#
-# Known sigma-phase asymmetry: sqs2tdb writes SIGMA_D8B, but the
-# AlCoCrNi.TDB reference calls it SIGMA_SGTE — so including SIGMA_D8B
-# here will be silently dropped from the reference side by the resilient
-# fallback. Easiest: leave SIGMA out unless you've matched names on both
-# sides. To diagnose what's actually in your reference TDB run
-# diagnose_ref_tdb.py against it (lists every phase + sublattice model).
-EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"
+# These are the phases to compare in the L1 / boundary scoring. Use the
+# names from your *test* TDBs (the sqs2tdb side); the scorer's built-in
+# phase-alias machinery handles the SIGMA_D8B vs SIGMA_SGTE asymmetry
+# between sqs2tdb output and SGTE-style reference TDBs (and any other
+# alias groups passed via --phase-aliases). To list every phase in your
+# reference TDB and verify names + sublattice models, run
+# diagnose_ref_tdb.py against it.
+EQ_PHASES="FCC_A1,HCP_A3,BCC_A2,SIGMA_D8B"
 
 # ── Stage-3 equilibrium conditions ──────────────────────────────────────────
 T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)

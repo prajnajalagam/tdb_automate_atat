@@ -50,20 +50,117 @@ except ImportError:
 # Scoring logic (from your match-score code, cleaned up)
 # ====================================================================
 
-def build_phase_fraction_array(eq_result, phases: List[str], P: float):
+# Phase-name aliasing.
+# Different databases label the same physical phase with different names —
+# e.g. our sqs2tdb-fitted TDBs write the topologically-close-packed sigma
+# phase as SIGMA_D8B, while several public reference TDBs (incl. SGTE-
+# style AlCoCrNi) write SIGMA_SGTE for the same phase. To score one
+# against the other, we treat all members of an alias group as equivalent:
+# the user's requested phase list is the "label" used for the comparison
+# array, but for each database we look up whichever group member actually
+# exists in that database and pass THAT name to pycalphad. Result tags
+# are then mapped back to the requested label before NP arrays are
+# concatenated, so test- and ref-side NP arrays share the same `phase`
+# dimension and L1 / boundary metrics make sense.
+#
+# To add more aliases at runtime, pass --phase-aliases on the CLI; the
+# built-in default list below is appended to.
+DEFAULT_PHASE_ALIAS_GROUPS: List[List[str]] = [
+    ["SIGMA", "SIGMA_D8B", "SIGMA_SGTE"],
+]
+
+
+def parse_alias_arg(arg: Optional[str]) -> List[List[str]]:
     """
-    Convert pycalphad equilibrium NP output to (phase, T, X) DataArray.
-    Missing phases → 0, normalized so phases sum to 1.
+    Parse a --phase-aliases CLI string into a list of alias groups.
+
+    Format: semicolon-separated groups, each group a comma-separated
+    list of phase names.
+
+      "SIGMA_D8B,SIGMA_SGTE;FCC#1,FCC_A1"
+        ->  [["SIGMA_D8B", "SIGMA_SGTE"], ["FCC#1", "FCC_A1"]]
     """
+    if not arg:
+        return []
+    out: List[List[str]] = []
+    for chunk in arg.split(";"):
+        members = [m.strip() for m in chunk.split(",") if m.strip()]
+        if members:
+            out.append(members)
+    return out
+
+
+def merge_alias_groups(*group_lists: List[List[str]]) -> List[List[str]]:
+    """Union alias groups across multiple sources, deduplicating."""
+    seen: List[set] = []
+    for groups in group_lists:
+        for g in groups:
+            gs = set(g)
+            # Merge into any existing group that overlaps.
+            merged = gs
+            keep: List[set] = []
+            for existing in seen:
+                if existing & merged:
+                    merged = merged | existing
+                else:
+                    keep.append(existing)
+            keep.append(merged)
+            seen = keep
+    return [sorted(g) for g in seen]
+
+
+def resolve_phase_for_db(
+    requested: str, db_phase_names: set, alias_groups: List[List[str]]
+) -> Optional[str]:
+    """
+    Given a phase the user asked for and the actual phase names in a
+    particular database, return the database's name for that phase
+    (preferring an exact match, then any alias-group member that exists).
+    None if no member of the alias group is in the database.
+    """
+    if requested in db_phase_names:
+        return requested
+    for g in alias_groups:
+        if requested in g:
+            for member in g:
+                if member != requested and member in db_phase_names:
+                    return member
+            return None
+    return None
+
+
+def build_phase_fraction_array(
+    eq_result,
+    requested_phases: List[str],
+    P: float,
+    actual_per_request: Optional[Dict[str, str]] = None,
+):
+    """
+    Convert a pycalphad equilibrium result to a (phase, T, X) NP array
+    keyed by the user's REQUESTED phase names.
+
+    `actual_per_request` maps each requested name to whatever name
+    pycalphad actually tagged it with (per-database resolution; see
+    `resolve_phase_for_db`). For phases not present in this database,
+    NP contributes a zero column so the output shape is invariant in
+    `requested_phases`.
+    """
+    actual_per_request = actual_per_request or {}
     NP = eq_result.NP.sel(P=P)
+
     per_phase = []
-    for ph in phases:
-        ph_np = NP.where(eq_result.Phase == ph).fillna(0.0)
+    zero_template = None
+    for req in requested_phases:
+        actual = actual_per_request.get(req, req)
+        # The mask picks rows where pycalphad tagged this exact name.
+        ph_np = NP.where(eq_result.Phase == actual).fillna(0.0)
         per_phase.append(ph_np)
+        if zero_template is None:
+            zero_template = ph_np * 0.0
 
     NP_phase = xr.concat(
         per_phase,
-        dim=xr.DataArray(phases, dims="phase", name="phase"))
+        dim=xr.DataArray(requested_phases, dims="phase", name="phase"))
 
     if "vertex" in NP_phase.dims:
         NP_phase = NP_phase.sum("vertex")
@@ -134,6 +231,7 @@ def score_tdb(
     stable_tol: float = 1e-6,
     boundary_weight: float = 0.25,
     boundary_power: float = 1.0,
+    alias_groups: Optional[List[List[str]]] = None,
 ) -> dict:
     """
     Score a test TDB against a precomputed reference phase-fraction array.
@@ -142,6 +240,10 @@ def score_tdb(
     NP_ref is the reference equilibrium phase-fraction DataArray, computed
     once by the caller and reused across all combinations (it is identical
     for every test TDB).
+
+    `alias_groups` lets requested phase names match different actual names
+    in this database (e.g. requested SIGMA_D8B → tagged SIGMA_SGTE). See
+    resolve_phase_for_db / DEFAULT_PHASE_ALIAS_GROUPS.
     """
     try:
         test_db = Database(test_tdb_path)
@@ -149,13 +251,31 @@ def score_tdb(
         return {"error": f"Cannot load TDB: {exc}", "final_score": 0.0}
 
     try:
+        # Resolve which actual phase name in this test DB corresponds to
+        # each requested phase (so requested SIGMA_D8B can match a test TDB
+        # that calls it SIGMA, etc.). Phases absent from the test DB get
+        # a zero column in the NP array.
+        groups = alias_groups or DEFAULT_PHASE_ALIAS_GROUPS
+        test_phase_names = set(test_db.phases.keys())
+        actual_per_request = {
+            req: resolve_phase_for_db(req, test_phase_names, groups)
+            for req in phases
+        }
+        active_actuals = [a for a in actual_per_request.values() if a]
+        if not active_actuals:
+            return {"error": f"None of {phases} present in test TDB",
+                    "final_score": 0.0}
+
         # NOTE: do NOT pass output="NP". pycalphad 0.11.x has a regression
         # in that code path (TypeError: only 0-dimensional arrays can be
         # converted to Python scalars). NP is present in the default
         # Dataset alongside GM/MU/X/Y/Phase, which is what we need.
-        test_eq = equilibrium(test_db, comps, phases, conds)
+        test_eq = equilibrium(test_db, comps, active_actuals, conds)
 
-        NP_test = build_phase_fraction_array(test_eq, phases, P)
+        NP_test = build_phase_fraction_array(
+            test_eq, phases, P,
+            actual_per_request={req: a for req, a in actual_per_request.items() if a},
+        )
 
         # Base score: L1 distance
         l1 = np.abs(NP_test - NP_ref).sum("phase")
@@ -266,6 +386,7 @@ def evaluate_combo(
     stable_tol: float,
     boundary_weight: float,
     boundary_power: float,
+    alias_groups: Optional[List[List[str]]] = None,
 ) -> ComboResult:
     """Combine per-phase TDBs, score against the precomputed reference."""
 
@@ -283,7 +404,8 @@ def evaluate_combo(
             str(combined), NP_ref, comps, phases, conds,
             P=P, stable_tol=stable_tol,
             boundary_weight=boundary_weight,
-            boundary_power=boundary_power)
+            boundary_power=boundary_power,
+            alias_groups=alias_groups)
 
         return ComboResult(
             combo_id=combo_id,
@@ -328,7 +450,21 @@ def main():
                     help="Cap on number of combinations (0 = unlimited)")
     ap.add_argument("--workdir", default=None,
                     help="Working directory (default: next to manifest)")
+    ap.add_argument("--phase-aliases", default=None,
+                    help="Additional phase-alias groups, beyond the built-in "
+                         "default ([SIGMA, SIGMA_D8B, SIGMA_SGTE]). Format: "
+                         "semicolon-separated groups, each a comma-separated "
+                         "list of equivalent names. Example: "
+                         "'FCC#1,FCC_A1;BCC#1,BCC_A2'. Phases inside a group "
+                         "are treated as the same column when scoring test "
+                         "vs reference TDBs that label them differently.")
     args = ap.parse_args()
+
+    # Merge user-supplied alias groups (if any) with the built-in defaults.
+    alias_groups = merge_alias_groups(
+        DEFAULT_PHASE_ALIAS_GROUPS,
+        parse_alias_arg(args.phase_aliases),
+    )
 
     # ── Load manifest ────────────────────────────────────────────
     with open(args.manifest) as f:
@@ -365,6 +501,9 @@ def main():
     print(f"  T range       : {T_min}–{T_max} K, step {T_step}")
     print(f"  X grid        : {args.X_grid}")
     print(f"  Eq phases     : {', '.join(eq_phases)}")
+    if alias_groups:
+        print(f"  Phase aliases : "
+              + "; ".join("[" + ",".join(g) + "]" for g in alias_groups))
     print(f"  Work root     : {work_root}")
 
     # ── Enumerate combinations ───────────────────────────────────
@@ -405,13 +544,47 @@ def main():
     print("  Computing reference equilibrium (once)...")
     ref_db = Database(args.ref_tdb)
 
+    # Per-phase, resolve which actual name the reference DB uses for
+    # whatever we asked for. Phases the user requested that are
+    # genuinely absent (in name AND in alias group) get warned about
+    # and dropped from the ref-side equilibrium call; they will appear
+    # as zero columns in NP_ref via build_phase_fraction_array.
+    ref_phase_names = set(ref_db.phases.keys())
+    ref_actual_per_request: Dict[str, str] = {}
+    ref_missing: List[str] = []
+    for req in eq_phases:
+        actual = resolve_phase_for_db(req, ref_phase_names, alias_groups)
+        if actual is None:
+            ref_missing.append(req)
+        else:
+            ref_actual_per_request[req] = actual
+    if ref_missing:
+        print(f"  Reference TDB has no match for: {ref_missing}")
+        print(f"    -> those phases will contribute 0 on the reference side")
+    if any(req != act for req, act in ref_actual_per_request.items()):
+        renames = ", ".join(f"{req}→{act}"
+                            for req, act in ref_actual_per_request.items()
+                            if req != act)
+        print(f"  Reference alias resolution: {renames}")
+
     def _try_ref_eq(phase_set: List[str]):
         try:
             # Default-output form, not output="NP" — see test_eq comment
             # in score_tdb above; the NP-only path is broken in
             # pycalphad 0.11.x.
-            eq = equilibrium(ref_db, comps, phase_set, conds)
-            return build_phase_fraction_array(eq, phase_set, args.P)
+            actuals = [ref_actual_per_request[p] for p in phase_set
+                       if p in ref_actual_per_request]
+            if not actuals:
+                return RuntimeError(
+                    f"No requested phases present in reference TDB "
+                    f"(after alias resolution): {phase_set}")
+            eq = equilibrium(ref_db, comps, actuals, conds)
+            return build_phase_fraction_array(
+                eq, phase_set, args.P,
+                actual_per_request={p: ref_actual_per_request[p]
+                                    for p in phase_set
+                                    if p in ref_actual_per_request},
+            )
         except Exception as exc:
             return exc
 
@@ -476,7 +649,8 @@ def main():
                 cid, ptdbs, work_root, NP_ref,
                 comps, eq_phases, conds, el1, el2,
                 args.P, args.stable_tol,
-                args.boundary_weight, args.boundary_power)
+                args.boundary_weight, args.boundary_power,
+                alias_groups=alias_groups)
             results.append(r)
             done += 1
             if r.error is None:
@@ -496,7 +670,8 @@ def main():
                     cid, ptdbs, work_root, NP_ref,
                     comps, eq_phases, conds, el1, el2,
                     args.P, args.stable_tol,
-                    args.boundary_weight, args.boundary_power)
+                    args.boundary_weight, args.boundary_power,
+                    alias_groups)
                 futs[fut] = cid
 
             for fut in as_completed(futs):
