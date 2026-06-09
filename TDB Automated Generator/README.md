@@ -193,3 +193,13 @@ For a brand-new binary with no Co-Cr defaults to overwrite, use
 `submit_template.pbs` instead. Every value in its USER CONFIG block is
 prefixed `TODO_`; the script bails out at submit time if any placeholder
 is still present, so you can't accidentally submit a half-edited job.
+
+### Re-running only Stage 3
+
+If Stages 1+2 already finished and you only need to (re-)score —
+e.g. after patching `score_tdb_combinations.py`, swapping the reference
+TDB, or adjusting `--eq-phases` — use `submit_CoCr_stage3.pbs`. It skips
+the fitting work entirely, auto-picks the newest `<prefix>_N` workdir
+(or you can set `MANIFEST_OVERRIDE`), and runs only the scoring step.
+Stage 3 is single-process by design, so it's much faster than a full
+re-submit.

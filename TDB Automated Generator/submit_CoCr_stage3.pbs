@@ -1,0 +1,214 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -N CoCr_score
+#PBS -q long
+#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o sqs2tdb_pbs_stage3.log
+#PBS -W group_list=a1485
+
+# ============================================================================
+#  Co-Cr TDB pipeline — Stage 3 ONLY (cross-phase TDB combine + scoring)
+# ----------------------------------------------------------------------------
+#  Use this when Stages 1+2 already succeeded and produced a
+#  tdb_manifest.json, and you only need to (re-)run Stage 3 — e.g. after
+#  patching score_tdb_combinations.py, after tweaking --eq-phases or
+#  --max-combos, or after swapping the reference TDB.
+#
+#  Stage 3 is single-threaded by design (pycalphad's equilibrium() uses
+#  Cython global state that isn't process-safe for ProcessPoolExecutor),
+#  so a 128-core node is mostly idle. You can drop to a smaller model
+#  (e.g. sky_ele with ncpus=20) if you want to save hours.
+#
+#  USAGE
+#     qsub submit_CoCr_stage3.pbs
+#     tail -f stage3_Co-Cr_*.log
+# ============================================================================
+
+set -euo pipefail
+
+# ───────────────────────── USER CONFIG (edit me) ────────────────────────────
+# Element pair (used only for log filenames; informational).
+ELEMENT_A="Co"
+ELEMENT_B="Cr"
+
+# Where Stages 1+2 wrote their work directories. The script auto-picks the
+# newest <prefix>_N directory and reads <prefix>_N/tdb_manifest.json.
+WORKDIR_PREFIX="/nobackupp27/pjalagam/${ELEMENT_A}-${ELEMENT_B}_automate"
+
+# Manifest override: if non-empty, this exact path is used and WORKDIR_PREFIX
+# is ignored. Leave empty to auto-pick the latest.
+MANIFEST_OVERRIDE=""
+
+# Reference TDB to score against.
+REF_TDB="/nobackupp27/pjalagam/AlCoCrNi.TDB"
+
+# Composition element for the X axis (upper case, e.g. "CO").
+COMP_ELEMENT="CO"
+
+# ── Equilibrium phase list ──────────────────────────────────────────────────
+# IMPORTANT: this list must match phase names that exist in BOTH the
+# reference TDB and the candidate (combined) TDBs you're scoring.
+#
+# Known sigma-phase asymmetry: sqs2tdb writes SIGMA_D8B, but the
+# AlCoCrNi.TDB reference calls it SIGMA_SGTE — so including SIGMA_D8B
+# here will be silently dropped from the reference side by the resilient
+# fallback. Easiest: leave SIGMA out unless you've matched names on both
+# sides. To diagnose what's actually in your reference TDB run
+# diagnose_ref_tdb.py against it (lists every phase + sublattice model).
+EQ_PHASES="FCC_A1,HCP_A3,BCC_A2"
+
+# ── Stage-3 equilibrium conditions ──────────────────────────────────────────
+T_RANGE="500,1200,50"     # T_min,T_max,T_step (K)
+X_GRID=0.005
+BOUNDARY_WEIGHT=0.25
+MAX_COMBOS=500            # cap on cross-phase combinations to score
+
+# Stage 3 must stay at 1 worker; see comment at top of file.
+SCORE_WORKERS=1
+
+# ── Site-specific environment (HPC modules / venv / ATAT install) ───────────
+VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
+ATAT_BIN="/home7/pjalagam/bin"
+
+# Where the Python scripts live. Defaults to the directory the job was
+# submitted from. Override with an absolute path if you submit elsewhere.
+SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
+
+# ───────────────────────── END USER CONFIG ──────────────────────────────────
+
+
+# ============================================================================
+#  Below this line you should not normally need to edit.
+# ============================================================================
+
+set -x
+
+# ── Environment ─────────────────────────────────────────────────────────────
+module purge
+module load python3
+module load gcc
+
+if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "ERROR: venv activate script not found: $VENV_ACTIVATE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$VENV_ACTIVATE"
+
+# ATAT executables on PATH (sqs2tdb -tdb is invoked by score_tdb_combinations).
+export PATH="${ATAT_BIN}:${PATH}"
+
+# Pin BLAS/OpenMP threads — even though Stage 3 is single-process, pycalphad
+# can spawn BLAS threads we don't want.
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# ── Workdir & log file ──────────────────────────────────────────────────────
+WORKDIR="${PBS_O_WORKDIR:-$PWD}"
+cd "$WORKDIR"
+
+PIPELINE_LOG="${WORKDIR}/stage3_${ELEMENT_A}-${ELEMENT_B}_$(date +%Y%m%d_%H%M%S).log"
+
+# ── Sanity checks (fail fast with clear messages) ───────────────────────────
+if [ ! -f "${SCRIPT_DIR}/score_tdb_combinations.py" ]; then
+    echo "ERROR: score_tdb_combinations.py not found at: ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+
+# Guard against the "PBS overwrote my python file" trap.
+first_line=$(head -1 "${SCRIPT_DIR}/score_tdb_combinations.py" 2>/dev/null || true)
+if ! printf '%s' "$first_line" | grep -qE '^#!.*python|^"""|^#|^from |^import '; then
+    echo "ERROR: ${SCRIPT_DIR}/score_tdb_combinations.py does not look like python."
+    echo "       First line was: $first_line"
+    echo "       Was it overwritten by a PBS log? Restore from the repo checkout"
+    echo "       and check for a stray '#PBS -o score_tdb_combinations.py'."
+    exit 1
+fi
+
+if ! command -v sqs2tdb >/dev/null 2>&1; then
+    echo "ERROR: 'sqs2tdb' not on PATH after loading modules + venv." >&2
+    echo "       score_tdb_combinations.py invokes 'sqs2tdb -tdb' to combine" >&2
+    echo "       per-phase TDBs. Check ATAT_BIN in the USER CONFIG block." >&2
+    exit 1
+fi
+
+if [ ! -f "${REF_TDB}" ]; then
+    echo "ERROR: reference TDB not found: ${REF_TDB}" >&2
+    exit 1
+fi
+
+# ── Resolve manifest ────────────────────────────────────────────────────────
+if [ -n "${MANIFEST_OVERRIDE}" ]; then
+    MANIFEST="${MANIFEST_OVERRIDE}"
+    AUTODIR=$(dirname "${MANIFEST}")
+else
+    AUTODIR=$(ls -1td "${WORKDIR_PREFIX}"_* 2>/dev/null | head -1)
+    if [ -z "${AUTODIR}" ]; then
+        echo "ERROR: no '${WORKDIR_PREFIX}_*' directories found." >&2
+        echo "       Either run Stages 1+2 first (submit_CoCr.pbs) or set" >&2
+        echo "       MANIFEST_OVERRIDE to an existing manifest path." >&2
+        exit 1
+    fi
+    MANIFEST="${AUTODIR}/tdb_manifest.json"
+fi
+
+if [ ! -f "${MANIFEST}" ]; then
+    echo "ERROR: tdb_manifest.json not found at: ${MANIFEST}" >&2
+    echo "       Expected to read from ${AUTODIR}/." >&2
+    exit 1
+fi
+
+# ── Header ──────────────────────────────────────────────────────────────────
+{
+echo "=========================================================="
+echo "  ${ELEMENT_A}-${ELEMENT_B} TDB pipeline — Stage 3 only"
+echo "=========================================================="
+echo "  Job started     : $(date)"
+echo "  Host            : $(hostname)"
+echo "  Node model      : mil_ait (128 cores, only 1 used)"
+echo "  Workdir         : ${WORKDIR}"
+echo "  Script dir      : ${SCRIPT_DIR}"
+echo "  Stage 3 log     : ${PIPELINE_LOG}"
+echo "  Python          : $(which python3)"
+echo "  sqs2tdb         : $(which sqs2tdb)"
+echo "  Manifest        : ${MANIFEST}"
+echo "  Reference TDB   : ${REF_TDB}"
+echo "  Eq phases       : ${EQ_PHASES}"
+echo "  Comp element    : ${COMP_ELEMENT}"
+echo "  T range         : ${T_RANGE}"
+echo "  X grid          : ${X_GRID}"
+echo "  Max combos      : ${MAX_COMBOS}"
+echo "=========================================================="
+} | tee "${PIPELINE_LOG}"
+
+# ============================================================================
+#  Stage 3: cross-phase combination & scoring
+# ============================================================================
+python3 "${SCRIPT_DIR}/score_tdb_combinations.py" \
+    --manifest "${MANIFEST}" \
+    --ref-tdb "${REF_TDB}" \
+    --comp-element "${COMP_ELEMENT}" \
+    --eq-phases "${EQ_PHASES}" \
+    --T-range "${T_RANGE}" \
+    --X-grid "${X_GRID}" \
+    --boundary-weight "${BOUNDARY_WEIGHT}" \
+    --n-workers "${SCORE_WORKERS}" \
+    --max-combos "${MAX_COMBOS}" \
+    2>&1 | tee -a "${PIPELINE_LOG}"
+
+SCORE_RC=${PIPESTATUS[0]}
+
+{
+echo ""
+echo "=========================================================="
+echo "  Job finished      : $(date)"
+echo "  Stage 3 exit code : ${SCORE_RC}"
+echo "  Stage 3 log       : ${PIPELINE_LOG}"
+echo "  Best TDB lives in : ${AUTODIR}/stage3_scoring/"
+echo "=========================================================="
+} | tee -a "${PIPELINE_LOG}"
+
+exit "${SCORE_RC}"
