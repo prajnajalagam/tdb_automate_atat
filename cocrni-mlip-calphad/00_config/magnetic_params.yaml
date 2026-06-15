@@ -1,0 +1,68 @@
+# Magnetic parameters from YOUR refined collinear ordered/disordered moment pipeline.
+# These feed the Inden–Hillert–Jarl magnetic Gibbs term in the TDB.
+#
+# Format per phase:
+#   beta(x):    mean magnetic moment per mole of atoms, expressed as polynomial coefficients
+#               in (x_Co, x_Cr, x_Ni) — typically Redlich-Kister-like. Units: μ_B.
+#   T_star(x):  Curie (FM) or Néel (AFM) temperature; same polynomial form. Units: K.
+#   ordering:   FM | AFM (sign convention: AFM → negative T* in IHJ formalism)
+#
+# If your pipeline produces site-resolved β_i for σ-phase, use the `sublattices` block.
+
+FCC_A1:
+  ordering: FM      # at high Co/Ni content; effectively PM at Cr-rich because T* < 0 K
+  ihj_p: 0.4
+  # G_mag = R*T*ln(beta+1)*f(tau);   tau = T/T*
+  # Populate these from your DFT+refinement fits:
+  beta_endmembers:
+    Co: 1.70    # FCC Co, FM
+    Cr: -0.008  # FCC Cr, weakly AFM in collinear approx
+    Ni: 0.52    # FCC Ni, FM
+  beta_binary_L0:
+    Co_Cr: 0.0
+    Co_Ni: 0.0
+    Cr_Ni: 0.0
+  beta_binary_L1: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+  beta_ternary: 0.0
+
+  Tstar_endmembers:
+    Co: 1396.0
+    Cr: -1109.0   # FCC Cr; negative → AFM in IHJ
+    Ni: 633.0
+  Tstar_binary_L0:
+    Co_Cr: 0.0
+    Co_Ni: 411.0
+    Cr_Ni: 0.0
+  Tstar_binary_L1: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+  Tstar_ternary: 0.0
+  # ^ Replace zeros with your refined values; the script will write
+  #   PARAMETER TC(FCC_A1,Co,Cr,Ni;0/1/...) and PARAMETER BMAGN(FCC_A1,...) lines.
+
+HCP_A3:
+  ordering: FM
+  ihj_p: 0.4
+  beta_endmembers: {Co: 1.70, Cr: 0.0, Ni: 0.62}
+  Tstar_endmembers: {Co: 1396.0, Cr: 0.0, Ni: 0.0}
+  beta_binary_L0: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+  Tstar_binary_L0: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+
+BCC_A2:
+  ordering: AFM
+  ihj_p: 0.28
+  beta_endmembers: {Co: 1.35, Cr: 0.008, Ni: 0.85}
+  Tstar_endmembers: {Co: 1450.0, Cr: -311.5, Ni: 575.0}
+  beta_binary_L0: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+  Tstar_binary_L0: {Co_Cr: 0.0, Co_Ni: 0.0, Cr_Ni: 0.0}
+
+SIGMA:
+  ordering: AFM   # complex; often treated as PM in CALPHAD, refine per your data
+  ihj_p: 0.28
+  sublattices:
+    A: {beta: 0.0, Tstar: 0.0}
+    B: {beta: 0.0, Tstar: 0.0}
+    C: {beta: 0.0, Tstar: 0.0}
+    D: {beta: 0.0, Tstar: 0.0}
+    E: {beta: 0.0, Tstar: 0.0}
+
+LIQUID:
+  ordering: none   # No magnetic Gibbs term for liquid in IHJ

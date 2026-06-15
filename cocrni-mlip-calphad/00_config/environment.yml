@@ -1,0 +1,25 @@
+name: cocrni
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - ase>=3.23
+  - pymatgen>=2024.5.1
+  - phonopy
+  - pyyaml
+  - tqdm
+  - h5py
+  - pytorch::pytorch
+  - pip
+  - pip:
+      - pycalphad>=0.11
+      - mace-torch>=0.3.6
+      - chgnet>=0.4
+      # spin-MLIP installed separately from gitlab.com/ivannovikov/spin-mlip
+      # ATAT (mcsqs, etc.) installed separately from axelvdw/atat
+      # LAMMPS w/ MLIP interface installed separately from gitlab.com/ivannovikov/interface-lammps-spin-mlip
