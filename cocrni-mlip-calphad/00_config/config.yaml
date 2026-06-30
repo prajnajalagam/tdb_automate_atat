@@ -1,0 +1,125 @@
+# Master configuration for the Co-Cr-Ni first-principles phase diagram pipeline.
+# Edit paths and resource settings to match your cluster.
+
+elements: [Co, Cr, Ni]
+
+composition_grid:
+  # Triangular grid in mole fractions; ΔX = 0.05 → 231 ternary points
+  # Plus 3 binary edges at finer ΔX = 0.025 for accurate L_ij fits
+  step_ternary: 0.05
+  step_binary: 0.025
+  include_endmembers: true
+
+phases:
+  FCC_A1:
+    pearson: cF4
+    spacegroup: 225
+    sqs_size_atoms: 32  # 2x2x2 conventional
+    sqs_correlations: [pair_3nn, triplet_2nn]
+    dlm_realizations: 8
+    magnetic_state: paramagnetic_DLM
+    notes: "Matrix of CrCoNi MEAs; primary phase of interest."
+
+  HCP_A3:
+    pearson: hP2
+    spacegroup: 194
+    sqs_size_atoms: 36   # 3x3x2 conventional
+    sqs_correlations: [pair_3nn, triplet_2nn]
+    dlm_realizations: 8
+    magnetic_state: paramagnetic_DLM
+    ca_ratio: 1.623
+
+  BCC_A2:
+    pearson: cI2
+    spacegroup: 229
+    sqs_size_atoms: 54   # 3x3x3 conventional
+    sqs_correlations: [pair_3nn, triplet_2nn]
+    dlm_realizations: 8
+    magnetic_state: collinear_AFM_or_DLM
+    notes: "Cr-rich; collinear AFM-(001) approx for ground state."
+
+  SIGMA:
+    # D8b, 30 atoms/cell, 5 inequivalent Wyckoff sites
+    # Special handling: train mMTP on explicit σ configs (see 01_sqs/sigma_special.py)
+    pearson: tP30
+    spacegroup: 136
+    sublattices: [A: 2, B: 4, C: 8, D: 8, E: 8]
+    sqs_per_sublattice: true
+    dlm_realizations: 4
+    magnetic_state: site_dependent_DLM
+
+  LIQUID:
+    # Approximate via amorphous SQS at high T; thermodynamic integration
+    initial_density: 8.0  # g/cm^3 starting guess
+    md_T_grid: [1700, 1900, 2100, 2300]  # K
+    dlm_realizations: 8
+
+dft:
+  code: vasp
+  vasp_version: "6.4"
+  encut_eV: 520
+  kspacing_invA: 0.18      # gamma-centered
+  smearing: methfessel_paxton
+  sigma_eV: 0.05
+  ediff: 1.0e-6
+  ediffg: -0.01
+  ispin: 2
+  lreal: auto
+  potcar_set: PBE_54
+  potcars: {Co: Co, Cr: Cr_pv, Ni: Ni}   # _pv recommended for Cr
+  soft_constrained:
+    lambda_ladder: [1, 2, 5, 10, 20, 40]
+    delta_M_max: 0.03    # μ_B
+    delta_M_av: 0.02     # μ_B
+    E_p_tol: 0.01        # eV/atom (penalty contribution)
+  resources:
+    ncores_per_job: 64
+    walltime_h: 6
+    queue: parallel
+
+mmtp:
+  level: 12
+  n_radial: 8
+  n_magnetic: 2
+  r_cut: 5.0   # Å (larger than Burov 4.0 because of 3-element + σ-phase complexity)
+  weights: {e: 1.0, f: 0.01, s: 0.001}
+  active_learning:
+    gamma_low: 3.0
+    gamma_up: 5.0
+    max_al_iters: 12
+    md_T_range_K: [300, 2200]
+    md_T_step_K: 200
+    md_steps_per_iter: 50000
+    md_timestep_fs: 1.0
+
+gnn:
+  backbone: mace_mp_0a    # alternatives: chgnet-v0.4.0, orb-d3-v2
+  finetune_epochs: 200
+  lr: 0.001
+  loss_weights: {e: 1.0, f: 0.1, m: 0.5}   # m = magnetic moment regularizer
+  device: cuda
+  batch_size: 8
+
+free_energy:
+  method: thermodynamic_integration   # alt: quasi_harmonic
+  T_grid_K: [300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200]
+  reference: einstein_crystal         # liquid: ideal_gas
+  lambda_steps: 21
+  md_equilibration_ps: 20
+  md_production_ps: 100
+
+calphad:
+  rk_order_binary: 2   # L^0, L^1, L^2
+  rk_order_ternary: 1   # L^123 only (Muggianu)
+  ihj_p: 0.4             # IHJ p parameter; 0.4 for FCC/HCP; 0.28 for BCC
+  reference_state: SER
+  output_tdb: cocrni_firstprinciples.tdb
+
+# Paths — edit for your cluster
+paths:
+  vasp_executable: /opt/vasp/6.4.0/bin/vasp_std
+  lammps_executable: /opt/lammps/build/lmp
+  mlp_executable: /opt/spin-mlip/bin/mlp
+  mcsqs_executable: /opt/atat/bin/mcsqs
+  potcar_dir: /opt/vasp/POTCAR/PBE_54
+  scratch: /scratch/${USER}/cocrni

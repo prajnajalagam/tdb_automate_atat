@@ -1,26 +1,14 @@
-# Default policy: TDB bytes don't get redistributed through git, because
-# some indexed sources are paywalled or by-author-permission. Track only
-# the manifest and citation sidecars by default.
+# Don't redistribute TDB files through this repo. Some are paywalled,
+# some are by-author-permission, and even the open ones have specific
+# license requirements that are best preserved at the source URL.
+# Track only the manifest and citation sidecars.
 *.tdb
 *.TDB
 *.tdb.txt
 *.TDB.txt
 
-# Always keep:
+# Keep these:
 !README.md
 !.gitignore
 !_manifest.yaml
 !*.citation.yaml
-
-# ── Per-system corpus directories the user has explicitly chosen ──
-# ── to share. These OVERRIDE the global *.tdb gitignore above. ────
-# When adding a new system, mirror this pattern: list the dir name
-# (so .tdb files inside are tracked) AND any subdirectories.
-!Co-Cr/
-!Co-Cr/**
-!Co-Cr-Ni/
-!Co-Cr-Ni/**
-!Co-Ni/
-!Co-Ni/**
-!Cr-Ni/
-!Cr-Ni/**

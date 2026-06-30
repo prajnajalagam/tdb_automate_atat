@@ -17,15 +17,13 @@ mean ± uncertainty across N curated references.
 
 | Component | File | Status |
 |---|---|---|
-| Corpus directory | [`corpus/`](corpus/) | ✅ 4 systems / 21 TDBs (Co-Cr, Co-Cr-Ni, Co-Ni, Cr-Ni) |
+| Corpus directory + manifest | [`corpus/`](corpus/) | ✅ skeleton; populate locally |
 | Local-TDB validation + indexing | [`corpus_ingest.py`](corpus_ingest.py) | ✅ works |
 | Known-open-source fetcher | [`tdbdb_fetch_open.py`](tdbdb_fetch_open.py) | ✅ small initial registry |
 | Open-source registry | [`open_sources.yaml`](open_sources.yaml) | ✅ seed entries; PRs welcome |
 | TDBDB API client | [`tdbdb_query.py`](tdbdb_query.py) | ⬜ stub — awaiting API spec |
 | API spec drop-zone | [`api_spec/`](api_spec/) | ⬜ paste help.html here |
-| Target-extraction notebook | [`reverse_engineer_targets.ipynb`](reverse_engineer_targets.ipynb) | ✅ Fable-generated; produces consensus + RK targets |
-| Target JSON drop-zone | [`targets/`](targets/) | ⬜ run notebook per (system, phase) |
-| SQS consensus-target gate | [`sqs_target_gate.py`](sqs_target_gate.py) | ✅ wired into `sqs2tdb_pipeline.py` via `--target-dir` |
+| Layer-1 ensemble scoring | (in `../TDB Automated Generator/`) | ⬜ next, after corpus seeded |
 
 ---
 
@@ -142,38 +140,6 @@ the corpus composition is reproducible without redistributing the
 content itself.
 
 ---
-
-## Using the consensus targets as an SQS filter
-
-This is the closing of the loop described in the project notes:
-**reverse-engineer the DFT inputs that the experimentally-accepted
-phase diagrams imply, then accept only those SQS into the fit.**
-
-1. Open `reverse_engineer_targets.ipynb`. For each (system, phase)
-   you care about, set the `elements` and `phase_name` in the main
-   cell, run all cells. The notebook writes a consensus JSON named
-   `<A>_<B>_<phase>_consensus.json`. Move/copy these into
-   [`targets/`](targets/).
-2. Submit the binary pipeline with the new flag pointing at that
-   directory:
-   ```bash
-   python3 sqs2tdb_pipeline.py \
-       --endmembers-yaml endmembers.yaml \
-       --data-roots /path/to/CoCr_data \
-       --target-dir ../tdb_corpus/targets \
-       --target-tol-sigma 3.0 \
-       --target-dft-noise-floor 0.005
-   ```
-3. During discovery, each SQS's same-phase DFT excess formation
-   energy is z-scored against the RK-excess of the consensus mean.
-   SQS more than `--target-tol-sigma` away are **rejected** with a
-   logged reason; the surviving pool is what sqs2tdb fits. Phases
-   without a matching JSON run without the gate (unchanged behavior).
-
-The math behind the gate is described in
-[`sqs_target_gate.py`](sqs_target_gate.py)'s module docstring and
-matches the notebook's Cell 12 (RK fit) + Cell 13 (gate sigma) exactly
-so a hand check in the notebook agrees with the pipeline's reject log.
 
 ## What this is *not*
 

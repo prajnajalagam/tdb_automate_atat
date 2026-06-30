@@ -1,0 +1,68 @@
+
+$Appendix C, Assessed Ag-Al database
+$
+TEMP-LIM 298.15 6000.00 !
+$
+$ELEMENT STABLE ELEMENT REF.              MASS     H298-H0       S298
+ ELEMENT VA   VACUUM                    0.0000E+00  0.0000E+00  0.0000E+00!
+ ELEMENT CO   HCP_A3                    5.8933E+01  0.0000E+00  0.0000E+00!
+ ELEMENT NI   FCC_A1                    5.8690E+01  4.7870E+03  2.9796E+01!
+ ELEMENT RU   HCP_A3                    1.0107E+02  4.6024E+03  2.8535E+01!
+$
+$PHASE NAME TYPE NR OF SUBL. SITES IN EACH SUBL
+$
+PHASE FCC_A1  % 2 1.0  1.0  !
+CONSTITUENT FCC_A1  : NI CO RU: VA: !
+$
+$
+DEFAULT-COMMAND DEF-SYS-ELEMENT VA !
+TYPE-DEFINITION % SEQ * !
+$
+$============== V O L U M E D A T A==============================
+$ DUMMY DATA
+PARAM VS(FCC_A1) 0 1.0E-5; 6000 N!
+$
+$============== D I F F U S I O N D A T A ========================
+$
+ZEROVOLUME_SPECIES VA !
+$
+$ ======================== P A R A M E T E R S ====================
+$
+$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+$ FCC
+$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+$CO
+
+PARAM MQ(FCC_A1&CO,CO:VA) 298.15 -286175-76*T; 6000 N!
+
+PARAM MQ(FCC_A1&CO,NI:VA) 298.15 -284169-67.6*T; 6000 N!
+
+PARAM MQ(FCC_A1&CO,RU:VA) 298.15 -382950-109.4*T; 6000 N!
+
+PARAM MQ(FCC_A1&CO,CO,NI:VA;0) 298.15 10787-11.5*T; 6000 N!
+
+PARAM MQ(FCC_A1&CO,NI,RU:VA;0) 298.15 0; 6000 N!
+$interactions
+$
+$$ NI
+PARAM MQ(FCC_A1&NI,NI:VA) 298.15 -287000-69.8*T; 6000 N!
+
+PARAM MQ(FCC_A1&NI,CO:VA) 298.15 -270348-87.3*T; 6000 N!
+
+PARAM MQ(FCC_A1&NI,RU:VA) 298.15 -294401-105*T; 6000 N!
+
+PARAM MQ(FCC_A1&NI,NI,CO:VA;0) 298.15 7866+7.65*T; 6000 N!
+
+PARAM MQ(FCC_A1&NI,NI,RU:VA;0) 298.15 309918.61; 6000 N!
+$interactions
+$
+$$ RU
+PARAM MQ(FCC_A1&RU,RU:VA) 298.15 -386130-73.9*T; 6000 N!
+
+PARAM MQ(FCC_A1&RU,NI:VA) 298.15 -304489.39-68.97*T; 6000 N!
+
+PARAM MQ(FCC_A1&RU,CO:VA) 298.15 -304489.39-68.97*T; 6000 N!
+
+PARAM MQ(FCC_A1&RU,RU,NI:VA) 298.15 11419.67; 6000 N!
+
+PARAM MQ(FCC_A1&RU,NI,CO:VA;0) 298.15 0; 6000 N!
