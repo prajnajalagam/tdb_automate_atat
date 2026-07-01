@@ -285,8 +285,8 @@ def oszicar_score(d: Path) -> Optional[float]:
 
 
 def has_mandatory_files(d: Path) -> bool:
-    """str.out and energy must exist. str_relax.out is checked but not required."""
-    return (d / "energy").is_file() and (d / "str.out").is_file()
+    """str.out, energy, and str_relax.out must exist."""
+    return (d / "energy").is_file() and (d / "str.out").is_file() and (d / "str_relax.out").is_file()
 
 
 def has_all_files(d: Path) -> Tuple[bool, List[str]]:
