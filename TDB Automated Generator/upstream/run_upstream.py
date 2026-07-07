@@ -139,7 +139,7 @@ def process_phase(phase: str,
                   relax_method: str,
                   algo: str,
                   tol_ev: float,
-                  sqs_level: Optional[int],
+                  sqs_levels: List[int],
                   sigma_elements: List[str],
                   template_root: Optional[Path],
                   env_bin: Optional[str],
@@ -155,14 +155,26 @@ def process_phase(phase: str,
 
     # SIGMA endmember-only handling (caveat 2).
     if phase in ENDMEMBER_ONLY_PHASES:
+        # SIGMA in a binary has no composition mesh — endmember corners
+        # only. Pass sqs_levels through for the (rare) DLM sigma_from_lev3
+        # override; process_sigma decides what to actually do.
         return process_sigma(phase, work_root, potcar_paths, dlm, relax_method,
-                             algo, tol_ev, sqs_level, sigma_elements, env_bin,
+                             algo, tol_ev, sqs_levels, sigma_elements, env_bin,
                              skip_phonon, timeout)
 
-    phase_root = sqsgen.generate_phase_sqs(
-        work_root, phase, elements=sigma_elements,
-        level=sqs_level, dlm=dlm.enabled,
-        env_bin=env_bin)
+    # Iterate over requested SQS levels (default [2]). Each call adds the
+    # structures for that composition mesh; sqs2tdb -cp is idempotent
+    # when species.in already exists so re-invocation is safe. Higher
+    # levels can be added later by re-running with --sqs-level "2,3"
+    # etc. — this is the "iteratively add higher-lev SQS if fit
+    # quality is inadequate" workflow.
+    print(f"    Generating SQS at level(s): {sqs_levels}")
+    phase_root = None
+    for lv in sqs_levels:
+        phase_root = sqsgen.generate_phase_sqs(
+            work_root, phase, elements=sigma_elements,
+            level=lv, dlm=dlm.enabled,
+            env_bin=env_bin)
 
     sqs_dirs = discover_sqs_dirs(phase_root)
     print(f"    {len(sqs_dirs)} SQS directories")
@@ -183,7 +195,7 @@ def process_sigma(phase: str,
                   relax_method: str,
                   algo: str,
                   tol_ev: float,
-                  sqs_level: Optional[int],
+                  sqs_levels: List[int],
                   sigma_elements: List[str],
                   env_bin: Optional[str],
                   skip_phonon: bool,
@@ -192,7 +204,10 @@ def process_sigma(phase: str,
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
     # species); otherwise the usual endmember (lev=0) generation is used.
-    gen_level = 3 if (dlm.enabled and dlm.sigma_from_lev3) else (sqs_level or 0)
+    # SIGMA in a binary has no mixing composition mesh, so it is NOT
+    # subject to the multi-level iteration used for FCC/BCC/HCP —
+    # sqs_levels is only consulted for the DLM override path.
+    gen_level = 3 if (dlm.enabled and dlm.sigma_from_lev3) else 0
     phase_root = sqsgen.generate_phase_sqs(
         work_root, phase, elements=sigma_elements,
         level=gen_level, dlm=False, use_small=False,
@@ -254,15 +269,29 @@ def main():
     ap.add_argument("--algo", default="All",
                     help="VASP ALGO (default 'All' per spec; use 'Fast' to "
                          "match the reference vasp.wrap).")
-    ap.add_argument("--relax-method", choices=["normal", "infdet"],
-                    default="normal",
-                    help="Structural relaxation method.")
+    ap.add_argument("--relax-method",
+                    choices=["runstruct", "normal", "infdet"],
+                    default="runstruct",
+                    help="Structural relaxation method. 'runstruct' "
+                         "(default) invokes 'pollmach runstruct_vasp' — "
+                         "simplest, fastest for well-converged cases. "
+                         "'normal' and 'infdet' both wrap "
+                         "robustrelax_vasp and are automatically "
+                         "preceded by 'robustrelax_vasp -mk' to build "
+                         "the input files robustrelax needs.")
     ap.add_argument("--tol-ev", type=float, default=converge.DEFAULT_TOL_EV,
                     help="Convergence tolerance, eV/atom (default 0.001 = "
                          "1 meV/atom).")
-    ap.add_argument("--sqs-level", type=int, default=None,
-                    help="Restrict generation to this sqs level (-lev=N), if "
-                         "the local sqs2tdb honours it.")
+    ap.add_argument("--sqs-level", default="2",
+                    help="SQS composition mesh level(s) to generate, "
+                         "passed to sqs2tdb -cp as -lv=N. Comma-separated "
+                         "for iterative addition, e.g. '2' (default) "
+                         "generates the level-2 mesh only; '2,3' or "
+                         "'2,3,4' add finer meshes on top (each "
+                         "successive -lv=N adds only that level's "
+                         "structures — the tree accumulates). Re-run "
+                         "upstream with a larger list if a lev=2 fit is "
+                         "not accurate enough downstream.")
     ap.add_argument("--env-bin", default=None,
                     help="Prepend this directory to PATH for ATAT/VASP "
                          "executables.")
@@ -286,6 +315,19 @@ def main():
     dlm = DLMConfig(enabled=args.dlm, subatom=subatom)
     sigma_elements = [args.element1, args.element2]
 
+    # Parse --sqs-level into a list of ints. "2" -> [2]; "2,3" -> [2, 3];
+    # empty falls back to [2] so the default behaviour matches the
+    # single-level flag semantics from before.
+    try:
+        sqs_levels = [int(x) for x in args.sqs_level.split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit(
+            f"--sqs-level must be a comma-separated list of ints; "
+            f"got {args.sqs_level!r}"
+        )
+    if not sqs_levels:
+        sqs_levels = [2]
+
     # Fail fast if ENMAX can't be read -- the whole convergence stage depends
     # on it, and a silent 0 cutoff would ruin every run.
     max_e = potcar.max_enmax(potcar_paths)
@@ -301,6 +343,7 @@ def main():
     print(f"  Conv tol    : {args.tol_ev*1e3:.1f} meV/atom")
     print(f"  ALGO        : {args.algo}")
     print(f"  Relax       : {args.relax_method}")
+    print(f"  SQS levels  : {sqs_levels}")
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
           + (f"  SUBATOM={subatom}" if args.dlm else ""))
     print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}")
@@ -314,10 +357,11 @@ def main():
         "relax_method": args.relax_method,
         "phases": [],
     }
+    manifest["sqs_levels"] = sqs_levels
     for phase in phases:
         res = process_phase(
             phase, work_root, potcar_paths, dlm, args.relax_method,
-            args.algo, args.tol_ev, args.sqs_level, sigma_elements,
+            args.algo, args.tol_ev, sqs_levels, sigma_elements,
             template_root, args.env_bin, args.skip_phonon, args.timeout)
         manifest["phases"].append(res)
 
