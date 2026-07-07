@@ -1,0 +1,3 @@
+This folder contains attempts to make scripts for VASP/PyCALPHAD/ATAT/TDBDB integration and seamless workflows for generating first principles multicomponent alloy thermodynamic databases.
+Please use all available options prewritten in PyCALPHAD and ATAT before writing custon scripts, only do so when necessary and to tie in different features. We are not reinventing the wheel, just automating workflows.
+Comment well on scripts, and always consider the permissions listed in NAS_VASP.md to know how to format for NAS systems. Assume by default all scripts are for use in NAS.
