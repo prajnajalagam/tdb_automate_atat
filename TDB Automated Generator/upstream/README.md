@@ -80,6 +80,7 @@ python3 run_upstream.py \
   --element1 Co --element2 Cr \
   --work-root /scratch/CoCr_upstream \
   --potcars $VASP_PP/Co/POTCAR,$VASP_PP/Cr/POTCAR \
+  ##internally this is --potcars /home1/zwu6/vasp/POTPAW_PBE.64/Cr_pv,/home1/zwu6/vasp/POTPAW_PBE.64/Co
   --template-root /home/you/atat_small_templates \
   --phases FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B \
   --relax-method normal \
