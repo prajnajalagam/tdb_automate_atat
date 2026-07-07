@@ -160,7 +160,8 @@ def process_phase(phase: str,
                              skip_phonon, timeout)
 
     phase_root = sqsgen.generate_phase_sqs(
-        work_root, phase, level=sqs_level, dlm=dlm.enabled,
+        work_root, phase, elements=sigma_elements,
+        level=sqs_level, dlm=dlm.enabled,
         env_bin=env_bin)
 
     sqs_dirs = discover_sqs_dirs(phase_root)
@@ -193,7 +194,8 @@ def process_sigma(phase: str,
     # species); otherwise the usual endmember (lev=0) generation is used.
     gen_level = 3 if (dlm.enabled and dlm.sigma_from_lev3) else (sqs_level or 0)
     phase_root = sqsgen.generate_phase_sqs(
-        work_root, phase, level=gen_level, dlm=False, use_small=False,
+        work_root, phase, elements=sigma_elements,
+        level=gen_level, dlm=False, use_small=False,
         env_bin=env_bin)
 
     endmember_dirs: List[Path] = []

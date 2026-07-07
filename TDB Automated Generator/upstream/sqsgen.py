@@ -39,24 +39,33 @@ def _sqs2tdb_target(phase: str, use_small: bool) -> str:
 
 def generate_phase_sqs(work_root: Path,
                        phase: str,
+                       elements: Optional[List[str]] = None,
                        level: Optional[int] = None,
                        dlm: bool = False,
                        use_small: Optional[bool] = None,
+                       species_edit=None,
                        env_bin: Optional[str] = None,
                        timeout: int = 600) -> Path:
     """Generate the SQS directory tree for one phase under work_root.
 
-    Runs, inside ``work_root``:
-        sqs2tdb -cp -l=<target>      (copy the SQS skeleton + structures)
-    and, if dlm and the phase is single-sublattice, then runs ``randomspin``
-    inside the produced *_small directory so str.out picks up +2/-2 tags.
+    sqs2tdb -cp is a TWO-PASS command: the first invocation only creates
+    <target>/species.in and exits (with rc=0 and the message "Edit the file
+    ... and rerun the same command"); only the second invocation copies the
+    SQS structures from the database. We therefore always run it twice, with
+    an optional ``species_edit(species_in_path)`` hook between the passes
+    (e.g. to impose the SIGMA_D8B per-sublattice +/- spin convention).
+    The double run is idempotent: if species.in already exists, pass 1 does
+    the copy and pass 2 is a no-op.
 
-    level   if given and supported by the installed sqs2tdb, restrict
-            generation to that level via ``-lev=<n>``. (The spec notes this
-            may or may not be honoured by the local sqs2tdb -- we pass it
-            through and the caller verifies the produced lev=* dirs.)
+    elements  passed as -sp=El1,El2. Required unless a species.in already
+              exists at the work_root level (sqs2tdb falls back to it).
+    level     restricts generation to one composition mesh level via
+              ``-lv=<n>`` (the actual flag name -- NOT -lev, which sqs2tdb
+              silently ignores).
     use_small  default: True for single-sublattice phases, False otherwise.
+    Runs ``randomspin`` in the produced *_small directory when dlm is set.
     Returns the directory sqs2tdb populated (work_root/<target>).
+    Raises RuntimeError if no sqsdb_* structure directories exist afterwards.
     """
     work_root = Path(work_root)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -66,15 +75,41 @@ def generate_phase_sqs(work_root: Path,
 
     cmd = ["sqs2tdb", "-cp", f"-l={target}"]
     if level is not None:
-        cmd.append(f"-lev={level}")
+        cmd.append(f"-lv={level}")
+    if elements:
+        cmd.append(f"-sp={','.join(elements)}")
+    elif not (work_root / "species.in").is_file():
+        raise RuntimeError(
+            f"generate_phase_sqs({phase}): no elements given and no "
+            f"species.in in {work_root}; sqs2tdb -cp would have nothing "
+            f"to generate for.")
+
+    # Pass 1: creates <target>/species.in and exits.
     runner.run_logged(cmd, cwd=work_root,
                       log=work_root / f"sqs2tdb_cp_{target}.log",
+                      env_bin=env_bin, timeout=timeout)
+
+    species_in = work_root / target / "species.in"
+    if species_edit and species_in.is_file():
+        species_edit(species_in)
+
+    # Pass 2: actually copies the SQS structures.
+    runner.run_logged(cmd, cwd=work_root,
+                      log=work_root / f"sqs2tdb_cp_{target}.2.log",
                       env_bin=env_bin, timeout=timeout)
 
     target_dir = work_root / target
     if not target_dir.is_dir():
         # Some sqs2tdb versions copy into the cwd rather than a named subdir.
         target_dir = work_root
+
+    # Verify the copy actually happened -- both passes exit 0 even when
+    # nothing was copied, so rc alone proves nothing.
+    if not any(target_dir.rglob("str.out")):
+        raise RuntimeError(
+            f"sqs2tdb -cp -l={target} produced no str.out under "
+            f"{target_dir} after two passes; see "
+            f"{work_root / f'sqs2tdb_cp_{target}.2.log'}")
 
     if dlm and phase in SINGLE_SUBLATTICE_PHASES:
         apply_randomspin(target_dir, env_bin=env_bin, timeout=timeout)
