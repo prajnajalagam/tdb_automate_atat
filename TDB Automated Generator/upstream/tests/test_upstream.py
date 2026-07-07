@@ -237,3 +237,77 @@ def test_sigma_lev3_explicit_tokens(tmp_path):
     s = read_structure(dst / "str.out")
     # tokens swapped: X2 -> up (+2), X1 -> down (-2)
     assert s.species() == ["Cr-2", "Cr+2", "Cr-2", "Cr+2"]
+
+
+# ---- sqs2tdb -cp two-pass behaviour -----------------------------------------
+
+def _fake_sqs2tdb(work_root, target, calls):
+    """Simulate sqs2tdb -cp: pass 1 only writes <target>/species.in;
+    pass 2 (species.in exists) copies the SQS structures."""
+    def fake_run_logged(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        calls.append(list(cmd))
+        tdir = Path(cwd) / target
+        sp = tdir / "species.in"
+        if not sp.is_file():
+            tdir.mkdir(parents=True, exist_ok=True)
+            sp.write_text("Co,Cr\n")
+        else:
+            d = tdir / "sqsdb_lev=1_a_0.5_b_0.5"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "str.out").write_text("1 0 0\n0 1 0\n0 0 1\n")
+        return 0
+    return fake_run_logged
+
+
+def test_generate_phase_sqs_runs_cp_twice(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sqsgen.runner, "run_logged",
+                        _fake_sqs2tdb(tmp_path, "BCC_A2_small", calls))
+    out = sqsgen.generate_phase_sqs(tmp_path, "BCC_A2", elements=["Co", "Cr"],
+                                    dlm=False)
+    cp_calls = [c for c in calls if c[:2] == ["sqs2tdb", "-cp"]]
+    assert len(cp_calls) == 2, "sqs2tdb -cp must be run twice"
+    assert all("-sp=Co,Cr" in c for c in cp_calls)
+    assert any(out.rglob("str.out"))
+
+
+def test_generate_phase_sqs_uses_lv_flag(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sqsgen.runner, "run_logged",
+                        _fake_sqs2tdb(tmp_path, "SIGMA_D8B", calls))
+    sqsgen.generate_phase_sqs(tmp_path, "SIGMA_D8B", elements=["Co", "Cr"],
+                              level=3, use_small=False)
+    assert all("-lv=3" in c for c in calls if c[:2] == ["sqs2tdb", "-cp"])
+    assert not any("-lev=3" in c for c in calls)
+
+
+def test_generate_phase_sqs_species_edit_between_passes(tmp_path, monkeypatch):
+    calls = []
+    seen = {}
+    monkeypatch.setattr(sqsgen.runner, "run_logged",
+                        _fake_sqs2tdb(tmp_path, "SIGMA_D8B", calls))
+
+    def edit(species_in):
+        # Hook fires after pass 1 (species.in exists, no SQS dirs yet).
+        seen["cp_calls_at_edit"] = len(
+            [c for c in calls if c[:2] == ["sqs2tdb", "-cp"]])
+        species_in.write_text("Co+2,Co-2\n")
+
+    sqsgen.generate_phase_sqs(tmp_path, "SIGMA_D8B", elements=["Co", "Cr"],
+                              level=3, use_small=False, species_edit=edit)
+    assert seen["cp_calls_at_edit"] == 1
+    assert (tmp_path / "SIGMA_D8B" / "species.in").read_text() == "Co+2,Co-2\n"
+
+
+def test_generate_phase_sqs_requires_elements_or_species_in(tmp_path):
+    with pytest.raises(RuntimeError, match="species.in"):
+        sqsgen.generate_phase_sqs(tmp_path, "BCC_A2")
+
+
+def test_generate_phase_sqs_fails_if_nothing_copied(tmp_path, monkeypatch):
+    def noop(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        (Path(cwd) / "BCC_A2_small").mkdir(exist_ok=True)
+        return 0
+    monkeypatch.setattr(sqsgen.runner, "run_logged", noop)
+    with pytest.raises(RuntimeError, match="no str.out"):
+        sqsgen.generate_phase_sqs(tmp_path, "BCC_A2", elements=["Co", "Cr"])
