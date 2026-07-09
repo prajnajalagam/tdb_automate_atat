@@ -2,7 +2,7 @@
 #PBS -S /bin/bash
 #PBS -N CoCr_UPSTREAM
 #PBS -q long
-#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
+#PBS -l select=1:ncpus=32:mpiprocs=32:model=mil_ait
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -o upstream_pbs.log
