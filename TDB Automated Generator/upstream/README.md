@@ -106,3 +106,46 @@ The pure logic — ENMAX parsing, ENCUT/KPPRA grids, `vasp.wrap` generation,
 the DLM fixup — is covered by `tests/` (`pytest`). The VASP-driving glue
 (`runner`, `converge.run_static_point`, `relax`, `phonon.run_fitfc`) can only
 be exercised on a real ATAT + VASP node.
+
+## Monitoring a running job (live logs)
+
+PBS only delivers `#PBS -o` output **after** the job ends, so the live
+view comes from files the pipeline writes as it goes:
+
+```bash
+# Step-level index — which phase / SQS / stage is running right now.
+# Every line timestamped; written by run_upstream.py itself:
+tail -f <WORK_ROOT>/upstream_live.log
+
+# Same content, captured by the PBS wrapper in the submit dir:
+tail -f upstream_live_<AB>_<timestamp>.log
+```
+
+Stage markers look like:
+
+```
+[2026-07-09 18:20:11] [sqsdb_lev=2_a_Co=0.5,...] STAGE 1/3 convergence sweep starting ...
+[2026-07-09 18:40:03] [sqsdb_lev=2_a_Co=0.5,...] STAGE 2/3 relaxation starting (method=runstruct; ...)
+[2026-07-09 19:55:47] [sqsdb_lev=2_a_Co=0.5,...] STAGE 2/3 relaxation done (str_relax.out present: True)
+[2026-07-09 19:55:48] [sqsdb_lev=2_a_Co=0.5,...] STAGE 3/3 fitfc phonons starting
+```
+
+Per-command detail (full VASP/ATAT output) streams live into per-step
+logs under `WORK_ROOT` — each STAGE marker names the one to watch:
+
+| Log | What's in it |
+|---|---|
+| `sqs2tdb_cp_<PHASE>.log`, `.2.log` | SQS generation, pass 1 / pass 2 |
+| `<sqs>/convergence/*/vasp.log` | each ENCUT/KPPRA sweep point |
+| `<sqs>/runstruct.log` | `pollmach runstruct_vasp` relaxation |
+| `<sqs>/robustrelax_mk.log` | robustrelax input generation (`-mk`) |
+| `<sqs>/robustrelax_{normal,infdet}.log` | robustrelax / infdet relaxation |
+| `<sqs>/fitfc_*.log` | phonon stages |
+
+Quick health checks while it runs:
+
+```bash
+grep STAGE <WORK_ROOT>/upstream_live.log | tail -20   # recent stage history
+find <WORK_ROOT> -name str_relax.out | wc -l          # relaxations finished
+find <WORK_ROOT> -name energy | wc -l                 # energies produced
+```

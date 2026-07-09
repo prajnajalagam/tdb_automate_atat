@@ -70,6 +70,9 @@ source "$VENV_ACTIVATE"
 
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
 export OMP_NUM_THREADS=1
+# Live logging: without this, Python buffers stdout when piped and the
+# job looks dead until buffers flush. Belt-and-braces with `python3 -u`.
+export PYTHONUNBUFFERED=1
 
 if ! command -v sqs2tdb  >/dev/null 2>&1; then echo "no sqs2tdb on PATH";  exit 1; fi
 if ! command -v fitfc    >/dev/null 2>&1; then echo "no fitfc on PATH";    exit 1; fi
@@ -82,7 +85,21 @@ EXTRA=()
 EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
 [ -n "${TEMPLATE_ROOT}" ]    && EXTRA+=(--template-root "${TEMPLATE_ROOT}")
 
-python3 "${SCRIPT_DIR}/run_upstream.py" \
+# Live log in the submit dir (PBS -o only arrives after the job ends).
+# run_upstream.py ALSO tees itself to <WORK_ROOT>/upstream_live.log with
+# per-line timestamps; either file works with tail -f. Per-command detail
+# (VASP output, sqs2tdb chatter) is in the per-step logs under WORK_ROOT:
+#   sqs2tdb_cp_<PHASE>.log / .2.log     SQS generation, pass 1 / pass 2
+#   <sqs>/convergence/*/vasp.log        ENCUT/KPPRA sweep points
+#   <sqs>/runstruct.log                 pollmach runstruct_vasp relaxation
+#   <sqs>/robustrelax_mk.log            robustrelax input generation
+#   <sqs>/robustrelax_{normal,infdet}.log
+#   <sqs>/fitfc_*.log                   phonon stages
+LIVE_LOG="${SCRIPT_DIR}/upstream_live_${ELEMENT_A}${ELEMENT_B}_$(date +%Y%m%d_%H%M%S).log"
+echo "Live log (tail -f me): ${LIVE_LOG}"
+
+set +e   # capture the python exit code through the tee pipe
+python3 -u "${SCRIPT_DIR}/run_upstream.py" \
     --element1 "${ELEMENT_A}" \
     --element2 "${ELEMENT_B}" \
     --work-root "${WORK_ROOT}" \
@@ -91,6 +108,14 @@ python3 "${SCRIPT_DIR}/run_upstream.py" \
     --relax-method "${RELAX_METHOD}" \
     --tol-ev "${TOL_EV}" \
     --env-bin "${ATAT_BIN}" \
-    "${EXTRA[@]}"
+    "${EXTRA[@]}" \
+    2>&1 | tee "${LIVE_LOG}"
+RC=${PIPESTATUS[0]}
+set -e
+
+if [ "${RC}" -ne 0 ]; then
+    echo "ERROR: run_upstream.py exited rc=${RC}; see ${LIVE_LOG}" >&2
+    exit "${RC}"
+fi
 
 echo "Upstream generation complete. Feed ${WORK_ROOT} to select_endmembers.py."

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -77,6 +78,58 @@ def parse_dlm_moments(spec: Optional[str],
     return out
 
 
+class _LiveLog:
+    """Mirror a stream (stdout/stderr) into a live log file.
+
+    Why: PBS only delivers #PBS -o output after the job ENDS, and Python
+    buffers stdout when it isn't a terminal — so a running upstream job
+    is a black box. This tee writes every line to a file in the work
+    root with a timestamp prefix and flushes both sinks per write, so
+
+        tail -f <work_root>/upstream_live.log
+
+    shows orchestrator progress in real time. Per-command detail (VASP
+    chatter, sqs2tdb output) still goes to the per-step logs written by
+    runner.run_logged / run_polled — this file is the step-level index.
+    """
+
+    def __init__(self, stream, logfile: Path):
+        self._stream = stream
+        self._fh = open(logfile, "a", buffering=1)
+        self._at_line_start = True
+
+    def write(self, text: str) -> int:
+        n = self._stream.write(text)
+        self._stream.flush()
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start and chunk.strip():
+                self._fh.write(time.strftime("[%Y-%m-%d %H:%M:%S] "))
+            self._fh.write(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._fh.flush()
+        return n
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._fh.flush()
+
+    def isatty(self) -> bool:          # keep argparse/help behaviour sane
+        return False
+
+
+def install_live_log(work_root: Path) -> Path:
+    """Tee stdout+stderr into <work_root>/upstream_live.log."""
+    logfile = Path(work_root) / "upstream_live.log"
+    sys.stdout = _LiveLog(sys.stdout, logfile)
+    sys.stderr = _LiveLog(sys.stderr, logfile)
+    return logfile
+
+
+def stamp(msg: str) -> None:
+    """Step marker: timestamped both on screen and in the live log."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def discover_sqs_dirs(phase_root: Path) -> List[Path]:
     """All lev>0 SQS directories produced by sqs2tdb -cp under phase_root."""
     out: List[Path] = []
@@ -100,6 +153,8 @@ def process_one_sqs(sqs_dir: Path,
     """Convergence -> relax -> phonon for a single SQS directory."""
     sweep_root = sqs_dir / "convergence"
 
+    stamp(f"[{sqs_dir.name}] STAGE 1/3 convergence sweep starting "
+          f"(watch {sweep_root}/*/vasp.log)")
     chosen_encut, chosen_kppra, kres, eres = converge.converge_sqs(
         sqs_dir, sweep_root, potcar_paths,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
@@ -109,16 +164,26 @@ def process_one_sqs(sqs_dir: Path,
     print(eres.table())
     print(f"    -> chosen ENCUT={chosen_encut} eV, KPPRA={chosen_kppra}")
 
+    stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation starting "
+          f"(method={relax_method}; watch {sqs_dir}/"
+          f"{'runstruct' if relax_method == 'runstruct' else 'robustrelax_' + relax_method}.log)")
     relax.relax_structure(
         sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
         method=relax_method, dlm=dlm, algo=algo,
         env_bin=env_bin, timeout=timeout)
+    stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation done "
+          f"(str_relax.out present: "
+          f"{(sqs_dir / 'str_relax.out').is_file()})")
 
     phonon_out = None
     if not skip_phonon:
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
         phonon_out = str(phonon.run_fitfc(
             sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout))
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons done")
+    else:
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 phonons skipped (--skip-phonon)")
 
     return {
         "sqs_dir": str(sqs_dir),
@@ -305,6 +370,11 @@ def main():
 
     work_root = Path(args.work_root).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
+
+    # From here on, everything printed also lands (timestamped, flushed)
+    # in <work_root>/upstream_live.log — tail -f it while the job runs.
+    live_log = install_live_log(work_root)
+    stamp(f"live log: {live_log}")
     potcar_paths = [Path(p.strip()) for p in args.potcars.split(",") if p.strip()]
     template_root = Path(args.template_root) if args.template_root else None
     phases = ([p.strip() for p in args.phases.split(",")]
