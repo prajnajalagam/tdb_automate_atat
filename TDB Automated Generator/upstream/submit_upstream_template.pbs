@@ -31,17 +31,24 @@ POTCARS="TODO_VASP_PP/${ELEMENT_A}/POTCAR,TODO_VASP_PP/${ELEMENT_B}/POTCAR"
 TEMPLATE_ROOT="TODO_PATH/atat_small_templates"
 
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
-RELAX_METHOD="normal"            # normal | infdet
+RELAX_METHOD="runstruct"         # runstruct (default) | normal | infdet
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
-SQS_LEVEL=""                     # e.g. "1" to pass -lev=1; empty = default
 
-# Site-specific environment.
+# SQS composition mesh level(s), comma-separated. Default "2" generates
+# the lev=2 mesh only. To iteratively refine when a lev=2 fit isn't
+# accurate enough downstream, re-run the job with SQS_LEVEL="2,3" (adds
+# lev=3 on top of the existing lev=2 structures) or "2,3,4".
+SQS_LEVEL="2"
+
+# Site-specific environment (matches the NAS reference PBS for the
+# user's default VASP setup — comp-intel/2023.2.1 + mpi-intel/2021.16
+# on mil_ait, ATAT under ~/bin, VASP under zwu6's tree).
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
-VASP_BIN="TODO_PATH/vasp/bin"    # directory containing vasp_std etc.
+VASP_BIN="/home1/zwu6/vasp"      # directory containing vasp_std etc.
 SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
 # ───────────────────────── END USER CONFIG ──────────────────────────────────
 
@@ -55,6 +62,10 @@ set -x
 module purge
 module load python3
 module load gcc
+# Match the reference NAS PBS for VASP on mil_ait.
+module load comp-intel/2023.2.1
+module use -a /nasa/modulefiles/testing
+module load mpi-intel/2021.16
 source "$VENV_ACTIVATE"
 
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
@@ -67,7 +78,8 @@ if ! command -v pollmach >/dev/null 2>&1; then echo "no pollmach on PATH"; exit 
 EXTRA=()
 [ "${DLM}" = "yes" ]         && EXTRA+=(--dlm --dlm-moment "${DLM_MOMENT}")
 [ "${SKIP_PHONON}" = "yes" ] && EXTRA+=(--skip-phonon)
-[ -n "${SQS_LEVEL}" ]        && EXTRA+=(--sqs-level "${SQS_LEVEL}")
+# SQS_LEVEL default is "2" (see USER CONFIG); pass through as-is.
+EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
 [ -n "${TEMPLATE_ROOT}" ]    && EXTRA+=(--template-root "${TEMPLATE_ROOT}")
 
 python3 "${SCRIPT_DIR}/run_upstream.py" \

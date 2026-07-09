@@ -22,6 +22,7 @@ import vaspwrap
 import converge
 import sqsgen
 import phonon
+import relax
 import run_upstream
 from strfile import read_structure, strip_spin_suffix_text
 from phases import DLMConfig, SigmaDLMSpec, DLM_SPIN_UP, DLM_SPIN_DOWN
@@ -311,3 +312,167 @@ def test_generate_phase_sqs_fails_if_nothing_copied(tmp_path, monkeypatch):
     monkeypatch.setattr(sqsgen.runner, "run_logged", noop)
     with pytest.raises(RuntimeError, match="no str.out"):
         sqsgen.generate_phase_sqs(tmp_path, "BCC_A2", elements=["Co", "Cr"])
+
+
+# ---- relax.py: -mk prep and runstruct default ------------------------------
+
+class _RecCalls:
+    def __init__(self):
+        self.logged = []
+        self.polled = []
+
+    def logged_fn(self):
+        def f(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+            self.logged.append(list(cmd))
+            return 0
+        return f
+
+    def polled_fn(self, touch_str_relax=True):
+        def f(cmd, cwd, log, done_when=None, stop_sentinel=None,
+              env_bin=None, timeout=None, check=True):
+            self.polled.append(list(cmd))
+            if touch_str_relax:
+                (Path(cwd) / "str_relax.out").write_text("stub\n")
+            return 0
+        return f
+
+
+def _stub_encut_kppra(monkeypatch, calc_dir):
+    """relax_structure calls write_relax_wrap which needs a valid POTCAR
+    only via vaspwrap.build_vasp_wrap. We stub vaspwrap so the test
+    doesn't need a real POTCAR."""
+    monkeypatch.setattr(
+        relax, "build_vasp_wrap",
+        lambda kind, encut, kppra, dlm=None, algo="All": f"# stub {kind}\n",
+    )
+
+
+def test_runstruct_is_now_the_default(tmp_path, monkeypatch):
+    """--relax-method default must be 'runstruct' (was 'normal')."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000)  # no method= arg
+    # runstruct: no -mk prep, one polled pollmach runstruct_vasp call.
+    assert rec.logged == [], f"runstruct should not run robustrelax_vasp -mk; got {rec.logged}"
+    assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
+
+
+def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
+    """method='normal' must be preceded by robustrelax_vasp -mk."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="normal")
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [["robustrelax_vasp"]], rec.polled
+
+
+def test_robustrelax_infdet_runs_mk_first(tmp_path, monkeypatch):
+    """method='infdet' must also be preceded by robustrelax_vasp -mk."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet",
+                          infdet_opts="-t 1e-3")
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [["robustrelax_vasp", "-id", "-idop", "-t 1e-3"]], rec.polled
+
+
+def test_relax_rejects_unknown_method(tmp_path, monkeypatch):
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="unknown relax method"):
+        relax.relax_structure(tmp_path, encut=400, kppra=8000, method="bogus")
+
+
+# ---- run_upstream.py: multi-level SQS iteration ---------------------------
+
+def test_sqs_level_default_is_2(monkeypatch):
+    """CLI default for --sqs-level must be the string '2'."""
+    # Reach into the argparse config via a dry-run parse.
+    import argparse
+    # Reconstruct the same parser by importing and calling main() minus
+    # its side effects would be brittle; instead do a targeted call.
+    import subprocess, sys
+    r = subprocess.run(
+        [sys.executable, str(Path(run_upstream.__file__)), "--help"],
+        capture_output=True, text=True,
+    )
+    assert "'2' (default)" in r.stdout
+
+
+def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
+    """A --sqs-level '2,3' request must call generate_phase_sqs once per
+    level so both meshes accumulate in the tree."""
+    calls = []
+
+    def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
+                 use_small=None, species_edit=None, env_bin=None, timeout=600):
+        calls.append({"phase": phase, "level": level, "dlm": dlm})
+        d = Path(work_root) / f"{phase}_small"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def fake_discover(_root):
+        return []
+
+    monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
+    monkeypatch.setattr(run_upstream, "discover_sqs_dirs", fake_discover)
+
+    res = run_upstream.process_phase(
+        phase="FCC_A1",
+        work_root=tmp_path,
+        potcar_paths=[],
+        dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct",
+        algo="All",
+        tol_ev=1e-3,
+        sqs_levels=[2, 3, 4],
+        sigma_elements=["Co", "Cr"],
+        template_root=None,
+        env_bin=None,
+        skip_phonon=True,
+        timeout=60,
+    )
+    levels_seen = [c["level"] for c in calls if c["phase"] == "FCC_A1"]
+    assert levels_seen == [2, 3, 4], levels_seen
+
+
+def test_process_sigma_ignores_sqs_levels_binary(tmp_path, monkeypatch):
+    """SIGMA in a binary must NOT iterate over sqs_levels — it's
+    endmember-only (unless DLM sigma_from_lev3 overrides)."""
+    calls = []
+
+    def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
+                 use_small=None, species_edit=None, env_bin=None, timeout=600):
+        calls.append({"phase": phase, "level": level})
+        d = Path(work_root) / "SIGMA_D8B"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def fake_discover(_root):
+        return []
+
+    monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
+    monkeypatch.setattr(run_upstream, "discover_sqs_dirs", fake_discover)
+
+    run_upstream.process_sigma(
+        phase="SIGMA_D8B",
+        work_root=tmp_path,
+        potcar_paths=[],
+        dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct",
+        algo="All",
+        tol_ev=1e-3,
+        sqs_levels=[2, 3, 4],   # deliberately noisy; must be ignored
+        sigma_elements=["Co", "Cr"],
+        env_bin=None,
+        skip_phonon=True,
+        timeout=60,
+    )
+    # exactly one call, at level 0 (endmembers), regardless of sqs_levels
+    assert len(calls) == 1, calls
+    assert calls[0]["level"] == 0, calls
