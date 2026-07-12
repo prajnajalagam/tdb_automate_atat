@@ -185,6 +185,15 @@ def process_one_sqs(sqs_dir: Path,
           f"(str_relax.out present: "
           f"{(sqs_dir / 'str_relax.out').is_file()})")
 
+    # Clear the ATAT 'wait' queue marker once the relax has produced its
+    # result — sqs2tdb -cp drops a `wait` file in every to-be-computed
+    # dir, and pollmach-style pollers treat its presence as "pending".
+    # Mirrors the manual `rm wait` in the reference NAS workflow.
+    if (sqs_dir / "str_relax.out").is_file():
+        wait_marker = sqs_dir / "wait"
+        if wait_marker.is_file():
+            wait_marker.unlink()
+
     phonon_out = None
     if not skip_phonon:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
@@ -241,19 +250,20 @@ def process_phase(phase: str,
                              skip_phonon, timeout,
                              cmd_prefix=cmd_prefix, relax_opts=relax_opts)
 
-    # Iterate over requested SQS levels (default [2]). Each call adds the
-    # structures for that composition mesh; sqs2tdb -cp is idempotent
-    # when species.in already exists so re-invocation is safe. Higher
-    # levels can be added later by re-running with --sqs-level "2,3"
-    # etc. — this is the "iteratively add higher-lev SQS if fit
-    # quality is inadequate" workflow.
-    print(f"    Generating SQS at level(s): {sqs_levels}")
-    phase_root = None
-    for lv in sqs_levels:
-        phase_root = sqsgen.generate_phase_sqs(
-            work_root, phase, elements=sigma_elements,
-            level=lv, dlm=dlm.enabled,
-            env_bin=env_bin)
+    # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
+    # `level <= -lv`), so a single invocation at max(sqs_levels) copies
+    # every mesh level up to and including that value — no per-level
+    # loop needed. The iterative-refinement workflow still holds:
+    # re-running later with a larger --sqs-level only ADDS the new
+    # levels, because sqs2tdb skips any sqs_ dir that already has
+    # str.out.
+    gen_level = max(sqs_levels)
+    print(f"    Generating SQS with -lv={gen_level} "
+          f"(cumulative: copies all levels 0..{gen_level})")
+    phase_root = sqsgen.generate_phase_sqs(
+        work_root, phase, elements=sigma_elements,
+        level=gen_level, dlm=dlm.enabled,
+        env_bin=env_bin)
 
     sqs_dirs = discover_sqs_dirs(phase_root)
     print(f"    {len(sqs_dirs)} SQS directories")
@@ -366,15 +376,16 @@ def main():
                     help="Convergence tolerance, eV/atom (default 0.001 = "
                          "1 meV/atom).")
     ap.add_argument("--sqs-level", default="2",
-                    help="SQS composition mesh level(s) to generate, "
-                         "passed to sqs2tdb -cp as -lv=N. Comma-separated "
-                         "for iterative addition, e.g. '2' (default) "
-                         "generates the level-2 mesh only; '2,3' or "
-                         "'2,3,4' add finer meshes on top (each "
-                         "successive -lv=N adds only that level's "
-                         "structures — the tree accumulates). Re-run "
-                         "upstream with a larger list if a lev=2 fit is "
-                         "not accurate enough downstream.")
+                    help="SQS composition-mesh cutoff, passed to "
+                         "sqs2tdb -cp as -lv=N. CUMULATIVE: -lv=N copies "
+                         "ALL database levels <= N (so the default '2' "
+                         "yields lev=0 endmembers + lev=1 midpoints + "
+                         "lev=2 mesh in one shot; omitting -lv would "
+                         "behave like 0 = endmembers only). A comma list "
+                         "is accepted for convenience but only its MAX "
+                         "matters. To refine later, re-run with a larger "
+                         "value — sqs2tdb skips dirs that already have "
+                         "str.out, so only the new levels are added.")
     ap.add_argument("--env-bin", default=None,
                     help="Prepend this directory to PATH for ATAT/VASP "
                          "executables.")

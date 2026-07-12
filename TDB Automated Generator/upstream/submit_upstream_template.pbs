@@ -50,10 +50,11 @@ DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
 
-# SQS composition mesh level(s), comma-separated. Default "2" generates
-# the lev=2 mesh only. To iteratively refine when a lev=2 fit isn't
-# accurate enough downstream, re-run the job with SQS_LEVEL="2,3" (adds
-# lev=3 on top of the existing lev=2 structures) or "2,3,4".
+# SQS composition-mesh cutoff (sqs2tdb -lv=N). CUMULATIVE: N copies ALL
+# levels <= N, so "2" yields endmembers (lev=0) + midpoints (lev=1) +
+# the lev=2 mesh in one shot. To refine later just raise the number
+# (e.g. "3") and re-run — sqs2tdb skips dirs that already have str.out,
+# so only the new level's structures are added.
 SQS_LEVEL="2"
 
 # Site-specific environment (matches the NAS reference PBS for the

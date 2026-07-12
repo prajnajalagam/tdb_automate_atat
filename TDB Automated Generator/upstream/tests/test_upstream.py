@@ -391,22 +391,24 @@ def test_relax_rejects_unknown_method(tmp_path, monkeypatch):
 # ---- run_upstream.py: multi-level SQS iteration ---------------------------
 
 def test_sqs_level_default_is_2(monkeypatch):
-    """CLI default for --sqs-level must be the string '2'."""
-    # Reach into the argparse config via a dry-run parse.
-    import argparse
-    # Reconstruct the same parser by importing and calling main() minus
-    # its side effects would be brittle; instead do a targeted call.
+    """CLI default for --sqs-level must be '2' and the help must state
+    the CUMULATIVE -lv semantics (level <= N per the sqs2tdb source)."""
+    import re
     import subprocess, sys
     r = subprocess.run(
         [sys.executable, str(Path(run_upstream.__file__)), "--help"],
         capture_output=True, text=True,
     )
-    assert "'2' (default)" in r.stdout
+    flat = re.sub(r"\s+", " ", r.stdout)   # undo argparse line-wrapping
+    assert "the default '2'" in flat
+    assert "CUMULATIVE" in flat
+    assert "levels <= N" in flat
 
 
-def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
-    """A --sqs-level '2,3' request must call generate_phase_sqs once per
-    level so both meshes accumulate in the tree."""
+def test_process_phase_single_cumulative_lv_call(tmp_path, monkeypatch):
+    """sqs2tdb -lv=N is CUMULATIVE (copies all levels <= N per its
+    `$levs[1] <= $cmdline{"-lv"}` test), so process_phase must make ONE
+    generate_phase_sqs call at max(sqs_levels) — not one per level."""
     calls = []
 
     def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
@@ -422,7 +424,7 @@ def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
     monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
     monkeypatch.setattr(run_upstream, "discover_sqs_dirs", fake_discover)
 
-    res = run_upstream.process_phase(
+    run_upstream.process_phase(
         phase="FCC_A1",
         work_root=tmp_path,
         potcar_paths=[],
@@ -437,8 +439,9 @@ def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
         skip_phonon=True,
         timeout=60,
     )
-    levels_seen = [c["level"] for c in calls if c["phase"] == "FCC_A1"]
-    assert levels_seen == [2, 3, 4], levels_seen
+    fcc_calls = [c for c in calls if c["phase"] == "FCC_A1"]
+    assert len(fcc_calls) == 1, fcc_calls
+    assert fcc_calls[0]["level"] == 4, fcc_calls
 
 
 def test_process_sigma_ignores_sqs_levels_binary(tmp_path, monkeypatch):
@@ -548,3 +551,57 @@ def test_static_point_gets_launcher(tmp_path, monkeypatch):
     assert e == -5.0
     assert calls == [
         ["runstruct_vasp", "mpiexec", "-n", "128"]], calls
+
+
+# ---- link-only dirs and wait-marker semantics (per sqs2tdb source) ----------
+
+def test_generate_phase_sqs_accepts_link_only_dirs(tmp_path, monkeypatch):
+    """sqs2tdb writes only a `link` file (no str.out) for SQS equivalent
+    to a permuted-site twin or endmembers reducible to a parent lattice.
+    The post-copy verification must accept a tree of link-only dirs."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        tdir = Path(cwd) / "BCC_B2"
+        sp = tdir / "species.in"
+        if not sp.is_file():
+            tdir.mkdir(parents=True, exist_ok=True)
+            sp.write_text("Co,Cr\n")
+        else:
+            d = tdir / "sqs_lev=0_a_Co=1,b_Co=1"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "link").write_text("BCC_A2/sqs_lev=0_a_Co=1\n")
+        return 0
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    out = sqsgen.generate_phase_sqs(tmp_path, "BCC_B2",
+                                    elements=["Co", "Cr"], use_small=False)
+    assert any(out.rglob("link"))     # verification passed on links alone
+
+
+def test_process_one_sqs_clears_wait_marker(tmp_path, monkeypatch):
+    """sqs2tdb -cp drops a `wait` queue marker in every to-be-computed
+    dir; after a successful relax we must remove it (the reference NAS
+    workflow's manual `rm wait`)."""
+    import types
+
+    sqs = tmp_path / "sqs_lev=2_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "wait").write_text("")
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def fake_relax(calc_dir, **kwargs):
+        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert not (sqs / "wait").exists(), "wait marker must be cleared"
+    assert (sqs / "str_relax.out").is_file()
