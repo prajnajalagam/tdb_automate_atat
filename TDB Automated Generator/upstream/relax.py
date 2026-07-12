@@ -58,13 +58,27 @@ def relax_structure(calc_dir: Path,
                     algo: str = "All",
                     env_bin: Optional[str] = None,
                     timeout: int = 172800,
-                    infdet_opts: str = "") -> Path:
+                    infdet_opts: str = "",
+                    relax_opts: str = "",
+                    cmd_prefix: str = "") -> Path:
     """Relax the structure in calc_dir, producing str_relax.out.
 
-    method   "runstruct" (default) -> pollmach runstruct_vasp
-             "normal"               -> robustrelax_vasp -mk; robustrelax_vasp
-             "infdet"               -> robustrelax_vasp -mk; robustrelax_vasp -id
-    infdet_opts  extra options forwarded to infdet via -idop "...".
+    method   "runstruct" (default) -> pollmach runstruct_vasp [cmd_prefix]
+             "normal"    -> robustrelax_vasp -mk; robustrelax_vasp [cmd_prefix]
+             "infdet"    -> robustrelax_vasp -mk; robustrelax_vasp -id [cmd_prefix]
+
+    cmd_prefix   the command used to launch VASP, e.g. "mpiexec -n 128".
+                 ATAT tools take it as TRAILING arguments (reference NAS
+                 job: `robustrelax_vasp -id -c 0.05 mpiexec -n 128`).
+                 Without it, runstruct_vasp launches the MPI vasp binary
+                 bare, which dies before writing OSZICAR. Tokenized via
+                 shlex so "mpiexec -n 128" becomes three argv elements.
+    relax_opts   direct robustrelax_vasp options, e.g. "-c 0.05"
+                 (constraint tolerance). Applied to both 'normal' and
+                 'infdet'; ignored for 'runstruct'.
+    infdet_opts  options forwarded to the infdet subprogram via -idop
+                 (distinct from relax_opts, which robustrelax consumes
+                 itself).
     Returns the path to str_relax.out (whether or not it was produced --
     caller should verify existence).
     """
@@ -76,12 +90,16 @@ def relax_structure(calc_dir: Path,
             f"unknown relax method {method!r}; expected one of {RELAX_METHODS}"
         )
 
+    vasp_launch = runner.split_prefix(cmd_prefix)
+
     if method == "runstruct":
         # Simple polled runstruct_vasp: pollmach turns str.out + vasp.wrap into
         # real VASP inputs and drives the relaxation to convergence. No -mk
         # step needed here -- runstruct_vasp reads vasp.wrap directly.
+        # Trailing tokens ride through pollmach to runstruct_vasp, which
+        # uses them as the VASP launch command.
         runner.run_polled(
-            ["pollmach", "runstruct_vasp"], cwd=calc_dir,
+            ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=calc_dir,
             log=calc_dir / "runstruct.log",
             done_when=runner.all_have_file([calc_dir], "str_relax.out"),
             stop_sentinel="stopcar",
@@ -103,6 +121,10 @@ def relax_structure(calc_dir: Path,
             cmd += ["-idop", infdet_opts]
     else:  # method == "normal"
         cmd = ["robustrelax_vasp"]
+
+    if relax_opts:
+        cmd += runner.split_prefix(relax_opts)
+    cmd += vasp_launch          # VASP launch command LAST, per ATAT usage
 
     # robustrelax stops on a 'stop' sentinel; poll until str_relax.out
     # appears.

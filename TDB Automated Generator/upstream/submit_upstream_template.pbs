@@ -33,6 +33,19 @@ TEMPLATE_ROOT="TODO_PATH/atat_small_templates"
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 RELAX_METHOD="runstruct"         # runstruct (default) | normal | infdet
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
+
+# Command used to launch VASP. ATAT's runstruct_vasp / robustrelax_vasp
+# take it as TRAILING arguments (reference NAS job:
+#   robustrelax_vasp -id -c 0.05 mpiexec -n 128
+# ). REQUIRED on mil_ait: the MPI vasp binary dies without its launcher
+# and every run fails with "unable to open OSZICAR". Match -n to the
+# ncpus in the #PBS select line above.
+CMD_PREFIX="mpiexec -n 128"
+
+# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet,
+# e.g. "-c 0.05" (constraint tolerance from the reference job).
+# Ignored for runstruct. Leave empty for defaults.
+RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
@@ -84,6 +97,9 @@ EXTRA=()
 # SQS_LEVEL default is "2" (see USER CONFIG); pass through as-is.
 EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
 [ -n "${TEMPLATE_ROOT}" ]    && EXTRA+=(--template-root "${TEMPLATE_ROOT}")
+# VASP launcher — REQUIRED for MPI builds (see USER CONFIG note).
+[ -n "${CMD_PREFIX}" ]       && EXTRA+=(--cmd-prefix "${CMD_PREFIX}")
+[ -n "${RELAX_OPTS}" ]       && EXTRA+=(--relax-opts "${RELAX_OPTS}")
 
 # Live log in the submit dir (PBS -o only arrives after the job ends).
 # run_upstream.py ALSO tees itself to <WORK_ROOT>/upstream_live.log with

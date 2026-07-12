@@ -149,8 +149,16 @@ def process_one_sqs(sqs_dir: Path,
                     tol_ev: float,
                     env_bin: Optional[str],
                     skip_phonon: bool,
-                    timeout: int) -> Dict:
-    """Convergence -> relax -> phonon for a single SQS directory."""
+                    timeout: int,
+                    cmd_prefix: str = "",
+                    relax_opts: str = "") -> Dict:
+    """Convergence -> relax -> phonon for a single SQS directory.
+
+    cmd_prefix is the VASP launch command ("mpiexec -n 128") forwarded
+    to every runstruct_vasp / robustrelax_vasp invocation as trailing
+    arguments — without it the MPI vasp binary is launched bare and
+    dies before writing OSZICAR.
+    """
     sweep_root = sqs_dir / "convergence"
 
     stamp(f"[{sqs_dir.name}] STAGE 1/3 convergence sweep starting "
@@ -158,7 +166,8 @@ def process_one_sqs(sqs_dir: Path,
     chosen_encut, chosen_kppra, kres, eres = converge.converge_sqs(
         sqs_dir, sweep_root, potcar_paths,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
-        env_bin=env_bin, timeout=timeout)
+        env_bin=env_bin, timeout=timeout,
+        cmd_prefix=cmd_prefix)
 
     print(kres.table())
     print(eres.table())
@@ -170,7 +179,8 @@ def process_one_sqs(sqs_dir: Path,
     relax.relax_structure(
         sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
         method=relax_method, dlm=dlm, algo=algo,
-        env_bin=env_bin, timeout=timeout)
+        env_bin=env_bin, timeout=timeout,
+        cmd_prefix=cmd_prefix, relax_opts=relax_opts)
     stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation done "
           f"(str_relax.out present: "
           f"{(sqs_dir / 'str_relax.out').is_file()})")
@@ -180,7 +190,8 @@ def process_one_sqs(sqs_dir: Path,
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
         phonon_out = str(phonon.run_fitfc(
             sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
-            dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout))
+            dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
+            cmd_prefix=cmd_prefix))
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons done")
     else:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 phonons skipped (--skip-phonon)")
@@ -209,7 +220,9 @@ def process_phase(phase: str,
                   template_root: Optional[Path],
                   env_bin: Optional[str],
                   skip_phonon: bool,
-                  timeout: int) -> Dict:
+                  timeout: int,
+                  cmd_prefix: str = "",
+                  relax_opts: str = "") -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -225,7 +238,8 @@ def process_phase(phase: str,
         # override; process_sigma decides what to actually do.
         return process_sigma(phase, work_root, potcar_paths, dlm, relax_method,
                              algo, tol_ev, sqs_levels, sigma_elements, env_bin,
-                             skip_phonon, timeout)
+                             skip_phonon, timeout,
+                             cmd_prefix=cmd_prefix, relax_opts=relax_opts)
 
     # Iterate over requested SQS levels (default [2]). Each call adds the
     # structures for that composition mesh; sqs2tdb -cp is idempotent
@@ -249,7 +263,8 @@ def process_phase(phase: str,
         print(f"\n  -- SQS {d.name} --")
         results.append(process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
-            env_bin, skip_phonon, timeout))
+            env_bin, skip_phonon, timeout,
+            cmd_prefix=cmd_prefix, relax_opts=relax_opts))
     return {"phase": phase, "sqs": results}
 
 
@@ -264,7 +279,9 @@ def process_sigma(phase: str,
                   sigma_elements: List[str],
                   env_bin: Optional[str],
                   skip_phonon: bool,
-                  timeout: int) -> Dict:
+                  timeout: int,
+                  cmd_prefix: str = "",
+                  relax_opts: str = "") -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -300,7 +317,8 @@ def process_sigma(phase: str,
         print(f"\n  -- SIGMA endmember {d.name} --")
         results.append(process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
-            env_bin, skip_phonon, timeout))
+            env_bin, skip_phonon, timeout,
+            cmd_prefix=cmd_prefix, relax_opts=relax_opts))
     return {"phase": phase, "sqs": results, "endmember_only": True}
 
 
@@ -360,6 +378,20 @@ def main():
     ap.add_argument("--env-bin", default=None,
                     help="Prepend this directory to PATH for ATAT/VASP "
                          "executables.")
+    ap.add_argument("--cmd-prefix", default="",
+                    help="Command used to launch VASP, passed to every "
+                         "runstruct_vasp / robustrelax_vasp invocation as "
+                         "trailing arguments (ATAT convention), e.g. "
+                         "'mpiexec -n 128'. REQUIRED on NAS mil_ait — the "
+                         "MPI vasp binary dies without its launcher and "
+                         "runstruct_vasp then reports 'unable to open "
+                         "OSZICAR'. Default: empty (bare vasp; only valid "
+                         "for serial builds).")
+    ap.add_argument("--relax-opts", default="",
+                    help="Direct robustrelax_vasp options for the 'normal' "
+                         "and 'infdet' relax methods, e.g. '-c 0.05'. "
+                         "Distinct from the -idop infdet suboptions; "
+                         "ignored for --relax-method runstruct.")
     ap.add_argument("--skip-phonon", action="store_true",
                     help="Skip the fitfc phonon stage (energy-only upstream).")
     ap.add_argument("--timeout", type=int, default=172800,
@@ -412,12 +444,20 @@ def main():
           f"(@ ENCUT {potcar.kppra_probe_encut(max_e)} eV)")
     print(f"  Conv tol    : {args.tol_ev*1e3:.1f} meV/atom")
     print(f"  ALGO        : {args.algo}")
-    print(f"  Relax       : {args.relax_method}")
+    print(f"  Relax       : {args.relax_method}"
+          + (f"  (opts: {args.relax_opts})" if args.relax_opts else ""))
     print(f"  SQS levels  : {sqs_levels}")
+    print(f"  VASP launch : {args.cmd_prefix or '<bare vasp — serial builds only>'}")
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
           + (f"  SUBATOM={subatom}" if args.dlm else ""))
     print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}")
     print(f"{'='*70}")
+
+    if not args.cmd_prefix:
+        print("  WARNING: --cmd-prefix is empty. On MPI VASP builds "
+              "(NAS mil_ait) the bare binary dies before writing OSZICAR "
+              "and every sweep point will fail. Pass e.g. "
+              "--cmd-prefix 'mpiexec -n 128'.")
 
     manifest = {
         "binary": f"{args.element1}-{args.element2}",
@@ -425,6 +465,8 @@ def main():
         "max_enmax": max_e,
         "dlm": args.dlm,
         "relax_method": args.relax_method,
+        "cmd_prefix": args.cmd_prefix,
+        "relax_opts": args.relax_opts,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
@@ -432,7 +474,8 @@ def main():
         res = process_phase(
             phase, work_root, potcar_paths, dlm, args.relax_method,
             args.algo, args.tol_ev, sqs_levels, sigma_elements,
-            template_root, args.env_bin, args.skip_phonon, args.timeout)
+            template_root, args.env_bin, args.skip_phonon, args.timeout,
+            cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts)
         manifest["phases"].append(res)
 
     out = Path(args.out) if args.out else work_root / "upstream_manifest.json"

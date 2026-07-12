@@ -80,17 +80,24 @@ def run_fitfc(sqs_dir: Path,
               dlm: Optional[DLMConfig] = None,
               algo: str = "All",
               env_bin: Optional[str] = None,
-              timeout: int = 172800) -> Path:
+              timeout: int = 172800,
+              cmd_prefix: str = "") -> Path:
     """Drive the full fitfc workflow in sqs_dir; returns the fitfc.out path.
 
     Assumes str.out (unrelaxed) and str_relax.out (relaxed) already exist
     (produced by relax.relax_structure). The DLM fixup is applied just before
     the final fitfc -f.
+
+    cmd_prefix: VASP launch command (e.g. "mpiexec -n 128") appended as
+    trailing tokens to both pollmach runstruct_vasp invocations — same
+    fix as converge/relax; bare MPI vasp dies before writing output.
     """
     sqs_dir = Path(sqs_dir)
     fitfc_args = [f"-er={er}", f"-ns={ns}", f"-ms={ms}", f"-dr={dr}"]
     if fr is None:
         fr = er / 2.0
+
+    vasp_launch = runner.split_prefix(cmd_prefix)
 
     # Phonon force runs use a frozen-geometry wrap.
     _write_phonon_wrap(sqs_dir, encut, kppra, dlm, algo)
@@ -105,7 +112,7 @@ def run_fitfc(sqs_dir: Path,
     # 2. relax under strain
     if vol_dirs:
         runner.run_polled(
-            ["pollmach", "runstruct_vasp"], cwd=sqs_dir,
+            ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
             log=sqs_dir / "fitfc_strain_runs.log",
             done_when=runner.all_energy_present(vol_dirs),
             stop_sentinel="stoppoll",
@@ -120,7 +127,7 @@ def run_fitfc(sqs_dir: Path,
     pert_dirs = [d for v in vol_dirs for d in sorted(v.glob("p*")) if d.is_dir()]
     if pert_dirs:
         runner.run_polled(
-            ["pollmach", "-lu", "runstruct_vasp"], cwd=sqs_dir,
+            ["pollmach", "-lu", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
             log=sqs_dir / "fitfc_force_runs.log",
             done_when=runner.all_have_file(pert_dirs, "force.out"),
             stop_sentinel="stoppoll",

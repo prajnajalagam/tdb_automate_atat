@@ -476,3 +476,75 @@ def test_process_sigma_ignores_sqs_levels_binary(tmp_path, monkeypatch):
     # exactly one call, at level 0 (endmembers), regardless of sqs_levels
     assert len(calls) == 1, calls
     assert calls[0]["level"] == 0, calls
+
+
+# ---- cmd_prefix (VASP MPI launcher) threading ------------------------------
+
+def test_split_prefix_tokenizes():
+    import runner as _runner
+    assert _runner.split_prefix("mpiexec -n 128") == ["mpiexec", "-n", "128"]
+    assert _runner.split_prefix("") == []
+    assert _runner.split_prefix(None) == []
+
+
+def test_runstruct_gets_vasp_launcher_tokens(tmp_path, monkeypatch):
+    """runstruct method must append the launcher as SEPARATE argv tokens
+    (not one space-containing string) after 'pollmach runstruct_vasp'."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          cmd_prefix="mpiexec -n 128")
+    assert rec.polled == [
+        ["pollmach", "runstruct_vasp", "mpiexec", "-n", "128"]], rec.polled
+
+
+def test_robustrelax_gets_launcher_and_relax_opts(tmp_path, monkeypatch):
+    """normal method: -mk first, then robustrelax with direct opts and the
+    launcher LAST (matches the reference NAS job
+    `robustrelax_vasp -id -c 0.05 mpiexec -n 128`)."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet",
+                          relax_opts="-c 0.05",
+                          cmd_prefix="mpiexec -n 128")
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [
+        ["robustrelax_vasp", "-id", "-c", "0.05",
+         "mpiexec", "-n", "128"]], rec.polled
+
+
+def test_empty_prefix_leaves_commands_unchanged(tmp_path, monkeypatch):
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000)
+    assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
+
+
+def test_static_point_gets_launcher(tmp_path, monkeypatch):
+    """The convergence sweep — where the user's OSZICAR failure occurred —
+    must pass the launcher to runstruct_vasp."""
+    calls = []
+
+    def fake_logged(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        calls.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(converge.runner, "run_logged", fake_logged)
+    monkeypatch.setattr(converge, "build_vasp_wrap",
+                        lambda kind, encut, kppra, dlm=None, algo="All":
+                        "# stub\n")
+    monkeypatch.setattr(converge, "energy_per_atom", lambda d: -5.0)
+
+    src = tmp_path / "sqs"; src.mkdir()
+    (src / "str.out").write_text("stub\n")
+    e = converge.run_static_point(src, tmp_path / "pt", encut=268, kppra=6000,
+                                  cmd_prefix="mpiexec -n 128")
+    assert e == -5.0
+    assert calls == [
+        ["runstruct_vasp", "mpiexec", "-n", "128"]], calls
