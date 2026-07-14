@@ -67,7 +67,14 @@ Reads `endmembers.yaml`, discovers the mixing SQS (`lev>0`) per phase, and runs:
   order (`2,0`/`2,1`/`2,2`); runs `sqs2tdb -fit`; prunes on max |error| in
   `fit_energy.out` and an overfit guard.
 - **Stage 2 (vibrational):** layers `svib_ht` onto Stage-1 survivors; prunes on
-  `fit_svib_ht.out`. Skipped for SIGMA and with `--skip-svib`.
+  `fit_svib_ht.out`. Skipped with `--skip-svib`.
+  `sqs2tdb -fit` only reads `<sqs_dir>/svib_ht` (top level), while ATAT's
+  `fitfc -f` writes it under `vol_0/` — the pipeline auto-promotes a nested
+  `vol_0/svib_ht` into the working copy for every structure whose svib is
+  included, so trees missing the tutorial's manual `cp vol_0/svib_ht .`
+  don't silently lose their vibrational data. SQS flagged by the upstream
+  generator as dynamically unstable (`unstable_modes.log`, no `svib_ht`)
+  simply participate energy-only.
 
 ```bash
 python3 sqs2tdb_pipeline.py \

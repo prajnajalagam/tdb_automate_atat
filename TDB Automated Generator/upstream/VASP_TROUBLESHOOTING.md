@@ -136,6 +136,31 @@ work fits. Our upstream pipeline's per-step logs
 (`upstream_live.log` stage markers) tell you which stage the clock
 ran out in.
 
+### 9. `fitfc` unstable modes — not a VASP error, but you'll hunt it here
+`Warning: <pert> is an unstable mode.` (dE<0 for a perturbation) and
+`Unstable modes found.` + `Aborting.` in `fitfc_fit.log`. fitfc aborts
+**before writing `svib_ht`** unless `-fn` or `-rl>0` is set.
+
+**Workflow (automated by `phonon.run_fitfc`, policy
+`--fitfc-on-unstable` / PBS `FITFC_ON_UNSTABLE`):**
+1. `mark` (default): the SQS is left energy-only with the evidence in
+   `<sqs>/unstable_modes.log`; downstream fits proceed without its
+   vibrational term.
+2. `escalate`: regenerate the perturbations at a 1.5× larger
+   displacement radius and refit — imaginary modes that vanish were a
+   finite-supercell artifact (short-range force constants extrapolated
+   to Γ). Only the new `p*` dirs cost VASP time.
+3. If the instability **persists**, it is likely genuine dynamical
+   instability at that composition (classic for unstable endmember
+   lattices, e.g. some BCC/SIGMA corners). Manual options, in order of
+   preference: re-relax more tightly (`EDIFFG`, `--relax-method
+   normal`) and rerun; `--fitfc-rl <len>` (van de Walle's robust
+   soft-mode treatment, beta); `fitfc -fu` / `-gu=<n>` mode-following
+   (produces a *different*, distorted structure — a scientific
+   decision, not a pipeline one); or accept the SQS as energy-only.
+4. `force` (`fitfc -fn`) is the last resort: the svib_ht it yields
+   omits the unstable branches (lower bound) and is flagged as such.
+
 ---
 
 ## Automation options
