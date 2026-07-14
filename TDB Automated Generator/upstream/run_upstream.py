@@ -151,8 +151,12 @@ def process_one_sqs(sqs_dir: Path,
                     skip_phonon: bool,
                     timeout: int,
                     cmd_prefix: str = "",
-                    relax_opts: str = "") -> Dict:
+                    relax_opts: str = "",
+                    fitfc_opts: Optional[Dict] = None) -> Dict:
     """Convergence -> relax -> phonon for a single SQS directory.
+
+    fitfc_opts: extra keyword args for phonon.run_fitfc, e.g.
+    {"on_unstable": "force", "rl": 0.3} — the unstable-mode policy.
 
     cmd_prefix is the VASP launch command ("mpiexec -n 128") forwarded
     to every runstruct_vasp / robustrelax_vasp invocation as trailing
@@ -200,8 +204,13 @@ def process_one_sqs(sqs_dir: Path,
         phonon_out = str(phonon.run_fitfc(
             sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
-            cmd_prefix=cmd_prefix))
-        stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons done")
+            cmd_prefix=cmd_prefix, **(fitfc_opts or {})))
+        unstable_log = sqs_dir / "unstable_modes.log"
+        if unstable_log.is_file():
+            stamp(f"[{sqs_dir.name}] STAGE 3/3 UNSTABLE MODES reported "
+                  f"by fitfc -f (see {unstable_log})")
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons done "
+              f"(svib_ht present: {(sqs_dir / 'svib_ht').is_file()})")
     else:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 phonons skipped (--skip-phonon)")
 
@@ -214,6 +223,8 @@ def process_one_sqs(sqs_dir: Path,
         "relax_method": relax_method,
         "str_relax_present": (sqs_dir / "str_relax.out").is_file(),
         "phonon_out": phonon_out,
+        "svib_ht_present": (sqs_dir / "svib_ht").is_file(),
+        "unstable_modes": (sqs_dir / "unstable_modes.log").is_file(),
     }
 
 
@@ -231,7 +242,8 @@ def process_phase(phase: str,
                   skip_phonon: bool,
                   timeout: int,
                   cmd_prefix: str = "",
-                  relax_opts: str = "") -> Dict:
+                  relax_opts: str = "",
+                  fitfc_opts: Optional[Dict] = None) -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -248,7 +260,8 @@ def process_phase(phase: str,
         return process_sigma(phase, work_root, potcar_paths, dlm, relax_method,
                              algo, tol_ev, sqs_levels, sigma_elements, env_bin,
                              skip_phonon, timeout,
-                             cmd_prefix=cmd_prefix, relax_opts=relax_opts)
+                             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
+                             fitfc_opts=fitfc_opts)
 
     # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
     # `level <= -lv`), so a single invocation at max(sqs_levels) copies
@@ -274,7 +287,8 @@ def process_phase(phase: str,
         results.append(process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
             env_bin, skip_phonon, timeout,
-            cmd_prefix=cmd_prefix, relax_opts=relax_opts))
+            cmd_prefix=cmd_prefix, relax_opts=relax_opts,
+            fitfc_opts=fitfc_opts))
     return {"phase": phase, "sqs": results}
 
 
@@ -291,7 +305,8 @@ def process_sigma(phase: str,
                   skip_phonon: bool,
                   timeout: int,
                   cmd_prefix: str = "",
-                  relax_opts: str = "") -> Dict:
+                  relax_opts: str = "",
+                  fitfc_opts: Optional[Dict] = None) -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -328,7 +343,8 @@ def process_sigma(phase: str,
         results.append(process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
             env_bin, skip_phonon, timeout,
-            cmd_prefix=cmd_prefix, relax_opts=relax_opts))
+            cmd_prefix=cmd_prefix, relax_opts=relax_opts,
+            fitfc_opts=fitfc_opts))
     return {"phase": phase, "sqs": results, "endmember_only": True}
 
 
@@ -405,6 +421,19 @@ def main():
                          "ignored for --relax-method runstruct.")
     ap.add_argument("--skip-phonon", action="store_true",
                     help="Skip the fitfc phonon stage (energy-only upstream).")
+    ap.add_argument("--fitfc-on-unstable", choices=("mark", "force"),
+                    default="mark",
+                    help="Policy when fitfc -f reports unstable modes and "
+                         "aborts before writing svib_ht. 'mark' (default): "
+                         "record unstable_modes.log and leave the SQS "
+                         "energy-only (honest — svib from a fit that drops "
+                         "imaginary branches is biased). 'force': retry once "
+                         "with fitfc's -fn so a (lower-bound) svib_ht is "
+                         "still produced; provenance is recorded.")
+    ap.add_argument("--fitfc-rl", type=float, default=None,
+                    help="Pass fitfc's -rl=<len> robust-length soft-mode "
+                         "treatment (beta) to the fit, which also prevents "
+                         "the unstable-mode abort. Off by default.")
     ap.add_argument("--timeout", type=int, default=172800,
                     help="Per-VASP/poll timeout in seconds (default 48h).")
     ap.add_argument("--out", default=None,
@@ -461,7 +490,15 @@ def main():
     print(f"  VASP launch : {args.cmd_prefix or '<bare vasp — serial builds only>'}")
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
           + (f"  SUBATOM={subatom}" if args.dlm else ""))
-    print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}")
+    fitfc_opts: Dict = {"on_unstable": args.fitfc_on_unstable}
+    if args.fitfc_rl is not None:
+        fitfc_opts["rl"] = args.fitfc_rl
+
+    print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}"
+          + ("" if args.skip_phonon else
+             f"  (on_unstable={args.fitfc_on_unstable}"
+             + (f", rl={args.fitfc_rl}" if args.fitfc_rl is not None else "")
+             + ")"))
     print(f"{'='*70}")
 
     if not args.cmd_prefix:
@@ -478,6 +515,7 @@ def main():
         "relax_method": args.relax_method,
         "cmd_prefix": args.cmd_prefix,
         "relax_opts": args.relax_opts,
+        "fitfc_opts": fitfc_opts,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
@@ -486,7 +524,8 @@ def main():
             phase, work_root, potcar_paths, dlm, args.relax_method,
             args.algo, args.tol_ev, sqs_levels, sigma_elements,
             template_root, args.env_bin, args.skip_phonon, args.timeout,
-            cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts)
+            cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts,
+            fitfc_opts=fitfc_opts)
         manifest["phases"].append(res)
 
     out = Path(args.out) if args.out else work_root / "upstream_manifest.json"

@@ -772,3 +772,136 @@ def test_promote_svib_ht_noop_without_source(tmp_path):
     (tmp_path / "vol_0" / "svib_ht").write_text("1.1\n")
     dst = phonon.promote_svib_ht(tmp_path)
     assert dst == tmp_path / "svib_ht" and dst.read_text() == "1.1\n"
+
+
+# ---- fitfc unstable-mode safeguards ----------------------------------------
+
+def test_fitfc_fit_args_rl_and_fn():
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=None, rl=0.3, fn=True)
+    assert "-rl=0.3" in args and "-fn" in args
+
+
+def test_detect_unstable_modes(tmp_path):
+    log = tmp_path / "fitfc_fit.log"
+    assert phonon.detect_unstable_modes(log) == []  # missing log = no fit
+    log.write_text("Reading...\nvol_0\n"
+                   "Warning: p+0.2_5.1_3 is an unstable mode.\n"
+                   "Unstable modes found.\nAborting.\n")
+    hits = phonon.detect_unstable_modes(log)
+    assert len(hits) == 2 and "Unstable modes found." in hits[1]
+
+
+def _unstable_sqs(tmp_path):
+    """SQS dir with STALE fit outputs from a previous (good) run — the
+    refit will hit unstable modes and must not resurrect these."""
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    (sqs / "vol_0").mkdir(parents=True)
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+    (sqs / "svib_ht").write_text("STALE\n")
+    (sqs / "fitfc.out").write_text("STALE\n")
+    (sqs / "vol_0" / "svib_ht").write_text("STALE\n")
+    return sqs
+
+
+def test_run_fitfc_unstable_mark_no_stale_svib(tmp_path, monkeypatch):
+    """Default policy: unstable fit aborts -> stale svib_ht cleared, NOT
+    promoted; unstable_modes.log written; no -fn retry."""
+    sqs = _unstable_sqs(tmp_path)
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            Path(log).write_text(
+                "Warning: p+0.2_5.1_0 is an unstable mode.\n"
+                "Unstable modes found.\nAborting.\n")  # no svib_ht written
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000)  # on_unstable="mark"
+
+    assert len(fit_cmds) == 1 and "-fn" not in fit_cmds[0]
+    assert not (sqs / "svib_ht").exists(), "stale svib_ht must be gone"
+    assert not (sqs / "vol_0" / "svib_ht").exists()
+    marker = sqs / "unstable_modes.log"
+    assert marker.is_file() and "energy-only" in marker.read_text()
+    assert "unstable" in (sqs / "fitfc_fit.log").read_text().lower()
+
+
+def test_run_fitfc_unstable_force_retries_with_fn(tmp_path, monkeypatch):
+    """on_unstable='force': one retry with -fn; the forced svib_ht is
+    promoted and the marker records the -fn provenance."""
+    sqs = _unstable_sqs(tmp_path)
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            if "-fn" in cmd:
+                Path(log).write_text("Unstable modes found.\n")
+                (Path(cwd) / "vol_0" / "svib_ht").write_text("2.2\n")
+                (Path(cwd) / "fitfc.out").write_text("forced\n")
+            else:
+                Path(log).write_text("Unstable modes found.\nAborting.\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="force")
+
+    assert len(fit_cmds) == 2
+    assert "-fn" not in fit_cmds[0] and "-fn" in fit_cmds[1]
+    assert (sqs / "svib_ht").read_text() == "2.2\n", "forced svib promoted"
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "-fn" in marker and "lower bound" in marker
+
+
+def test_run_fitfc_rl_passthrough_and_bad_policy(tmp_path, monkeypatch):
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    with pytest.raises(ValueError, match="on_unstable"):
+        phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="ignore")
+
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled",
+                        lambda *a, **k: 0)
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, rl=0.3)
+    assert any("-rl=0.3" in c for cmd in fit_cmds for c in cmd)

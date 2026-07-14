@@ -50,6 +50,16 @@ DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
 
+# Unstable-mode policy for the phonon fit. fitfc -f ABORTS (no svib_ht)
+# when the force constants give imaginary modes, unless told otherwise:
+#   mark  (default) record unstable_modes.log, leave the SQS energy-only
+#   force           retry once with fitfc -fn (svib_ht then OMITS the
+#                   unstable branches — a lower bound; flagged in the log)
+FITFC_ON_UNSTABLE="mark"
+# Optional fitfc -rl=<len> robust-length soft-mode treatment (beta);
+# also prevents the abort. Leave empty to keep it off.
+FITFC_RL=""
+
 # SQS composition-mesh cutoff (sqs2tdb -lv=N). CUMULATIVE: N copies ALL
 # levels <= N, so "2" yields endmembers (lev=0) + midpoints (lev=1) +
 # the lev=2 mesh in one shot. To refine later just raise the number
@@ -101,6 +111,8 @@ EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
 # VASP launcher — REQUIRED for MPI builds (see USER CONFIG note).
 [ -n "${CMD_PREFIX}" ]       && EXTRA+=(--cmd-prefix "${CMD_PREFIX}")
 [ -n "${RELAX_OPTS}" ]       && EXTRA+=(--relax-opts "${RELAX_OPTS}")
+EXTRA+=(--fitfc-on-unstable "${FITFC_ON_UNSTABLE:-mark}")
+[ -n "${FITFC_RL}" ]         && EXTRA+=(--fitfc-rl "${FITFC_RL}")
 
 # Live log in the submit dir (PBS -o only arrives after the job ends).
 # run_upstream.py ALSO tees itself to <WORK_ROOT>/upstream_live.log with
