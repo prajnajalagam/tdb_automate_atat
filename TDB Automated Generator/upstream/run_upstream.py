@@ -153,11 +153,20 @@ def process_one_sqs(sqs_dir: Path,
                     timeout: int,
                     cmd_prefix: str = "",
                     relax_opts: str = "",
-                    fitfc_opts: Optional[Dict] = None) -> Dict:
+                    fitfc_opts: Optional[Dict] = None,
+                    preset_encut: Optional[int] = None,
+                    preset_kppra: Optional[int] = None) -> Dict:
     """Convergence -> relax -> phonon for a single SQS directory.
 
     fitfc_opts: extra keyword args for phonon.run_fitfc, e.g.
     {"on_unstable": "force", "rl": 0.3} — the unstable-mode policy.
+
+    preset_encut/preset_kppra: reuse settings converged on a sibling SQS
+    (phase-uniform convergence scope) instead of sweeping again. Mixing
+    energies subtract eV-scale totals of different structures — that
+    subtraction only cancels basis/k-mesh error when every structure in
+    the phase is computed at the SAME settings, so uniform settings are
+    both cheaper and more correct than per-SQS sweeps.
 
     cmd_prefix is the VASP launch command ("mpiexec -n 128") forwarded
     to every runstruct_vasp / robustrelax_vasp invocation as trailing
@@ -166,23 +175,41 @@ def process_one_sqs(sqs_dir: Path,
     """
     sweep_root = sqs_dir / "convergence"
 
-    stamp(f"[{sqs_dir.name}] STAGE 1/3 convergence sweep starting "
-          f"(watch {sweep_root}/*/vasp.log)")
-    chosen_encut, chosen_kppra, kres, eres = converge.converge_sqs(
-        sqs_dir, sweep_root, potcar_paths,
-        dlm=dlm, algo=algo, tol_ev=tol_ev,
-        env_bin=env_bin, timeout=timeout,
-        cmd_prefix=cmd_prefix)
+    if preset_encut is not None and preset_kppra is not None:
+        chosen_encut, chosen_kppra = preset_encut, preset_kppra
+        kres = eres = None
+        stamp(f"[{sqs_dir.name}] STAGE 1/3 convergence reused from phase "
+              f"scope: ENCUT={chosen_encut} eV, KPPRA={chosen_kppra}")
+    else:
+        stamp(f"[{sqs_dir.name}] STAGE 1/3 convergence sweep starting "
+              f"(watch {sweep_root}/*/vasp.log)")
+        chosen_encut, chosen_kppra, kres, eres = converge.converge_sqs(
+            sqs_dir, sweep_root, potcar_paths,
+            dlm=dlm, algo=algo, tol_ev=tol_ev,
+            env_bin=env_bin, timeout=timeout,
+            cmd_prefix=cmd_prefix)
+        print(kres.table())
+        print(eres.table())
+        print(f"    -> chosen ENCUT={chosen_encut} eV, KPPRA={chosen_kppra}")
 
-    print(kres.table())
-    print(eres.table())
-    print(f"    -> chosen ENCUT={chosen_encut} eV, KPPRA={chosen_kppra}")
+    # ISIF=3 relaxations need a Pulay-safe basis: the sweep converges the
+    # ENERGY, but the stress tensor converges much more slowly, and cell
+    # relaxation at the energy-converged ENCUT gives systematically small
+    # volumes. Floor at 1.3 x max(ENMAX) (VASP guidance); statics/phonons
+    # keep the sweep-chosen value.
+    relax_encut = chosen_encut
+    if potcar_paths:
+        relax_encut = potcar.pulay_safe_encut(
+            chosen_encut, potcar.max_enmax(potcar_paths))
+        if relax_encut != chosen_encut:
+            stamp(f"[{sqs_dir.name}] relax ENCUT raised {chosen_encut} -> "
+                  f"{relax_encut} eV (Pulay-stress floor for ISIF=3)")
 
     stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation starting "
           f"(method={relax_method}; watch {sqs_dir}/"
           f"{'runstruct' if relax_method == 'runstruct' else 'robustrelax_' + relax_method}.log)")
     relax.relax_structure(
-        sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
+        sqs_dir, encut=relax_encut, kppra=chosen_kppra,
         method=relax_method, dlm=dlm, algo=algo,
         env_bin=env_bin, timeout=timeout,
         cmd_prefix=cmd_prefix, relax_opts=relax_opts)
@@ -219,8 +246,10 @@ def process_one_sqs(sqs_dir: Path,
         "sqs_dir": str(sqs_dir),
         "chosen_encut": chosen_encut,
         "chosen_kppra": chosen_kppra,
-        "kppra_converged": kres.converged,
-        "encut_converged": eres.converged,
+        "relax_encut": relax_encut,
+        "convergence_reused": kres is None,
+        "kppra_converged": kres.converged if kres else None,
+        "encut_converged": eres.converged if eres else None,
         "relax_method": relax_method,
         "str_relax_present": (sqs_dir / "str_relax.out").is_file(),
         "phonon_out": phonon_out,
@@ -244,7 +273,8 @@ def process_phase(phase: str,
                   timeout: int,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
-                  fitfc_opts: Optional[Dict] = None) -> Dict:
+                  fitfc_opts: Optional[Dict] = None,
+                  convergence_scope: str = "phase") -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -262,7 +292,8 @@ def process_phase(phase: str,
                              algo, tol_ev, sqs_levels, sigma_elements, env_bin,
                              skip_phonon, timeout,
                              cmd_prefix=cmd_prefix, relax_opts=relax_opts,
-                             fitfc_opts=fitfc_opts)
+                             fitfc_opts=fitfc_opts,
+                             convergence_scope=convergence_scope)
 
     # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
     # `level <= -lv`), so a single invocation at max(sqs_levels) copies
@@ -282,14 +313,25 @@ def process_phase(phase: str,
     sqs_dirs = discover_sqs_dirs(phase_root)
     print(f"    {len(sqs_dirs)} SQS directories")
 
+    # Phase-uniform convergence (default): sweep on the FIRST SQS only
+    # and reuse its (ENCUT, KPPRA) for every sibling — mixing energies
+    # subtract eV-scale totals, and that subtraction only cancels
+    # basis/k-mesh error when all structures share the same settings.
+    # --convergence-scope sqs restores the old per-SQS sweeps.
     results = []
+    preset: Optional[tuple] = None
     for d in sqs_dirs:
         print(f"\n  -- SQS {d.name} --")
-        results.append(process_one_sqs(
+        res = process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
             env_bin, skip_phonon, timeout,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
-            fitfc_opts=fitfc_opts))
+            fitfc_opts=fitfc_opts,
+            preset_encut=preset[0] if preset else None,
+            preset_kppra=preset[1] if preset else None)
+        results.append(res)
+        if convergence_scope == "phase" and preset is None:
+            preset = (res["chosen_encut"], res["chosen_kppra"])
     return {"phase": phase, "sqs": results}
 
 
@@ -307,7 +349,8 @@ def process_sigma(phase: str,
                   timeout: int,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
-                  fitfc_opts: Optional[Dict] = None) -> Dict:
+                  fitfc_opts: Optional[Dict] = None,
+                  convergence_scope: str = "phase") -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -338,14 +381,21 @@ def process_sigma(phase: str,
         endmember_dirs = [d for d in discover_sqs_dirs(phase_root)
                           if "lev=0" in d.name] or discover_sqs_dirs(phase_root)
 
+    # Same phase-uniform convergence policy as process_phase.
     results = []
+    preset: Optional[tuple] = None
     for d in endmember_dirs:
         print(f"\n  -- SIGMA endmember {d.name} --")
-        results.append(process_one_sqs(
+        res = process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
             env_bin, skip_phonon, timeout,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
-            fitfc_opts=fitfc_opts))
+            fitfc_opts=fitfc_opts,
+            preset_encut=preset[0] if preset else None,
+            preset_kppra=preset[1] if preset else None)
+        results.append(res)
+        if convergence_scope == "phase" and preset is None:
+            preset = (res["chosen_encut"], res["chosen_kppra"])
     return {"phase": phase, "sqs": results, "endmember_only": True}
 
 
@@ -443,6 +493,16 @@ def main():
                          "distance) for the 'escalate' retry. Default: "
                          "1.5x the original (i.e. 3.0 for the default "
                          "-ernn=2).")
+    ap.add_argument("--convergence-scope", choices=("phase", "sqs"),
+                    default="phase",
+                    help="'phase' (default): converge ENCUT/KPPRA on the "
+                         "first SQS of each phase and reuse for all its "
+                         "siblings, so every structure entering a mixing-"
+                         "energy fit shares identical settings (the "
+                         "subtraction of eV-scale totals only cancels "
+                         "basis/k-mesh error at uniform settings). 'sqs' "
+                         "restores per-SQS sweeps (more compute, "
+                         "inconsistent settings — for diagnostics only).")
     ap.add_argument("--no-spin", action="store_true",
                     help="Force ISPIN=1 (non-spin-polarized) even for "
                          "magnetic elements. Default: spin polarization is "
@@ -557,6 +617,7 @@ def main():
         "relax_opts": args.relax_opts,
         "fitfc_opts": fitfc_opts,
         "spin_polarized": vaspwrap.DEFAULT_SPIN,
+        "convergence_scope": args.convergence_scope,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
@@ -566,7 +627,8 @@ def main():
             args.algo, args.tol_ev, sqs_levels, sigma_elements,
             template_root, args.env_bin, args.skip_phonon, args.timeout,
             cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts,
-            fitfc_opts=fitfc_opts)
+            fitfc_opts=fitfc_opts,
+            convergence_scope=args.convergence_scope)
         manifest["phases"].append(res)
 
     out = Path(args.out) if args.out else work_root / "upstream_manifest.json"

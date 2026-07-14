@@ -28,6 +28,26 @@ _ENMAX_RE = re.compile(r"ENMAX\s*=\s*([0-9]+\.?[0-9]*)")
 # Fractions of MAX_ENMAX spanned by the ENCUT sweep.
 ENCUT_LOW_FACTOR = 1.00
 ENCUT_HIGH_FACTOR = 1.25
+
+# ENCUT floor factor for ISIF=3 (variable-cell) relaxations. The
+# convergence sweep tests ENERGY convergence on static points; the
+# STRESS tensor converges much more slowly with basis size (Pulay
+# stress), so relaxing the cell at the energy-converged ENCUT gives
+# systematically too-small volumes. VASP's own guidance for volume
+# relaxations is ENCUT >= 1.3 x max(ENMAX).
+PULAY_ENCUT_FACTOR = 1.3
+
+
+def pulay_safe_encut(chosen_encut: int,
+                     max_enmax_ev: float,
+                     factor: float = PULAY_ENCUT_FACTOR,
+                     round_to: int = 10) -> int:
+    """ENCUT to use for a variable-cell (ISIF=3) relaxation: the
+    energy-converged value, floored at factor x max(ENMAX) rounded UP to
+    `round_to` eV. Static/phonon runs keep the sweep-chosen ENCUT."""
+    floor_ev = factor * max_enmax_ev
+    floor_int = int(-(-floor_ev // round_to) * round_to)   # ceil to round_to
+    return max(int(chosen_encut), floor_int)
 ENCUT_N_POINTS = 5
 
 # ENCUT factor used while the KPPRA sweep runs.

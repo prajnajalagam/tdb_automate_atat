@@ -1024,3 +1024,50 @@ def test_wants_spin_detects_magnetic_3d():
     assert vaspwrap.wants_spin(["Co", "Cr"])
     assert vaspwrap.wants_spin(["Al", "Ni"])
     assert not vaspwrap.wants_spin(["Al", "Ti"])
+
+
+# ---- Pulay ENCUT floor + phase-uniform convergence (review F2/F4) ----------
+
+def test_pulay_safe_encut():
+    # 1.3 x 267.882 = 348.2 -> ceil to 350; sweep choice below the floor
+    # is raised, above it is kept.
+    assert potcar.pulay_safe_encut(300, 267.882) == 350
+    assert potcar.pulay_safe_encut(400, 267.882) == 400
+    assert potcar.pulay_safe_encut(350, 267.882) == 350
+
+
+def test_process_one_sqs_preset_skips_sweep_and_bumps_relax_encut(
+        tmp_path, monkeypatch):
+    """Preset (phase-scope) settings must skip converge_sqs entirely, and
+    the relax wrap must get the Pulay-floored ENCUT while the record
+    keeps the sweep-chosen one for statics/phonons."""
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    pot = tmp_path / "POTCAR"
+    pot.write_text(POTCAR_CO)   # ENMAX 267.882 -> floor 350
+
+    def boom(*a, **k):
+        raise AssertionError("convergence sweep must not run with preset")
+
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs", boom)
+
+    seen = {}
+
+    def fake_relax(calc_dir, encut, kppra, **kwargs):
+        seen["encut"], seen["kppra"] = encut, kppra
+        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[pot], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60,
+        preset_encut=300, preset_kppra=6000)
+
+    assert res["convergence_reused"] is True
+    assert res["chosen_encut"] == 300 and res["relax_encut"] == 350
+    assert seen["encut"] == 350, "relax must use the Pulay-floored ENCUT"
+    assert seen["kppra"] == 6000
