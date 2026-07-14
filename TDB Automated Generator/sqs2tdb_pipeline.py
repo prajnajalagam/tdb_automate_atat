@@ -340,7 +340,11 @@ def discover_sqs(data_roots: List[Path], phase: str,
                  verbose: bool = True,
                  rename_energy_off: bool = True,
                  oszicar_min_score: float = 0.0,
-                 max_checkrelax: float = 0.1) -> List[SQSData]:
+                 max_checkrelax: float = 0.1,
+                 target_gate=None,
+                 endmember_per_atom: Optional[Dict[str, float]] = None,
+                 target_tol_sigma: float = 3.0,
+                 reject_log: Optional[List[Dict]] = None) -> List[SQSData]:
     """Find all lev>0 SQS for a phase/binary, one per composition.
 
     Energy handling
@@ -358,6 +362,25 @@ def discover_sqs(data_roots: List[Path], phase: str,
       (if present) via oszicar_convergence_scorer; SQS scoring below the
       threshold are rejected. If the scorer is unavailable or no OSZICAR
       is present, the SQS is accepted (no information ≠ failure).
+
+    Consensus-target gate  (restored — the 76ee1f4 wiring was lost in a
+    later file overwrite; see REVIEW_RESPONSE.md item F0)
+    ---------------------
+    - When `target_gate` is supplied (a TargetGate from
+      tdb_corpus/sqs_target_gate.py), each candidate SQS's DFT formation
+      energy is computed relative to same-phase pure endmembers
+      (provided via `endmember_per_atom` = {EL: eV/atom}) and z-scored
+      against the consensus RK-excess target. SQS more than
+      `target_tol_sigma` standard deviations from target are rejected.
+      Compositions outside the RK's covered x-range are kept (no
+      target to compare against).
+
+    Rejection records
+    -----------------
+    - When `reject_log` is a list, every skipped candidate appends a
+      record (phase, dir, reason, and any gate numbers). The caller
+      persists these — gated-out DFT data is a scientific decision that
+      must stay auditable, not a silent deletion.
     """
     el1, el2 = el1.upper(), el2.upper()
     found = []
@@ -365,8 +388,14 @@ def discover_sqs(data_roots: List[Path], phase: str,
     skipped_reasons: Dict[str, int] = {}
     rename_count = 0
 
-    def skip(reason):
+    def skip(reason, path=None, **detail):
         skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+        if reject_log is not None:
+            rec = {"phase": phase, "reason": reason}
+            if path is not None:
+                rec["dir"] = str(path)
+            rec.update(detail)
+            reject_log.append(rec)
 
     site = PHASE_SITE.get(phase)  # None for SIGMA (no mixing SQS)
     if site is None and phase == "SIGMA_D8B":
@@ -405,7 +434,7 @@ def discover_sqs(data_roots: List[Path], phase: str,
                 if verbose:
                     print(f"      SKIP {p.name}: energy file empty or "
                           f"unparseable")
-                skip("unparseable_energy")
+                skip("unparseable_energy", path=p)
                 continue
 
             # Lattice-drift gate (upstream checkrelax analogue): an SQS
@@ -419,14 +448,14 @@ def discover_sqs(data_roots: List[Path], phase: str,
                     if verbose:
                         print(f"      SKIP {p.name}: relaxaway.flag "
                               f"(left parent lattice)")
-                    skip("relaxed_away_flag")
+                    skip("relaxed_away_flag", path=p)
                     continue
                 cr = read_float_file(p / "checkrelax.out")
                 if cr is not None and cr > max_checkrelax:
                     if verbose:
                         print(f"      SKIP {p.name}: checkrelax "
                               f"{cr:.4f} > {max_checkrelax}")
-                    skip("lattice_drift")
+                    skip("lattice_drift", path=p, checkrelax=cr)
                     continue
 
             # Convergence quality gate.
@@ -436,7 +465,7 @@ def discover_sqs(data_roots: List[Path], phase: str,
                     if verbose:
                         print(f"      SKIP {p.name}: OSZICAR score "
                               f"{score:.1f} < {oszicar_min_score}")
-                    skip("oszicar_below_threshold")
+                    skip("oszicar_below_threshold", path=p, score=score)
                     continue
 
             # Parse composition from directory name
@@ -469,6 +498,46 @@ def discover_sqs(data_roots: List[Path], phase: str,
                 skip("duplicate_composition")
                 continue
             seen_comp.add(comp_key)
+
+            # Consensus-target gate: same-phase excess formation energy
+            # vs the RK-excess target loaded from a tdb_corpus consensus
+            # JSON. Applied AFTER the cheap filters. Every rejection is
+            # recorded via skip(...) -> reject_log.
+            if target_gate is not None and endmember_per_atom:
+                try:
+                    from sqs_target_gate import (
+                        per_atom_energy as _per_atom_e,
+                    )
+                except ImportError:
+                    _per_atom_e = None
+                if _per_atom_e is not None:
+                    pa = _per_atom_e(p / "energy", p / "str.out")
+                    if pa is None:
+                        skip("target_gate_no_atom_count", path=p)
+                        if verbose:
+                            print(f"      SKIP {p.name}: target gate could "
+                                  f"not compute eV/atom (str.out unreadable)")
+                        continue
+                    e_per_atom, n_at = pa
+                    comp_for_gate = {el1: x1, el2: x2}
+                    e_ref = sum(
+                        comp_for_gate[el] * endmember_per_atom[el]
+                        for el in (el1, el2)
+                        if el in endmember_per_atom
+                    )
+                    e_excess = e_per_atom - e_ref
+                    passes, target, sigma, z, reason = target_gate.evaluate(
+                        comp_for_gate, e_excess, n_sigma=target_tol_sigma,
+                    )
+                    if not passes:
+                        if verbose:
+                            print(f"      SKIP {p.name}: target gate "
+                                  f"{reason}  (x({el2})={x2:.3f}, "
+                                  f"E_excess={e_excess*1e3:+.1f} meV/atom)")
+                        skip("target_gate_rejected", path=p,
+                             z_score=z, target_ev=target, sigma_ev=sigma,
+                             e_excess_ev=e_excess, x_B=x2)
+                        continue
 
             svib_path = find_svib_ht(p)
             found.append(SQSData(
@@ -992,6 +1061,33 @@ def main():
                          "is below this threshold. Uses "
                          "../oszicar_convergence_scorer.py. SQS with no "
                          "OSZICAR found are accepted. Default 0 (disabled).")
+    ap.add_argument("--target-dir", default=None,
+                    help="Directory of consensus-target JSONs produced by "
+                         "tdb_corpus/reverse_engineer_targets.ipynb. When "
+                         "supplied, SQS whose DFT formation energy (same-"
+                         "phase pure references) deviates from the RK-"
+                         "excess consensus target by more than "
+                         "--target-tol-sigma standard deviations are "
+                         "REJECTED before fitting (and recorded in "
+                         "discovery_rejects.json). Files are picked up by "
+                         "name: <A>_<B>_<phase>_consensus.json. Phases for "
+                         "which no JSON is found run without a gate.")
+    ap.add_argument("--target-tol-sigma", type=float, default=3.0,
+                    help="Tolerance in units of consensus gate sigma "
+                         "(sqrt(sigma_TDB^2 + dft_noise_floor^2), floored "
+                         "at --target-min-sigma) for the --target-dir "
+                         "gate. Default 3.0.")
+    ap.add_argument("--target-dft-noise-floor", type=float, default=0.005,
+                    help="DFT/SQS-vs-random-alloy error floor in eV/atom "
+                         "added in quadrature to the cross-TDB sigma. "
+                         "Default 5 meV/atom.")
+    ap.add_argument("--target-min-sigma", type=float, default=0.010,
+                    help="Absolute floor on the gating sigma (eV/atom). "
+                         "Where a phase is METASTABLE the TDBs are not "
+                         "constrained by data and often just inherit the "
+                         "same SGTE lattice stabilities, so their spread "
+                         "shrinks artificially and a tight gate would "
+                         "reject correct DFT. Default 10 meV/atom.")
     ap.add_argument("--keep-energy-off", action="store_true",
                     help="Do NOT auto-rename energy.off files to energy "
                          "during discovery (the rename is on by default so "
@@ -1030,6 +1126,53 @@ def main():
     print(f"  Rename .off   : {not args.keep_energy_off}")
     print(f"  Phases        : {', '.join(requested_phases)}")
     print(f"{'='*70}\n")
+
+    print(f"  Target gate   : "
+          + (f"{args.target_dir} (tol {args.target_tol_sigma} sigma, "
+             f"min-sigma {args.target_min_sigma*1e3:.0f} meV/atom)"
+             if args.target_dir else "disabled"))
+
+    # ── Load consensus-target gates (one per phase) ───────────────────
+    target_gates: Dict[str, object] = {}
+    if args.target_dir:
+        # tdb_corpus/sqs_target_gate.py is the canonical location; also
+        # tolerate a copy reachable via cwd or PYTHONPATH.
+        gate_path_candidates = [
+            Path(__file__).resolve().parent.parent / "tdb_corpus",
+            Path.cwd() / "tdb_corpus",
+        ]
+        for cand in gate_path_candidates:
+            if (cand / "sqs_target_gate.py").is_file():
+                sys.path.insert(0, str(cand))
+                break
+        try:
+            from sqs_target_gate import load_target_dir
+            target_gates = load_target_dir(
+                Path(args.target_dir),
+                [el1, el2],
+                requested_phases,
+                dft_noise_floor_ev=args.target_dft_noise_floor,
+                min_sigma_ev=args.target_min_sigma,
+            )
+        except ImportError as exc:
+            print(f"  WARNING: --target-dir set but sqs_target_gate not "
+                  f"importable ({exc}); gate disabled.")
+        if target_gates:
+            print(f"  Loaded consensus gates for: "
+                  f"{sorted(target_gates.keys())}")
+            for ph, gate in sorted(target_gates.items()):
+                xr = gate.rk_E.x_range
+                print(f"    [{ph}] {gate.system[0]}-{gate.system[1]}  "
+                      f"x-range [{xr[0]:.2f}, {xr[1]:.2f}]  "
+                      f"from {Path(gate.source_path).name}")
+        else:
+            print(f"  WARNING: no consensus JSONs matched the requested "
+                  f"system+phase set in {args.target_dir}.")
+        print()
+
+    # Auditable record of everything discovery drops (target gate,
+    # lattice drift, OSZICAR, missing energies, ...).
+    discovery_rejects: List[Dict] = []
 
     all_results: Dict[str, Dict[str, List]] = {}
     global_tid = 0
@@ -1100,11 +1243,45 @@ def main():
             print(f"      {em.name}  ({sv})")
 
         # ── Discover mixing SQS ──────────────────────────────────
+        # ── Per-atom endmember energies for the target gate ─────
+        # Same-phase formation energies: lattice stability cancels with
+        # the RK-excess target, so the comparison is apples-to-apples.
+        gate_for_phase = target_gates.get(phase)
+        endmember_per_atom: Optional[Dict[str, float]] = None
+        if gate_for_phase is not None and phase != "SIGMA_D8B":
+            try:
+                from sqs_target_gate import per_atom_energy as _pae
+                endmember_per_atom = {}
+                for em, el in zip(endmembers, (el1, el2)):
+                    pa = _pae(em / "energy", em / "str.out")
+                    if pa is None:
+                        endmember_per_atom = None
+                        break
+                    endmember_per_atom[el.upper()] = pa[0]
+            except Exception as exc:
+                print(f"    WARNING: could not compute endmember per-atom "
+                      f"energies ({exc}); gate disabled for this phase.")
+                endmember_per_atom = None
+            if endmember_per_atom:
+                refs = ", ".join(
+                    f"{el}={e:.4f}" for el, e in endmember_per_atom.items()
+                )
+                print(f"    Target gate enabled: per-atom refs eV/atom "
+                      f"{{{refs}}}")
+            else:
+                print(f"    Target gate skipped for this phase "
+                      f"(endmember energies unreadable).")
+                gate_for_phase = None
+
         sqs_list = discover_sqs(
             data_roots, phase, el1, el2,
             rename_energy_off=not args.keep_energy_off,
             oszicar_min_score=args.oszicar_min_score,
             max_checkrelax=args.max_checkrelax,
+            target_gate=gate_for_phase,
+            endmember_per_atom=endmember_per_atom,
+            target_tol_sigma=args.target_tol_sigma,
+            reject_log=discovery_rejects,
         )
         print(f"    Mixing SQS : {len(sqs_list)}")
         for s in sqs_list:
@@ -1168,6 +1345,27 @@ def main():
     out_file = workdir / "fit_results.json"
     with open(out_file, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
+
+    # Auditable record of everything discovery dropped. Gating DFT data
+    # toward a consensus is a modelling DECISION — it must be reviewable
+    # (and reversible) afterwards, never a silent deletion.
+    rejects_file = workdir / "discovery_rejects.json"
+    with open(rejects_file, "w") as f:
+        json.dump({
+            "binary": f"{el1}-{el2}",
+            "n_rejected": len(discovery_rejects),
+            "gate": {
+                "target_dir": args.target_dir,
+                "target_tol_sigma": args.target_tol_sigma,
+                "target_dft_noise_floor": args.target_dft_noise_floor,
+                "target_min_sigma": args.target_min_sigma,
+                "max_checkrelax": args.max_checkrelax,
+                "oszicar_min_score": args.oszicar_min_score,
+            },
+            "rejects": discovery_rejects,
+        }, f, indent=2)
+    print(f"  Discovery rejects: {len(discovery_rejects)} "
+          f"(recorded in {rejects_file})")
 
     # ── Build manifest of surviving TDB paths per phase ──────────
     # Stage 3 (scoring) consumes this to enumerate cross-phase combos.

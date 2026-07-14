@@ -79,3 +79,35 @@ in by hand). The gate picks up whichever JSONs are present.
 This directory ships empty in git; populate it by running the notebook.
 The gate module's behaviour when no JSON is present for a given phase
 is to **skip the gate cleanly** (no rejection — equivalent to disabled).
+
+## Honesty caveats (advisor review, 2026-07)
+
+Two systematic risks in reverse-engineering DFT targets from assessed
+TDBs — both must be kept in mind when tightening the gate:
+
+1. **Metastable extrapolation.** An assessed TDB constrains G(x,T) only
+   where the phase is stable or measured. Where a phase is metastable
+   (e.g. FCC across the Cr-rich half), several assessments often inherit
+   the *same* SGTE/PURE lattice stabilities, so the cross-TDB spread
+   shrinks *artificially* — agreement there is provenance, not evidence.
+   A tight 3σ gate in such regions rejects perfectly correct DFT. The
+   gate therefore floors its sigma at `--target-min-sigma` (default
+   10 meV/atom, `min_sigma_ev` in `sqs_target_gate.py`); do not lower it
+   below the DFT noise floor, and prefer widening it for phases known to
+   be metastable over most of the composition range.
+
+2. **Magnetic entropy contamination of svib targets.** The `*T`
+   coefficients of a TDB mix vibrational, electronic, and — for Co/Cr/Ni
+   — sizeable magnetic contributions, with the magnetic part *sometimes*
+   split into the IHJ (TC/BMAGN) model and sometimes folded into the
+   excess terms, differently per assessment. Mapping consensus `*T`
+   terms directly onto `svib_ht` (a purely vibrational, high-T harmonic
+   quantity) is therefore a category error unless the notebook excludes
+   the IHJ contribution and flags assessments that fold magnetism into
+   L-parameters. Until the notebook does that decomposition, treat
+   svib_ht targets as SOFT guidance (wide sigma), never as a hard gate.
+
+Every gate rejection is recorded in the pipeline's
+`discovery_rejects.json` (dir, reason, z-score, target, sigma) — review
+it after each run; a phase losing many SQS to the gate usually means the
+target, not the DFT, is wrong there.
