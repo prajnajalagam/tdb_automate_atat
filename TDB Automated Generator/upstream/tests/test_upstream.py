@@ -1154,3 +1154,36 @@ def test_process_one_sqs_flags_relaxed_away(tmp_path, monkeypatch):
         env_bin=None, skip_phonon=True, timeout=60)
     assert res2["relaxed_away"] is False
     assert not (sqs2 / "relaxaway.flag").exists()
+
+
+# ---- NAS smoke suite (dry-run only — VASP paths run on the node) -----------
+
+def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_smoke
+    rc = run_smoke.main(["--dry-run", "--workdir", str(tmp_path),
+                         "--element", "Co",
+                         "--cmd-prefix", "mpiexec -n 8"])
+    assert rc == 0
+    import json
+    plan = {c["test"]: c for c in
+            json.loads((tmp_path / "plan.json").read_text())}
+    assert set(plan) == {"T1_static", "T2_runstruct", "T3_robustrelax",
+                         "T4_fitfc_wrap", "T5_pollmach"}
+    # each distinct call form, launcher trailing
+    assert plan["T1_static"]["argv"] == ["runstruct_vasp",
+                                         "mpiexec", "-n", "8"]
+    assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
+    assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
+                                                 "fvasp.wrap"]
+    assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
+    # inputs on disk: frozen wrap under the separate name, wait markers,
+    # displaced structure for the force run
+    assert (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").is_file()
+    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").read_text()
+    assert "0.52" in (tmp_path / "T4_fitfc_wrap" / "str.out").read_text()
+    assert (tmp_path / "T5_pollmach" / "p_1" / "wait").is_file()
+    assert (tmp_path / "T5_pollmach" / "vasp.wrap").is_file()
+    # smoke wraps are tiny-run tuned and spin-off (plumbing test)
+    w = (tmp_path / "T1_static" / "vasp.wrap").read_text()
+    assert "NELM = 25" in w and "NCORE = 1" in w and "ISPIN" not in w

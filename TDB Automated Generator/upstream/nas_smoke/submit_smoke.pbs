@@ -1,0 +1,87 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -N vasp_smoke
+#PBS -q devel
+#PBS -l select=1:ncpus=40:mpiprocs=40:model=sky_ele
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -o vasp_smoke_pbs.log
+#PBS -W group_list=a1485
+
+# ============================================================================
+#  VASP smoke suite — plumbing check for every distinct VASP call path
+#  (runstruct static / runstruct relax / robustrelax / fitfc -w wrap /
+#  pollmach dispatch) on a 2-atom cell. NOT a physics run.
+#
+#  Resource notes (deliberately minimal):
+#   * devel queue, 30 min walltime, ONE node. NAS charges SBUs per
+#     node-hour, so the savings come from the short walltime and the
+#     small node model — pick the cheapest model you have access to
+#     in the select line (sky_ele shown; bro/has are cheaper if
+#     available to the group).
+#   * Only 8 MPI ranks are used (CMD_PREFIX) even though the node has
+#     more cores — a 2-atom cell gains nothing from more, and this
+#     also mirrors an undersubscribed launch, a useful data point.
+#   * Every test self-terminates via ATAT stop sentinels the moment
+#     its expected outputs exist, and is hard-capped at TIMEOUT_S.
+# ============================================================================
+
+set -euo pipefail
+
+# ───────────────────────── USER CONFIG (edit me) ────────────────────────────
+ELEMENT="Co"
+# POTCAR for ELEMENT (leave empty to rely on ~/.ezvasp.rc POTDIR):
+POTCAR="/home1/zwu6/vasp/POTPAW_PBE.64/Co/POTCAR"
+WORKDIR="${PBS_O_WORKDIR:-$PWD}/vasp_smoke_$(date +%Y%m%d_%H%M%S)"
+CMD_PREFIX="mpiexec -n 8"        # small on purpose
+TIMEOUT_S="900"                  # per-test cap; suite ~5 tests
+
+VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
+ATAT_BIN="/home7/pjalagam/bin"
+VASP_BIN="/home1/zwu6/vasp"      # dir containing vasp_std etc.
+SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
+# ───────────────────────── END USER CONFIG ──────────────────────────────────
+
+module purge
+module load python3
+module load gcc
+module load comp-intel/2023.2.1
+module use -a /nasa/modulefiles/testing
+module load mpi-intel/2021.16
+source "$VENV_ACTIVATE"
+
+export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+# Record the environment the suite ran under — half of all "VASP won't
+# start" reports are module/PATH problems, and this makes them visible.
+mkdir -p "${WORKDIR}"
+{
+  echo "== module list ==";  module list 2>&1
+  echo "== which =="
+  for b in runstruct_vasp robustrelax_vasp pollmach fitfc ezvasp \
+           mpiexec vasp_std; do
+      printf '%-18s %s\n' "$b" "$(command -v "$b" || echo MISSING)"
+  done
+  echo "== mpi sanity (2 ranks) =="
+  mpiexec -n 2 hostname 2>&1 || echo "MPI LAUNCH FAILED"
+} > "${WORKDIR}/environment.txt" 2>&1
+
+set +e
+python3 -u "${SCRIPT_DIR}/run_smoke.py" \
+    --element "${ELEMENT}" \
+    ${POTCAR:+--potcar "${POTCAR}"} \
+    --cmd-prefix "${CMD_PREFIX}" \
+    --env-bin "${ATAT_BIN}" \
+    --workdir "${WORKDIR}" \
+    --timeout "${TIMEOUT_S}" \
+    2>&1 | tee "${WORKDIR}/smoke_console.log"
+RC=${PIPESTATUS[0]}
+set -e
+
+echo ""
+echo "Smoke suite exit code: ${RC}  (0 = all passed)"
+echo "Report: ${WORKDIR}/smoke_report.txt"
+echo "Debug bundle to share: ${WORKDIR}/smoke_report.json + environment.txt"
+exit "${RC}"
