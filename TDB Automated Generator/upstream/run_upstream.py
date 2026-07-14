@@ -155,7 +155,8 @@ def process_one_sqs(sqs_dir: Path,
                     relax_opts: str = "",
                     fitfc_opts: Optional[Dict] = None,
                     preset_encut: Optional[int] = None,
-                    preset_kppra: Optional[int] = None) -> Dict:
+                    preset_kppra: Optional[int] = None,
+                    max_checkrelax: float = 0.1) -> Dict:
     """Convergence -> relax -> phonon for a single SQS directory.
 
     fitfc_opts: extra keyword args for phonon.run_fitfc, e.g.
@@ -226,6 +227,34 @@ def process_one_sqs(sqs_dir: Path,
         if wait_marker.is_file():
             wait_marker.unlink()
 
+    # Lattice-drift check (ATAT checkrelax analogue): an SQS whose cell
+    # relaxed away from its parent lattice carries the energy of a
+    # DIFFERENT phase — it must be flagged so downstream fits can drop
+    # it. Value recorded in checkrelax.out; drift beyond max_checkrelax
+    # additionally drops a relaxaway.flag marker.
+    checkrelax_val = None
+    if (sqs_dir / "str_relax.out").is_file():
+        try:
+            from strfile import lattice_drift
+            checkrelax_val = lattice_drift(sqs_dir / "str.out",
+                                           sqs_dir / "str_relax.out")
+            (sqs_dir / "checkrelax.out").write_text(
+                f"{checkrelax_val:.6f}\n")
+            if checkrelax_val > max_checkrelax:
+                (sqs_dir / "relaxaway.flag").write_text(
+                    f"lattice drift {checkrelax_val:.4f} > "
+                    f"{max_checkrelax} — structure left its parent "
+                    f"lattice; exclude from this phase's fit\n")
+                stamp(f"[{sqs_dir.name}] WARNING lattice drift "
+                      f"{checkrelax_val:.4f} > {max_checkrelax} "
+                      f"(relaxaway.flag written — see checkrelax.out)")
+            else:
+                stamp(f"[{sqs_dir.name}] checkrelax = "
+                      f"{checkrelax_val:.4f} (<= {max_checkrelax}, OK)")
+        except Exception as exc:                    # noqa: BLE001
+            stamp(f"[{sqs_dir.name}] WARNING checkrelax metric failed: "
+                  f"{exc}")
+
     phonon_out = None
     if not skip_phonon:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
@@ -252,6 +281,8 @@ def process_one_sqs(sqs_dir: Path,
         "encut_converged": eres.converged if eres else None,
         "relax_method": relax_method,
         "str_relax_present": (sqs_dir / "str_relax.out").is_file(),
+        "checkrelax": checkrelax_val,
+        "relaxed_away": (sqs_dir / "relaxaway.flag").is_file(),
         "phonon_out": phonon_out,
         "svib_ht_present": (sqs_dir / "svib_ht").is_file(),
         "unstable_modes": (sqs_dir / "unstable_modes.log").is_file(),
@@ -274,7 +305,8 @@ def process_phase(phase: str,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
                   fitfc_opts: Optional[Dict] = None,
-                  convergence_scope: str = "phase") -> Dict:
+                  convergence_scope: str = "phase",
+                  max_checkrelax: float = 0.1) -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -293,7 +325,8 @@ def process_phase(phase: str,
                              skip_phonon, timeout,
                              cmd_prefix=cmd_prefix, relax_opts=relax_opts,
                              fitfc_opts=fitfc_opts,
-                             convergence_scope=convergence_scope)
+                             convergence_scope=convergence_scope,
+                             max_checkrelax=max_checkrelax)
 
     # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
     # `level <= -lv`), so a single invocation at max(sqs_levels) copies
@@ -328,7 +361,8 @@ def process_phase(phase: str,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
             fitfc_opts=fitfc_opts,
             preset_encut=preset[0] if preset else None,
-            preset_kppra=preset[1] if preset else None)
+            preset_kppra=preset[1] if preset else None,
+            max_checkrelax=max_checkrelax)
         results.append(res)
         if convergence_scope == "phase" and preset is None:
             preset = (res["chosen_encut"], res["chosen_kppra"])
@@ -350,7 +384,8 @@ def process_sigma(phase: str,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
                   fitfc_opts: Optional[Dict] = None,
-                  convergence_scope: str = "phase") -> Dict:
+                  convergence_scope: str = "phase",
+                  max_checkrelax: float = 0.1) -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -392,7 +427,8 @@ def process_sigma(phase: str,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
             fitfc_opts=fitfc_opts,
             preset_encut=preset[0] if preset else None,
-            preset_kppra=preset[1] if preset else None)
+            preset_kppra=preset[1] if preset else None,
+            max_checkrelax=max_checkrelax)
         results.append(res)
         if convergence_scope == "phase" and preset is None:
             preset = (res["chosen_encut"], res["chosen_kppra"])
@@ -493,6 +529,15 @@ def main():
                          "distance) for the 'escalate' retry. Default: "
                          "1.5x the original (i.e. 3.0 for the default "
                          "-ernn=2).")
+    ap.add_argument("--max-checkrelax", type=float, default=0.1,
+                    help="Lattice-drift threshold (checkrelax analogue: "
+                         "Frobenius norm of the volume-normalized strain "
+                         "between str.out and str_relax.out). Every SQS "
+                         "gets its value written to checkrelax.out; above "
+                         "the threshold a relaxaway.flag marks it as "
+                         "having left its parent lattice (ATAT guidance: "
+                         "~0.1). Downstream discovery drops flagged/"
+                         "over-threshold SQS.")
     ap.add_argument("--convergence-scope", choices=("phase", "sqs"),
                     default="phase",
                     help="'phase' (default): converge ENCUT/KPPRA on the "
@@ -618,6 +663,7 @@ def main():
         "fitfc_opts": fitfc_opts,
         "spin_polarized": vaspwrap.DEFAULT_SPIN,
         "convergence_scope": args.convergence_scope,
+        "max_checkrelax": args.max_checkrelax,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
@@ -628,7 +674,8 @@ def main():
             template_root, args.env_bin, args.skip_phonon, args.timeout,
             cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts,
             fitfc_opts=fitfc_opts,
-            convergence_scope=args.convergence_scope)
+            convergence_scope=args.convergence_scope,
+            max_checkrelax=args.max_checkrelax)
         manifest["phases"].append(res)
 
     out = Path(args.out) if args.out else work_root / "upstream_manifest.json"

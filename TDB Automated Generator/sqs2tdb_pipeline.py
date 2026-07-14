@@ -339,7 +339,8 @@ def discover_sqs(data_roots: List[Path], phase: str,
                  el1: str, el2: str,
                  verbose: bool = True,
                  rename_energy_off: bool = True,
-                 oszicar_min_score: float = 0.0) -> List[SQSData]:
+                 oszicar_min_score: float = 0.0,
+                 max_checkrelax: float = 0.1) -> List[SQSData]:
     """Find all lev>0 SQS for a phase/binary, one per composition.
 
     Energy handling
@@ -406,6 +407,27 @@ def discover_sqs(data_roots: List[Path], phase: str,
                           f"unparseable")
                 skip("unparseable_energy")
                 continue
+
+            # Lattice-drift gate (upstream checkrelax analogue): an SQS
+            # flagged as having relaxed away from its parent lattice
+            # carries another phase's energy — poison for this phase's
+            # mixing-energy fit. Uses the checkrelax.out / relaxaway.flag
+            # records written by upstream run_upstream.py; unflagged
+            # trees (no file) pass through un-gated.
+            if max_checkrelax > 0.0:
+                if (p / "relaxaway.flag").is_file():
+                    if verbose:
+                        print(f"      SKIP {p.name}: relaxaway.flag "
+                              f"(left parent lattice)")
+                    skip("relaxed_away_flag")
+                    continue
+                cr = read_float_file(p / "checkrelax.out")
+                if cr is not None and cr > max_checkrelax:
+                    if verbose:
+                        print(f"      SKIP {p.name}: checkrelax "
+                              f"{cr:.4f} > {max_checkrelax}")
+                    skip("lattice_drift")
+                    continue
 
             # Convergence quality gate.
             if oszicar_min_score > 0.0:
@@ -958,6 +980,13 @@ def main():
                          "fits are found per phase. Pending tasks are "
                          "cancelled. Drastically reduces compute when the "
                          "configuration grid is large. Default: unlimited.")
+    ap.add_argument("--max-checkrelax", type=float, default=0.1,
+                    help="Reject SQS whose recorded lattice drift "
+                         "(checkrelax.out, written by the upstream "
+                         "generator) exceeds this, or that carry a "
+                         "relaxaway.flag — they relaxed off their parent "
+                         "lattice and their energy belongs to a different "
+                         "phase. 0 disables. Default 0.1 (ATAT guidance).")
     ap.add_argument("--oszicar-min-score", type=float, default=0.0,
                     help="Skip SQS whose OSZICAR convergence score (0-100) "
                          "is below this threshold. Uses "
@@ -1075,6 +1104,7 @@ def main():
             data_roots, phase, el1, el2,
             rename_energy_off=not args.keep_energy_off,
             oszicar_min_score=args.oszicar_min_score,
+            max_checkrelax=args.max_checkrelax,
         )
         print(f"    Mixing SQS : {len(sqs_list)}")
         for s in sqs_list:

@@ -1071,3 +1071,86 @@ def test_process_one_sqs_preset_skips_sweep_and_bumps_relax_encut(
     assert res["chosen_encut"] == 300 and res["relax_encut"] == 350
     assert seen["encut"] == 350, "relax must use the Pulay-floored ENCUT"
     assert seen["kppra"] == 6000
+
+
+# ---- lattice-drift metric + gate (review F3) --------------------------------
+
+from strfile import parse_cell, cell_distortion, lattice_drift
+
+
+def _write_str(path, cell_rows, coord="1 0 0\n0 1 0\n0 0 1"):
+    rows = "\n".join(" ".join(f"{v}" for v in r) for r in cell_rows)
+    path.write_text(f"{coord}\n{rows}\n0 0 0 Co\n0.5 0.5 0.5 Cr\n")
+
+
+def test_parse_cell_both_header_layouts(tmp_path):
+    p = tmp_path / "a.out"
+    _write_str(p, [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    c = parse_cell(read_structure(p))
+    assert c[0][0] == pytest.approx(3.5) and c[1][2] == pytest.approx(0.0)
+    # (a b c alpha beta gamma) header with identity lattice rows
+    q = tmp_path / "b.out"
+    q.write_text("3.5 3.5 3.5 90 90 90\n1 0 0\n0 1 0\n0 0 1\n0 0 0 Co\n")
+    c2 = parse_cell(read_structure(q))
+    assert c2[0][0] == pytest.approx(3.5)
+    assert c2[2][2] == pytest.approx(3.5)
+
+
+def test_cell_distortion_invariances():
+    ident = [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]]
+    # pure volume change is NOT drift
+    scaled = [[3.9, 0, 0], [0, 3.9, 0], [0, 0, 3.9]]
+    assert cell_distortion(ident, scaled) == pytest.approx(0.0, abs=1e-10)
+    # rigid rotation is NOT drift (90 deg about z)
+    rot = [[0, 3.5, 0], [-3.5, 0, 0], [0, 0, 3.5]]
+    assert cell_distortion(ident, rot) == pytest.approx(0.0, abs=1e-10)
+    # shear IS drift
+    shear = [[3.5, 1.4, 0], [0, 3.5, 0], [0, 0, 3.5]]
+    assert cell_distortion(ident, shear) > 0.1
+
+
+def test_process_one_sqs_flags_relaxed_away(tmp_path, monkeypatch):
+    """A relax that shears the cell beyond max_checkrelax must leave
+    checkrelax.out + relaxaway.flag and mark the manifest record."""
+    import types
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def fake_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.5, 1.4, 0], [0, 3.5, 0], [0, 0, 3.5]])
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert (sqs / "checkrelax.out").is_file()
+    assert res["checkrelax"] > 0.1 and res["relaxed_away"] is True
+    assert (sqs / "relaxaway.flag").is_file()
+    # and a faithful relax must NOT be flagged
+    sqs2 = tmp_path / "sqs_lev=2_a_Co=0.25,a_Cr=0.75"
+    sqs2.mkdir()
+    _write_str(sqs2 / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    def faithful_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.62, 0, 0], [0, 3.62, 0], [0, 0, 3.62]])
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure",
+                        faithful_relax)
+    res2 = run_upstream.process_one_sqs(
+        sqs2, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+    assert res2["relaxed_away"] is False
+    assert not (sqs2 / "relaxaway.flag").exists()
