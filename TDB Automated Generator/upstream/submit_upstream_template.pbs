@@ -52,9 +52,13 @@ SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
 
 # Unstable-mode policy for the phonon fit. fitfc -f ABORTS (no svib_ht)
 # when the force constants give imaginary modes, unless told otherwise:
-#   mark  (default) record unstable_modes.log, leave the SQS energy-only
-#   force           retry once with fitfc -fn (svib_ht then OMITS the
-#                   unstable branches — a lower bound; flagged in the log)
+#   mark     (default) record unstable_modes.log, leave the SQS energy-only
+#   escalate regenerate perturbations at a 1.5x larger displacement radius
+#            and refit — rules out the finite-supercell artifact (costs
+#            extra VASP force runs); persists -> marked energy-only as
+#            likely genuine dynamical instability
+#   force    retry once with fitfc -fn (svib_ht then OMITS the unstable
+#            branches — a lower bound; flagged in the log)
 FITFC_ON_UNSTABLE="mark"
 # Optional fitfc -rl=<len> robust-length soft-mode treatment (beta);
 # also prevents the abort. Leave empty to keep it off.

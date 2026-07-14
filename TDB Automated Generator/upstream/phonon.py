@@ -244,6 +244,7 @@ def run_fitfc(sqs_dir: Path,
               nrr: Optional[bool] = None,
               rl: Optional[float] = None,
               on_unstable: str = "mark",
+              escalate_ernn: Optional[float] = None,
               dlm: Optional[DLMConfig] = None,
               algo: str = "All",
               env_bin: Optional[str] = None,
@@ -277,6 +278,19 @@ def run_fitfc(sqs_dir: Path,
       * on_unstable="force": retry once with fitfc's own -fn (force
         continuation). The resulting svib_ht omits the unstable
         branches — the marker log records that provenance;
+      * on_unstable="escalate": the dynamically-unstable-SQS workflow.
+        Spurious imaginary modes are most often an artifact of a
+        too-small displacement supercell (short-range force constants
+        extrapolated to Γ), so the perturbations are REGENERATED at a
+        larger radius (escalate_ernn, default 1.5x the original; the
+        vol dirs already hold str_relax.out, so one fitfc invocation
+        emits the new p* dirs), force runs are launched for the new
+        dirs only (existing force.out equations stay in the fit), and
+        the fit is retried. If the instability persists it is treated
+        as likely GENUINE dynamical instability: the SQS is left
+        energy-only and unstable_modes.log names the remaining manual
+        options (tighter re-relaxation, -rl, fitfc -fu/-gu
+        mode-following);
       * rl=<len> passes fitfc's -rl robust-length soft-mode treatment
         (beta) on the first attempt, which also prevents the abort.
 
@@ -286,9 +300,9 @@ def run_fitfc(sqs_dir: Path,
     output ("unable to open OSZICAR").
     """
     sqs_dir = Path(sqs_dir)
-    if on_unstable not in ("mark", "force"):
-        raise ValueError(f"on_unstable must be 'mark' or 'force', "
-                         f"got {on_unstable!r}")
+    if on_unstable not in ("mark", "force", "escalate"):
+        raise ValueError(f"on_unstable must be 'mark', 'force' or "
+                         f"'escalate', got {on_unstable!r}")
     if not (sqs_dir / "str_relax.out").is_file():
         raise RuntimeError(
             f"run_fitfc({sqs_dir}): no str_relax.out — fitfc generation "
@@ -385,11 +399,62 @@ def run_fitfc(sqs_dir: Path,
                       env_bin=env_bin, timeout=3600, check=False)
 
     # 5b. unstable-mode safeguard. fitfc aborted before svib_ht unless
-    #     -rl was on; either mark the SQS or retry with -fn per policy.
+    #     -rl was on; escalate / force / mark per policy.
     unstable = detect_unstable_modes(fit_log)
     forced = False
-    if unstable and not (sqs_dir / "vol_0" / "svib_ht").is_file() \
-            and on_unstable == "force":
+    escalated = False
+    escalation_fixed = False
+    esc_desc = ""
+
+    def _svib_missing() -> bool:
+        return not (sqs_dir / "vol_0" / "svib_ht").is_file()
+
+    if unstable and _svib_missing() and on_unstable == "escalate":
+        # Dynamically-unstable-SQS workflow, step 1: rule out the
+        # finite-supercell artifact by regenerating the perturbations
+        # at a larger displacement radius. The vol dirs already hold
+        # str_relax.out, so this single fitfc invocation writes the
+        # new p* dirs directly; their names embed the new radius, so
+        # the original dirs (and their force.out equations) survive
+        # and stay in the refit.
+        escalated = True
+        if er is not None:
+            esc_er, esc_ernn = er * 1.5, None
+            esc_desc = f"-er={esc_er}"
+        else:
+            esc_er = None
+            esc_ernn = escalate_ernn if escalate_ernn is not None \
+                else ernn * 1.5
+            esc_desc = f"-ernn={esc_ernn}"
+        esc_gen = build_fitfc_gen_args(ernn=esc_ernn, er=esc_er,
+                                       ns=ns, ms=ms, dr=dr, nrr=nrr)
+        runner.run_logged(["fitfc"] + esc_gen, cwd=sqs_dir,
+                          log=sqs_dir / "fitfc_gen_escalated.log",
+                          env_bin=env_bin, timeout=600, check=False)
+        new_pert = [d for d in _pert_dirs(sqs_dir)
+                    if not (d / "force.out").is_file()]
+        if new_pert:
+            runner.run_polled(
+                ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
+                log=sqs_dir / "fitfc_force_runs_escalated.log",
+                done_when=all_force_runs_done(new_pert),
+                stop_sentinel="stoppoll",
+                env_bin=env_bin, timeout=timeout)
+        # The regenerated str_unpert.out / str_relax.out carry spin
+        # tags again on a DLM run — re-strip before refitting.
+        if dlm is not None and dlm.enabled:
+            dlm_fixup(sqs_dir)
+        _clear_stale_fit_outputs(sqs_dir)
+        esc_log = sqs_dir / "fitfc_fit_escalated.log"
+        runner.run_logged(
+            ["fitfc"] + build_fitfc_fit_args(frnn=frnn, fr=fr, rl=rl),
+            cwd=sqs_dir, log=esc_log,
+            env_bin=env_bin, timeout=3600, check=False)
+        esc_unstable = detect_unstable_modes(esc_log)
+        escalation_fixed = not esc_unstable and not _svib_missing()
+        unstable += esc_unstable
+
+    if unstable and _svib_missing() and on_unstable == "force":
         forced = True
         runner.run_logged(
             ["fitfc"] + build_fitfc_fit_args(frnn=frnn, fr=fr, rl=rl,
@@ -398,13 +463,28 @@ def run_fitfc(sqs_dir: Path,
             env_bin=env_bin, timeout=3600, check=False)
         unstable += detect_unstable_modes(sqs_dir / "fitfc_fit_forced.log")
     if unstable:
-        disposition = (
-            "retried with -fn: svib_ht (if present) OMITS the unstable "
-            "branches — a lower bound, use with care" if forced
-            else "soft modes handled by -rl robust-length treatment"
-            if rl is not None
-            else "left WITHOUT svib_ht (on_unstable='mark'): downstream "
-            "treats this SQS as energy-only")
+        if forced:
+            disposition = ("retried with -fn: svib_ht (if present) OMITS "
+                           "the unstable branches — a lower bound, use "
+                           "with care")
+        elif escalation_fixed:
+            disposition = (f"RESOLVED by escalating the displacement "
+                           f"supercell ({esc_desc}): the imaginary modes "
+                           f"were a finite-range artifact; svib_ht comes "
+                           f"from the escalated fit")
+        elif escalated:
+            disposition = (f"PERSISTS after escalating to {esc_desc} — "
+                           f"likely genuine dynamical instability at this "
+                           f"composition. Left WITHOUT svib_ht "
+                           f"(energy-only). Manual options: re-relax more "
+                           f"tightly (EDIFFG, --relax-method normal), "
+                           f"fitfc -rl=<len> robust soft-mode treatment, "
+                           f"or fitfc -fu / -gu=<n> mode-following.")
+        elif rl is not None:
+            disposition = "soft modes handled by -rl robust-length treatment"
+        else:
+            disposition = ("left WITHOUT svib_ht (on_unstable='mark'): "
+                           "downstream treats this SQS as energy-only")
         (sqs_dir / "unstable_modes.log").write_text(
             "fitfc -f reported unstable/imaginary modes:\n  "
             + "\n  ".join(dict.fromkeys(unstable))

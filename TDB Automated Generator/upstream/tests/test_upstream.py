@@ -905,3 +905,85 @@ def test_run_fitfc_rl_passthrough_and_bad_policy(tmp_path, monkeypatch):
                         lambda *a, **k: 0)
     phonon.run_fitfc(sqs, encut=400, kppra=6000, rl=0.3)
     assert any("-rl=0.3" in c for cmd in fit_cmds for c in cmd)
+
+
+def _escalation_fakes(monkeypatch, resolves: bool):
+    """Fake runner where the first fit is unstable; the escalated fit
+    succeeds iff `resolves`. Returns (gen_cmds, fit_cmds, forced_pert)."""
+    gen_cmds, fit_cmds, forced_pert = [], [], []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        cwd = Path(cwd)
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            gen_cmds.append(list(cmd))
+            vol = cwd / "vol_0"
+            er = [a for a in cmd if a.startswith(("-er", "-ernn"))][0]
+            radius = er.split("=")[1]
+            pert = vol / f"p+0.2_{radius}_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            if len(fit_cmds) == 1 or not resolves:
+                Path(log).write_text("Unstable modes found.\nAborting.\n")
+            else:
+                Path(log).write_text("fitted fine\n")
+                (cwd / "vol_0" / "svib_ht").write_text("4.4\n")
+                (cwd / "fitfc.out").write_text("ok\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            if not (d / "force.out").is_file():
+                forced_pert.append(d.name)
+                (d / "force.out").write_text("0\n")
+                (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+    return gen_cmds, fit_cmds, forced_pert
+
+
+def test_run_fitfc_escalate_resolves(tmp_path, monkeypatch):
+    """escalate: regenerate at 1.5x -ernn, force-run ONLY the new p*
+    dirs, refit; resolved -> escalated svib_ht promoted + marker says so."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    gen_cmds, fit_cmds, forced_pert = _escalation_fakes(monkeypatch, True)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate")
+
+    assert len(gen_cmds) == 2, "one normal gen + one escalated gen"
+    assert "-ernn=2.0" in gen_cmds[0] and "-ernn=3.0" in gen_cmds[1]
+    assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
+    # the original pert kept its force.out; only the new dir was run
+    assert forced_pert.count("p+0.2_2.0_0") == 1
+    assert forced_pert.count("p+0.2_3.0_0") == 1
+    assert (sqs / "svib_ht").read_text() == "4.4\n"
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "RESOLVED" in marker and "-ernn=3.0" in marker
+
+
+def test_run_fitfc_escalate_persists_marks_energy_only(tmp_path, monkeypatch):
+    """escalate, still unstable: no svib_ht, no -fn fallback; marker
+    calls it likely genuine dynamical instability with manual options."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    gen_cmds, fit_cmds, _ = _escalation_fakes(monkeypatch, False)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate",
+                     escalate_ernn=4.0)
+
+    assert "-ernn=4.0" in gen_cmds[1], "explicit escalate_ernn honoured"
+    assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
+    assert not (sqs / "svib_ht").exists()
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "PERSISTS" in marker and "genuine dynamical instability" in marker
+    assert "-fu" in marker and "-rl" in marker, "manual options named"

@@ -421,7 +421,8 @@ def main():
                          "ignored for --relax-method runstruct.")
     ap.add_argument("--skip-phonon", action="store_true",
                     help="Skip the fitfc phonon stage (energy-only upstream).")
-    ap.add_argument("--fitfc-on-unstable", choices=("mark", "force"),
+    ap.add_argument("--fitfc-on-unstable",
+                    choices=("mark", "force", "escalate"),
                     default="mark",
                     help="Policy when fitfc -f reports unstable modes and "
                          "aborts before writing svib_ht. 'mark' (default): "
@@ -429,7 +430,18 @@ def main():
                          "energy-only (honest — svib from a fit that drops "
                          "imaginary branches is biased). 'force': retry once "
                          "with fitfc's -fn so a (lower-bound) svib_ht is "
-                         "still produced; provenance is recorded.")
+                         "still produced; provenance is recorded. "
+                         "'escalate': regenerate the perturbations at a "
+                         "1.5x larger displacement radius and refit (rules "
+                         "out the finite-supercell artifact — costs extra "
+                         "VASP force runs); if the instability persists the "
+                         "SQS is marked energy-only as likely genuinely "
+                         "dynamically unstable.")
+    ap.add_argument("--fitfc-escalate-ernn", type=float, default=None,
+                    help="Displacement radius (-ernn, x nearest-neighbour "
+                         "distance) for the 'escalate' retry. Default: "
+                         "1.5x the original (i.e. 3.0 for the default "
+                         "-ernn=2).")
     ap.add_argument("--fitfc-rl", type=float, default=None,
                     help="Pass fitfc's -rl=<len> robust-length soft-mode "
                          "treatment (beta) to the fit, which also prevents "
@@ -493,6 +505,8 @@ def main():
     fitfc_opts: Dict = {"on_unstable": args.fitfc_on_unstable}
     if args.fitfc_rl is not None:
         fitfc_opts["rl"] = args.fitfc_rl
+    if args.fitfc_escalate_ernn is not None:
+        fitfc_opts["escalate_ernn"] = args.fitfc_escalate_ernn
 
     print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}"
           + ("" if args.skip_phonon else
