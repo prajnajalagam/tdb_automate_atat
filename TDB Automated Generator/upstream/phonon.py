@@ -2,14 +2,48 @@
 """
 fitfc phonon workflow + DLM spin-suffix fixup.
 
-fitfc stages (ATAT manual 7.1.9):
-  1. fitfc -er=.. -ns=.. -ms=.. -dr=..   -> writes vol_* strain dirs.
-  2. pollmach runstruct_vasp (relax under strain) ; touch stoppoll.
-  3. fitfc (same args)                    -> writes perturbation subdirs.
-  4. pollmach runstruct_vasp (frozen, force runs).
-  5. [DLM only] strip +2/-2 spin tags from every str_relax.out / str_unpert.out
-     so fitfc -f can read plain element symbols.
-  6. fitfc -f -fr=..                      -> fits force constants; svib_ht etc.
+Verified against the fitfc.c++ source ($atatdir/src/fitfc.c++). The facts
+that shape this module:
+
+* Generation mode (no -f) REQUIRES -er or -ernn and reads BOTH the ideal
+  structure (-si, default str.out) and the relaxed one (-sr, default
+  str_relax.out); it ERRORQUITs if either is missing. The sqs2tdb
+  vibrational recipe passes ``-si=str_relax.out`` so ideal == relaxed.
+* Generation writes vol_0 / vol_<strain%> dirs containing str.out (the
+  relaxed structure stretched to that strain). Without -nrr it drops a
+  ``wait`` marker and STOPS THERE: perturbations are only emitted for vol
+  dirs that already contain str_relax.out ("Next, you need to relax the
+  structures ... and rerun fitfc with the same command-line options").
+  With -nrr it writes str_relax.out into the vol dir directly, so the
+  SAME invocation proceeds to write the p*<dr>_<er>_<n> perturbation dirs
+  (str.out perturbed, str_unpert.out, str_ideal.out, wait). fitfc's own
+  help says -nrr is correct when the input is already relaxed and the
+  calculation is harmonic — exactly our svib_ht use case.
+* Fit mode (-f) REQUIRES -fr or -frnn. Per vol dir it reads
+  str_relax.out, optional ``energy``, and per perturbation dir
+  str_unpert.out + str_relax.out + force.out (NOT the perturbed str.out —
+  the relaxed output of the frozen force run is what enters the fit).
+  It writes fc.out, vdos.out, ``svib_ht`` and ``fvib`` INSIDE each vol
+  dir, then fitfc.out / fvib / svib at the top level. It also reads
+  ``../Trange.in`` (from the PHASE directory above the SQS dir) for the
+  temperature grid when present.
+* ``sqs2tdb -fit`` reads ``<sqs_dir>/svib_ht`` ONLY (top level), so the
+  vol_0/svib_ht that fitfc produces must be copied up — the tutorial's
+  ``cp vol_0/svib_ht .`` step, automated here.
+
+Default recipe (harmonic, matches the sqs2tdb vibrational workflow):
+
+  1. fitfc -si=str_relax.out -ernn=2 -ns=1 -nrr   -> vol_0 + p* dirs, one shot
+  2. pollmach runstruct_vasp <launcher>            -> force.out in every p* dir
+  3. [DLM only] strip +2/-2 spin tags from str_relax.out / str_unpert.out
+  4. fitfc -f -frnn=1.5 -si=str_relax.out          -> vol_0/svib_ht etc.
+  5. cp vol_0/svib_ht .                            -> what sqs2tdb -fit reads
+
+Quasiharmonic variant (ns > 1, nrr off): step 1 only writes vol_* dirs
+with ``wait``; we then relax them (ions-only, fixed strained cell — a
+per-vol ISIF=2 wrap that is removed afterwards so the p* force runs fall
+through to the frozen top-level wrap), rerun fitfc with the SAME options
+to emit the perturbations, and continue as above.
 
 DLM fixup
 ---------
@@ -20,14 +54,15 @@ The user's element-specific sed recipe
     foreachfile -d 2 str_relax.out  ... (same, recursively)
     foreachfile -d 2 str_unpert.out ...
 
-is generalised here to dlm_fixup(): walk the SQS tree and strip *any* +/-N
+is generalised in dlm_fixup(): walk the SQS tree and strip *any* +/-N
 spin/charge suffix from species tokens in every str_relax.out and
-str_unpert.out, at the top level and in all subdirectories. Element-agnostic,
+str_unpert.out — exactly the two files fitfc -f parses. Element-agnostic,
 so it works for Co-Cr, Fe-Ni, etc. without editing per pair.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
@@ -69,14 +104,91 @@ def _write_phonon_wrap(calc_dir: Path, encut: int, kppra: int,
     (Path(calc_dir) / "vasp.wrap").write_text(wrap)
 
 
+def build_fitfc_gen_args(ernn: Optional[float], er: Optional[float],
+                         ns: int, ms: float, dr: Optional[float],
+                         nrr: bool) -> List[str]:
+    """fitfc generation arguments (everything except the program name).
+
+    -si=str_relax.out makes the relaxed structure the "ideal" one too, as
+    in the sqs2tdb vibrational recipe — SQS relax hard enough that
+    matching str.out against str_relax.out (fitfc's reorder_atoms) is
+    fragile, and the perturbation spacegroup is found from the relaxed
+    cell anyway. -er (absolute, Å) wins over -ernn (× nearest-neighbour
+    distance) when both are given. -ms is only meaningful for ns > 1 but
+    is harmless at ns=1 (strain grid collapses to 0), and the SAME args
+    must be reused if fitfc has to be re-invoked after the vol_* relax.
+    """
+    if er is None and ernn is None:
+        raise ValueError("fitfc generation needs -er or -ernn")
+    args = ["-si=str_relax.out"]
+    args.append(f"-er={er}" if er is not None else f"-ernn={ernn}")
+    args.append(f"-ns={ns}")
+    args.append(f"-ms={ms}")
+    if dr is not None:
+        args.append(f"-dr={dr}")
+    if nrr:
+        args.append("-nrr")
+    return args
+
+
+def build_fitfc_fit_args(frnn: Optional[float],
+                         fr: Optional[float]) -> List[str]:
+    """fitfc fit-mode arguments: -f requires -fr or -frnn (fitfc
+    ERRORQUITs without one). -fr (absolute, Å) wins over -frnn."""
+    if fr is None and frnn is None:
+        raise ValueError("fitfc -f needs -fr or -frnn")
+    args = ["-f", "-si=str_relax.out"]
+    args.append(f"-fr={fr}" if fr is not None else f"-frnn={frnn}")
+    return args
+
+
+def _vol_dirs(sqs_dir: Path) -> List[Path]:
+    return sorted(d for d in sqs_dir.glob("vol_*") if d.is_dir())
+
+
+def _pert_dirs(sqs_dir: Path) -> List[Path]:
+    return [d for v in _vol_dirs(sqs_dir)
+            for d in sorted(v.glob("p*")) if d.is_dir()]
+
+
+def all_force_runs_done(pert_dirs: List[Path]):
+    """done_when predicate for the perturbation force runs: fitfc -f needs
+    BOTH force.out and str_relax.out in every p* dir (it parses the
+    relaxed output of the frozen run, not the input str.out)."""
+    def _pred(_cwd: Path) -> bool:
+        return all((d / "force.out").is_file()
+                   and (d / "str_relax.out").is_file() for d in pert_dirs)
+    return _pred
+
+
+def promote_svib_ht(sqs_dir: Path) -> Optional[Path]:
+    """Copy vol_0/svib_ht up to <sqs_dir>/svib_ht.
+
+    fitfc -f writes svib_ht inside each vol_* dir, but ``sqs2tdb -fit``
+    only ever opens ``<sqs_dir>/svib_ht`` — this is the tutorial's
+    ``cp vol_0/svib_ht .`` step. Returns the top-level path, or None if
+    no vol_0/svib_ht exists (fit failed or produced nothing).
+    """
+    sqs_dir = Path(sqs_dir)
+    src = sqs_dir / "vol_0" / "svib_ht"
+    if not src.is_file():
+        return None
+    dst = sqs_dir / "svib_ht"
+    shutil.copy2(src, dst)
+    return dst
+
+
 def run_fitfc(sqs_dir: Path,
               encut: int,
               kppra: int,
-              er: float = 11.5,
-              ns: int = 3,
-              ms: float = 0.02,
-              dr: float = 0.1,
+              ernn: Optional[float] = 2.0,
+              er: Optional[float] = None,
+              frnn: Optional[float] = 1.5,
               fr: Optional[float] = None,
+              ns: int = 1,
+              ms: float = 0.02,
+              dr: Optional[float] = None,
+              nrr: Optional[bool] = None,
               dlm: Optional[DLMConfig] = None,
               algo: str = "All",
               env_bin: Optional[str] = None,
@@ -84,65 +196,120 @@ def run_fitfc(sqs_dir: Path,
               cmd_prefix: str = "") -> Path:
     """Drive the full fitfc workflow in sqs_dir; returns the fitfc.out path.
 
-    Assumes str.out (unrelaxed) and str_relax.out (relaxed) already exist
-    (produced by relax.relax_structure). The DLM fixup is applied just before
-    the final fitfc -f.
+    Requires str.out and str_relax.out in sqs_dir (produced by
+    relax.relax_structure) — fitfc ERRORQUITs without the relaxed file.
+
+    Defaults follow the sqs2tdb vibrational recipe: harmonic, single
+    volume (-ernn=2 -ns=1 -nrr, fit with -frnn=1.5), which is all the
+    downstream svib_ht fit consumes. Set ns > 1 for a quasiharmonic
+    strain series: the vol_* dirs are then relaxed ions-only at fixed
+    (strained) cell before fitfc is re-run with the same options to emit
+    the perturbations, per fitfc's own two-invocation contract.
+
+    nrr defaults to (ns == 1): at a single volume vol_0 IS the already-
+    relaxed input, so re-relaxing it would waste a VASP run.
 
     cmd_prefix: VASP launch command (e.g. "mpiexec -n 128") appended as
-    trailing tokens to both pollmach runstruct_vasp invocations — same
-    fix as converge/relax; bare MPI vasp dies before writing output.
+    trailing tokens to every pollmach runstruct_vasp invocation — same
+    fix as converge/relax; a bare MPI vasp binary dies before writing
+    output ("unable to open OSZICAR").
     """
     sqs_dir = Path(sqs_dir)
-    fitfc_args = [f"-er={er}", f"-ns={ns}", f"-ms={ms}", f"-dr={dr}"]
-    if fr is None:
-        fr = er / 2.0
+    if not (sqs_dir / "str_relax.out").is_file():
+        raise RuntimeError(
+            f"run_fitfc({sqs_dir}): no str_relax.out — fitfc generation "
+            f"reads the relaxed structure and dies without it; run the "
+            f"relaxation stage first.")
 
+    if nrr is None:
+        nrr = (ns == 1)
+    gen_args = build_fitfc_gen_args(ernn=ernn, er=er, ns=ns, ms=ms,
+                                    dr=dr, nrr=nrr)
     vasp_launch = runner.split_prefix(cmd_prefix)
 
-    # Phonon force runs use a frozen-geometry wrap.
+    # Frozen-geometry wrap at the TOP level: runstruct_vasp searches
+    # upward for vasp.wrap, so the vol_*/p*/ force runs inherit this one.
     _write_phonon_wrap(sqs_dir, encut, kppra, dlm, algo)
 
-    # 1. generate strain dirs
-    runner.run_logged(["fitfc"] + fitfc_args, cwd=sqs_dir,
-                      log=sqs_dir / "fitfc_gen_strain.log",
+    # 1. generate. With -nrr this single invocation writes vol_* AND the
+    #    perturbation dirs (vol str_relax.out exists immediately).
+    runner.run_logged(["fitfc"] + gen_args, cwd=sqs_dir,
+                      log=sqs_dir / "fitfc_gen.log",
                       env_bin=env_bin, timeout=600, check=False)
 
-    vol_dirs = sorted(sqs_dir.glob("vol_*"))
+    vol_dirs = _vol_dirs(sqs_dir)
 
-    # 2. relax under strain
-    if vol_dirs:
-        runner.run_polled(
-            ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
-            log=sqs_dir / "fitfc_strain_runs.log",
-            done_when=runner.all_energy_present(vol_dirs),
-            stop_sentinel="stoppoll",
-            env_bin=env_bin, timeout=timeout)
+    if not nrr:
+        # 2a. relax each strained volume: ions only, cell FIXED at the
+        #     strain fitfc imposed (ISIF=2 override of the relax wrap).
+        #     The per-vol wrap shadows the frozen top-level one and is
+        #     removed afterwards so the p* dirs underneath fall through
+        #     to the frozen wrap for their force runs.
+        pending = [d for d in vol_dirs if not (d / "str_relax.out").is_file()]
+        if pending:
+            relax_wrap = build_vasp_wrap("relax", encut=encut, kppra=kppra,
+                                         dlm=dlm, algo=algo,
+                                         extra={"ISIF": 2})
+            for d in pending:
+                (d / "vasp.wrap").write_text(relax_wrap)
+            runner.run_polled(
+                ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
+                log=sqs_dir / "fitfc_strain_runs.log",
+                done_when=runner.all_energy_present(pending),
+                stop_sentinel="stoppoll",
+                env_bin=env_bin, timeout=timeout)
+            for d in pending:
+                wrap = d / "vasp.wrap"
+                if wrap.is_file():
+                    wrap.unlink()
 
-    # 3. regenerate perturbations
-    runner.run_logged(["fitfc"] + fitfc_args, cwd=sqs_dir,
-                      log=sqs_dir / "fitfc_gen_pert.log",
-                      env_bin=env_bin, timeout=600, check=False)
+        # 2b. re-run fitfc with the SAME options — now that the vol dirs
+        #     hold str_relax.out it emits the perturbation dirs (this is
+        #     fitfc's own printed instruction).
+        runner.run_logged(["fitfc"] + gen_args, cwd=sqs_dir,
+                          log=sqs_dir / "fitfc_gen_pert.log",
+                          env_bin=env_bin, timeout=600, check=False)
+    else:
+        # -nrr leaves no vol_0/energy; seed it from the SQS static energy
+        # (same cell, same atom count) so fitfc.out / fvib include the
+        # T=0 energy instead of fitfc's "assuming 0" fallback. svib_ht is
+        # unaffected either way.
+        top_energy = sqs_dir / "energy"
+        if top_energy.is_file():
+            for d in vol_dirs:
+                if not (d / "energy").is_file():
+                    shutil.copy2(top_energy, d / "energy")
 
-    # 4. force runs for the perturbations
-    pert_dirs = [d for v in vol_dirs for d in sorted(v.glob("p*")) if d.is_dir()]
+    # 3. force runs for the perturbations (frozen wrap, launcher LAST).
+    pert_dirs = _pert_dirs(sqs_dir)
     if pert_dirs:
         runner.run_polled(
-            ["pollmach", "-lu", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
+            ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
             log=sqs_dir / "fitfc_force_runs.log",
-            done_when=runner.all_have_file(pert_dirs, "force.out"),
+            done_when=all_force_runs_done(pert_dirs),
             stop_sentinel="stoppoll",
             env_bin=env_bin, timeout=timeout)
 
-    # 5. DLM fixup BEFORE the fit (fitfc -f can't parse Co+2 etc.)
+    # 4. DLM fixup BEFORE the fit — fitfc -f parses str_relax.out and
+    #    str_unpert.out (top level, vol_* and p* alike) and can't match
+    #    Co+2-style labels once the wrap's SUBATOM rules are out of play.
     if dlm is not None and dlm.enabled:
         changed = dlm_fixup(sqs_dir)
         (sqs_dir / "dlm_fixup.log").write_text(
             "Stripped spin suffixes from:\n"
             + "\n".join(str(p.relative_to(sqs_dir)) for p in changed) + "\n")
 
-    # 6. fit force constants
-    runner.run_logged(["fitfc", "-f", f"-fr={fr}"], cwd=sqs_dir,
+    # 5. fit force constants. fitfc also reads ../Trange.in (phase dir)
+    #    for the T grid when present; svib_ht is T-independent.
+    runner.run_logged(["fitfc"] + build_fitfc_fit_args(frnn=frnn, fr=fr),
+                      cwd=sqs_dir,
                       log=sqs_dir / "fitfc_fit.log",
                       env_bin=env_bin, timeout=3600, check=False)
+
+    # 6. promote vol_0/svib_ht to the top level for sqs2tdb -fit.
+    if promote_svib_ht(sqs_dir) is None:
+        with open(sqs_dir / "fitfc_fit.log", "a") as fh:
+            fh.write("\nWARNING: no vol_0/svib_ht produced — fit failed "
+                     "or found no force.out; svib_ht NOT promoted.\n")
 
     return sqs_dir / "fitfc.out"

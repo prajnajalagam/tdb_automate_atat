@@ -605,3 +605,170 @@ def test_process_one_sqs_clears_wait_marker(tmp_path, monkeypatch):
 
     assert not (sqs / "wait").exists(), "wait marker must be cleared"
     assert (sqs / "str_relax.out").is_file()
+
+
+# ---- fitfc orchestration (verified against fitfc.c++ source) ---------------
+
+def test_fitfc_gen_args_harmonic_default():
+    """Default recipe = sqs2tdb vibrational workflow: relative radius,
+    single volume, no re-relax, ideal structure = relaxed structure."""
+    args = phonon.build_fitfc_gen_args(ernn=2.0, er=None, ns=1, ms=0.02,
+                                       dr=None, nrr=True)
+    assert args[0] == "-si=str_relax.out"
+    assert "-ernn=2.0" in args
+    assert "-ns=1" in args
+    assert "-nrr" in args
+    assert not any(a.startswith("-dr") for a in args)  # fitfc default 0.2
+    assert not any(a.startswith("-er=") for a in args)
+
+
+def test_fitfc_gen_args_er_wins_and_requires_radius():
+    args = phonon.build_fitfc_gen_args(ernn=2.0, er=5.5, ns=3, ms=0.02,
+                                       dr=0.1, nrr=False)
+    assert "-er=5.5" in args and not any(a.startswith("-ernn") for a in args)
+    assert "-dr=0.1" in args and "-nrr" not in args
+    with pytest.raises(ValueError):
+        phonon.build_fitfc_gen_args(ernn=None, er=None, ns=1, ms=0.02,
+                                    dr=None, nrr=True)
+
+
+def test_fitfc_fit_args():
+    """fitfc -f ERRORQUITs without -fr/-frnn; -si must match generation."""
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=None)
+    assert "-f" in args and "-frnn=1.5" in args and "-si=str_relax.out" in args
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=4.0)
+    assert "-fr=4.0" in args and not any(a.startswith("-frnn") for a in args)
+    with pytest.raises(ValueError):
+        phonon.build_fitfc_fit_args(frnn=None, fr=None)
+
+
+def test_run_fitfc_requires_str_relax(tmp_path):
+    """fitfc generation dies without str_relax.out; fail fast with a
+    message instead of a cryptic fitfc log."""
+    with pytest.raises(RuntimeError, match="str_relax.out"):
+        phonon.run_fitfc(tmp_path, encut=400, kppra=6000)
+
+
+def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
+    """With -nrr (ns=1 default) fitfc emits vol_0 AND the perturbations in
+    ONE invocation, so run_fitfc must call fitfc exactly twice (gen, fit)
+    and pollmach exactly once (force runs), and must copy vol_0/svib_ht
+    to the top level (the only path sqs2tdb -fit reads)."""
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+    (sqs / "energy").write_text("-42.0\n")
+
+    calls = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        calls.append(("logged", list(cmd)))
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            # simulate -nrr generation: vol_0 + pert dirs in one shot
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str.out").write_text("s\n")
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("3.21\n")
+            (Path(cwd) / "fitfc.out").write_text("fit\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        calls.append(("polled", list(cmd)))
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0 0 0\n")
+            (d / "str_relax.out").write_text("s\n")
+        assert done_when(Path(cwd))
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    out = phonon.run_fitfc(sqs, encut=400, kppra=6000,
+                           cmd_prefix="mpiexec -n 128")
+
+    fitfc_calls = [c for k, c in calls if k == "logged" and c[0] == "fitfc"]
+    assert len(fitfc_calls) == 2, "harmonic path: gen once, fit once"
+    assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
+    polled = [c for k, c in calls if k == "polled"]
+    assert len(polled) == 1, "only the force runs need pollmach"
+    assert polled[0][:2] == ["pollmach", "runstruct_vasp"]
+    assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
+    # svib_ht promoted top-level for sqs2tdb -fit
+    assert (sqs / "svib_ht").read_text() == "3.21\n"
+    # -nrr: static energy seeded into vol_0 so fitfc.out has a T=0 term
+    assert (sqs / "vol_0" / "energy").read_text() == "-42.0\n"
+    assert out == sqs / "fitfc.out"
+
+
+def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
+    """ns>1 without -nrr follows fitfc's two-invocation contract: gen
+    (vol_* + wait), relax vols with a per-vol ISIF=2 wrap (removed
+    afterwards so p* runs inherit the frozen top wrap), gen again with
+    the SAME args, force runs, fit."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+
+    fitfc_gen_calls = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            fitfc_gen_calls.append(list(cmd))
+            for name in ("vol_0", "vol_2"):
+                vol = Path(cwd) / name
+                vol.mkdir(exist_ok=True)
+                (vol / "str.out").write_text("s\n")
+                if (vol / "str_relax.out").is_file():
+                    pert = vol / "p+0.2_5.1_0"
+                    pert.mkdir(exist_ok=True)
+                    (pert / "str.out").write_text("s\n")
+                    (pert / "str_unpert.out").write_text("s\n")
+                else:
+                    (vol / "wait").write_text("")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("3.3\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for vol in Path(cwd).glob("vol_*"):
+            if not (vol / "str_relax.out").is_file():
+                # vol relax stage: relax wrap must be present NOW
+                assert (vol / "vasp.wrap").is_file()
+                assert "ISIF = 2" in (vol / "vasp.wrap").read_text()
+                (vol / "str_relax.out").write_text("s\n")
+                (vol / "energy").write_text("-1.0\n")
+            for d in vol.glob("p*"):
+                (d / "force.out").write_text("0\n")
+                (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, ns=3)
+
+    assert len(fitfc_gen_calls) == 2
+    assert fitfc_gen_calls[0] == fitfc_gen_calls[1], \
+        "fitfc must be re-run with the SAME command-line options"
+    assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
+    # per-vol relax wraps removed so p* force runs see the frozen top wrap
+    for vol in sqs.glob("vol_*"):
+        assert not (vol / "vasp.wrap").is_file()
+    assert (sqs / "vasp.wrap").is_file()
+    assert (sqs / "svib_ht").read_text() == "3.3\n"
+
+
+def test_promote_svib_ht_noop_without_source(tmp_path):
+    assert phonon.promote_svib_ht(tmp_path) is None
+    (tmp_path / "vol_0").mkdir()
+    (tmp_path / "vol_0" / "svib_ht").write_text("1.1\n")
+    dst = phonon.promote_svib_ht(tmp_path)
+    assert dst == tmp_path / "svib_ht" and dst.read_text() == "1.1\n"

@@ -207,6 +207,23 @@ def find_svib_ht(d: Path) -> Optional[Path]:
     return None
 
 
+def promote_svib_ht(d: Path) -> None:
+    """Copy a nested (vol_0/...) svib_ht up to <d>/svib_ht if the top-level
+    file is missing.
+
+    `sqs2tdb -fit` only ever opens `<sqs_dir>/svib_ht` (the Perl source
+    checks -e "$dirname/svib_ht" and nothing else), but fitfc -f writes
+    svib_ht INSIDE each vol_* directory — the ATAT tutorial bridges the
+    two with a manual `cp vol_0/svib_ht .`. Trees where that step was
+    skipped would silently drop their vibrational data from the fit.
+    """
+    if (d / "svib_ht").is_file():
+        return
+    nested = find_svib_ht(d)
+    if nested is not None:
+        shutil.copy2(nested, d / "svib_ht")
+
+
 def maybe_rename_energy_off(d: Path) -> bool:
     """
     If a directory has `energy.off` but no `energy`, rename energy.off
@@ -549,22 +566,30 @@ def setup_fit_directory(task: FitTask) -> Path:
         dest = phase_dir / em.name
         if not dest.exists():
             robust_copytree(em, dest)
-        # Handle svib removal if stage 1 or endmember_svib=False
+        # Handle svib removal if stage 1 or endmember_svib=False;
+        # otherwise make sure svib_ht sits at the top of the dir, the
+        # only place sqs2tdb -fit looks for it (fitfc writes it under
+        # vol_0/ and the tutorial's `cp vol_0/svib_ht .` may be missing).
         if not task.endmember_svib:
             sv = find_svib_ht(dest)
             if sv:
                 sv.unlink()
+        else:
+            promote_svib_ht(dest)
 
     # Copy mixing SQS — fully resolve all symlinks
     for sqs in task.sqs_list:
         dest = phase_dir / sqs.name
         if not dest.exists():
             robust_copytree(sqs.path, dest)
-        # Remove svib_ht if not in the include set
+        # Remove svib_ht if not in the include set; if included, promote
+        # a nested vol_0/svib_ht so sqs2tdb -fit actually sees it.
         if sqs.name not in task.svib_include:
             sv = find_svib_ht(dest)
             if sv:
                 sv.unlink()
+        else:
+            promote_svib_ht(dest)
 
     # Write control files
     write_species_mult(task.phase, phase_dir, task.el1, task.el2)
