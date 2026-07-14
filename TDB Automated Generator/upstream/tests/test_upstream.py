@@ -987,3 +987,40 @@ def test_run_fitfc_escalate_persists_marks_energy_only(tmp_path, monkeypatch):
     marker = (sqs / "unstable_modes.log").read_text()
     assert "PERSISTS" in marker and "genuine dynamical instability" in marker
     assert "-fu" in marker and "-rl" in marker, "manual options named"
+
+
+# ---- spin polarization (advisor review F1) ---------------------------------
+
+def test_wrap_spin_flag_sets_ispin2():
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=True)
+    assert "ISPIN = 2" in w
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=False)
+    assert "ISPIN" not in w
+
+
+def test_wrap_spin_module_default(monkeypatch):
+    """run_upstream sets vaspwrap.DEFAULT_SPIN once; every wrap written by
+    converge/relax/phonon then inherits it without explicit plumbing."""
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", True)
+    for mode in ("static", "relax", "phonon"):
+        assert "ISPIN = 2" in vaspwrap.build_vasp_wrap(mode, encut=400,
+                                                       kppra=6000)
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", False)
+    assert "ISPIN" not in vaspwrap.build_vasp_wrap("static", encut=400,
+                                                   kppra=6000)
+
+
+def test_wrap_spin_skipped_for_dlm():
+    """DLM spin handling comes from SUBATOM moments (ezvasp emits the
+    magnetic INCAR); no bare ISPIN=2 on top."""
+    dlm = DLMConfig(enabled=True, subatom={"Co": ("Co", 1.8)})
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000,
+                                 dlm=dlm, spin=True)
+    assert "ISPIN" not in w
+    assert "NUPDOWN = 0" in w and "SUBATOM = s/Co+2/Co+1.8/g" in w
+
+
+def test_wants_spin_detects_magnetic_3d():
+    assert vaspwrap.wants_spin(["Co", "Cr"])
+    assert vaspwrap.wants_spin(["Al", "Ni"])
+    assert not vaspwrap.wants_spin(["Al", "Ti"])

@@ -40,6 +40,7 @@ import phonon
 import potcar
 import relax
 import sqsgen
+import vaspwrap
 from phases import (
     ALL_PHASES, SINGLE_SUBLATTICE_PHASES, ENDMEMBER_ONLY_PHASES,
     SMALL_SYSTEM, DLMConfig, SigmaDLMSpec,
@@ -442,6 +443,17 @@ def main():
                          "distance) for the 'escalate' retry. Default: "
                          "1.5x the original (i.e. 3.0 for the default "
                          "-ernn=2).")
+    ap.add_argument("--no-spin", action="store_true",
+                    help="Force ISPIN=1 (non-spin-polarized) even for "
+                         "magnetic elements. Default: spin polarization is "
+                         "AUTO-ENABLED (ISPIN=2, VASP-default initial "
+                         "moments) whenever an element is in "
+                         f"{sorted(vaspwrap.MAGNETIC_3D)} and the run is "
+                         "not DLM — non-magnetic energies for these metals "
+                         "are wrong by tens of meV/atom.")
+    ap.add_argument("--spin", action="store_true",
+                    help="Force ISPIN=2 even for elements outside the "
+                         "magnetic-3d set.")
     ap.add_argument("--fitfc-rl", type=float, default=None,
                     help="Pass fitfc's -rl=<len> robust-length soft-mode "
                          "treatment (beta) to the fit, which also prevents "
@@ -500,6 +512,20 @@ def main():
           + (f"  (opts: {args.relax_opts})" if args.relax_opts else ""))
     print(f"  SQS levels  : {sqs_levels}")
     print(f"  VASP launch : {args.cmd_prefix or '<bare vasp — serial builds only>'}")
+    # Spin policy: every wrap written by converge/relax/phonon inherits
+    # vaspwrap.DEFAULT_SPIN (see build_vasp_wrap docstring). DLM runs
+    # handle spin through the SUBATOM machinery instead.
+    if args.no_spin:
+        spin_on = False
+    else:
+        spin_on = args.spin or vaspwrap.wants_spin(
+            [args.element1, args.element2])
+    vaspwrap.DEFAULT_SPIN = spin_on and not args.dlm
+    print(f"  Spin        : "
+          + ("DLM (SUBATOM moments)" if args.dlm else
+             ("ISPIN=2, VASP-default init moments" if vaspwrap.DEFAULT_SPIN
+              else "off (ISPIN=1)"))
+          + ("  [--no-spin]" if args.no_spin else ""))
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
           + (f"  SUBATOM={subatom}" if args.dlm else ""))
     fitfc_opts: Dict = {"on_unstable": args.fitfc_on_unstable}
@@ -530,6 +556,7 @@ def main():
         "cmd_prefix": args.cmd_prefix,
         "relax_opts": args.relax_opts,
         "fitfc_opts": fitfc_opts,
+        "spin_polarized": vaspwrap.DEFAULT_SPIN,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
