@@ -34,6 +34,19 @@ PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 RELAX_METHOD="runstruct"         # runstruct (default) | normal | infdet
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
 
+# Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
+# runs — NM energies for these metals are wrong by tens of meV/atom.
+# Set to "no" only for a deliberate non-magnetic control run.
+SPIN="auto"                      # auto | no
+# Convergence scope: "phase" converges ENCUT/KPPRA on the first SQS of
+# each phase and reuses it for all siblings (uniform settings = clean
+# mixing energies + ~N x less sweep compute). "sqs" = old per-SQS mode.
+CONVERGENCE_SCOPE="phase"
+# Lattice-drift threshold (ATAT checkrelax analogue). Every SQS gets
+# checkrelax.out; above this it is flagged relaxaway (left its parent
+# lattice) and downstream fitting drops it.
+MAX_CHECKRELAX="0.1"
+
 # Command used to launch VASP. ATAT's runstruct_vasp / robustrelax_vasp
 # take it as TRAILING arguments (reference NAS job:
 #   robustrelax_vasp -id -c 0.05 mpiexec -n 128
@@ -117,6 +130,9 @@ EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
 [ -n "${RELAX_OPTS}" ]       && EXTRA+=(--relax-opts "${RELAX_OPTS}")
 EXTRA+=(--fitfc-on-unstable "${FITFC_ON_UNSTABLE:-mark}")
 [ -n "${FITFC_RL}" ]         && EXTRA+=(--fitfc-rl "${FITFC_RL}")
+[ "${SPIN}" = "no" ]         && EXTRA+=(--no-spin)
+EXTRA+=(--convergence-scope "${CONVERGENCE_SCOPE:-phase}")
+EXTRA+=(--max-checkrelax "${MAX_CHECKRELAX:-0.1}")
 
 # Live log in the submit dir (PBS -o only arrives after the job ends).
 # run_upstream.py ALSO tees itself to <WORK_ROOT>/upstream_live.log with

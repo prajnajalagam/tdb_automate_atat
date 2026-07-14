@@ -98,10 +98,18 @@ python3 sqs2tdb_pipeline.py \
 | `--n-workers` | `4` | Parallel fit processes |
 | `--skip-svib` | off | Skip Stage 2 |
 | `--phases` | all in YAML | Comma-separated subset of phases |
+| `--max-checkrelax` | `0.1` | Drop SQS whose recorded lattice drift (`checkrelax.out` / `relaxaway.flag` from the upstream generator) says they left their parent lattice; `0` disables |
+| `--oszicar-min-score` | `0` (off) | Drop SQS scoring below this OSZICAR convergence score |
+| `--target-dir` | off | Consensus-target gate: reject SQS whose same-phase excess E deviates > `--target-tol-sigma` σ from the TDBDB consensus (JSONs from `tdb_corpus/reverse_engineer_targets.ipynb`) |
+| `--target-tol-sigma` | `3.0` | Gate tolerance in σ units |
+| `--target-dft-noise-floor` | `0.005` | DFT/SQS noise floor (eV/atom), added in quadrature |
+| `--target-min-sigma` | `0.010` | Absolute σ floor (eV/atom) — keeps the gate honest where the consensus is artificially tight (metastable ranges; see `tdb_corpus/targets/README.md`) |
 
 **Outputs** (in the auto-created `<prefix>_N/` workdir):
 - `fit_results.json` — full per-task results for both stages.
 - `tdb_manifest.json` — surviving per-phase `.tdb` paths (input to Step 3).
+- `discovery_rejects.json` — every SQS discovery dropped, with the reason
+  and gate numbers (audit trail; see `REVIEW_RESPONSE.md` item F5).
 
 ## Step 3 — Combine & score (`score_tdb_combinations.py`)
 

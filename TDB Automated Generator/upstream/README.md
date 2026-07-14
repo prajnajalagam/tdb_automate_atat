@@ -24,6 +24,14 @@ It **drives VASP on the node** (generate-and-submit/poll): it calls
 inside a PBS job on a compute node with ATAT + VASP on `PATH`
 (`submit_upstream_template.pbs`).
 
+> **Advisor-review upgrades (2026-07, see `../../REVIEW_RESPONSE.md`):**
+> spin polarization is auto-on for magnetic 3d elements (F1); ENCUT/KPPRA
+> are converged once per phase and reused for all its SQS (F4); ISIF=3
+> relaxations get a Pulay-safe ENCUT floor of 1.3×max(ENMAX) (F2); every
+> relaxation is checked for lattice drift and flagged with
+> `checkrelax.out`/`relaxaway.flag` at 0.1 (F3). All decisions land in
+> the manifest and live log.
+
 ## Procedure
 
 For each SQS (and each SIGMA endmember):
