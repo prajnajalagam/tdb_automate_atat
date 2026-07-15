@@ -23,6 +23,7 @@ logic that *can* be tested lives in converge.py and potcar.py.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -34,6 +35,22 @@ def _env_with_bin(env_bin: Optional[str]) -> dict:
     if env_bin:
         env["PATH"] = f"{env_bin}:{env.get('PATH', '')}"
     return env
+
+
+def split_prefix(cmd_prefix: Optional[str]) -> List[str]:
+    """Tokenize a VASP launch prefix like 'mpiexec -n 128' for argv use.
+
+    ATAT's runstruct_vasp / robustrelax_vasp / pollmach take the command
+    used to launch VASP as TRAILING arguments (that's how the reference
+    NAS job works: `robustrelax_vasp -id -c 0.05 mpiexec -n 128`). We
+    run subprocesses with shell=False, so the prefix must be split into
+    separate argv tokens — appending the whole string as one element
+    would hand ATAT a single argument containing spaces, which only
+    works if ATAT happens to re-join args through a shell.
+    """
+    if not cmd_prefix:
+        return []
+    return shlex.split(cmd_prefix)
 
 
 def run_logged(cmd: Sequence[str],

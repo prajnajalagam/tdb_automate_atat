@@ -391,22 +391,24 @@ def test_relax_rejects_unknown_method(tmp_path, monkeypatch):
 # ---- run_upstream.py: multi-level SQS iteration ---------------------------
 
 def test_sqs_level_default_is_2(monkeypatch):
-    """CLI default for --sqs-level must be the string '2'."""
-    # Reach into the argparse config via a dry-run parse.
-    import argparse
-    # Reconstruct the same parser by importing and calling main() minus
-    # its side effects would be brittle; instead do a targeted call.
+    """CLI default for --sqs-level must be '2' and the help must state
+    the CUMULATIVE -lv semantics (level <= N per the sqs2tdb source)."""
+    import re
     import subprocess, sys
     r = subprocess.run(
         [sys.executable, str(Path(run_upstream.__file__)), "--help"],
         capture_output=True, text=True,
     )
-    assert "'2' (default)" in r.stdout
+    flat = re.sub(r"\s+", " ", r.stdout)   # undo argparse line-wrapping
+    assert "the default '2'" in flat
+    assert "CUMULATIVE" in flat
+    assert "levels <= N" in flat
 
 
-def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
-    """A --sqs-level '2,3' request must call generate_phase_sqs once per
-    level so both meshes accumulate in the tree."""
+def test_process_phase_single_cumulative_lv_call(tmp_path, monkeypatch):
+    """sqs2tdb -lv=N is CUMULATIVE (copies all levels <= N per its
+    `$levs[1] <= $cmdline{"-lv"}` test), so process_phase must make ONE
+    generate_phase_sqs call at max(sqs_levels) — not one per level."""
     calls = []
 
     def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
@@ -422,7 +424,7 @@ def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
     monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
     monkeypatch.setattr(run_upstream, "discover_sqs_dirs", fake_discover)
 
-    res = run_upstream.process_phase(
+    run_upstream.process_phase(
         phase="FCC_A1",
         work_root=tmp_path,
         potcar_paths=[],
@@ -437,8 +439,9 @@ def test_process_phase_generates_at_each_level(tmp_path, monkeypatch):
         skip_phonon=True,
         timeout=60,
     )
-    levels_seen = [c["level"] for c in calls if c["phase"] == "FCC_A1"]
-    assert levels_seen == [2, 3, 4], levels_seen
+    fcc_calls = [c for c in calls if c["phase"] == "FCC_A1"]
+    assert len(fcc_calls) == 1, fcc_calls
+    assert fcc_calls[0]["level"] == 4, fcc_calls
 
 
 def test_process_sigma_ignores_sqs_levels_binary(tmp_path, monkeypatch):
@@ -476,3 +479,711 @@ def test_process_sigma_ignores_sqs_levels_binary(tmp_path, monkeypatch):
     # exactly one call, at level 0 (endmembers), regardless of sqs_levels
     assert len(calls) == 1, calls
     assert calls[0]["level"] == 0, calls
+
+
+# ---- cmd_prefix (VASP MPI launcher) threading ------------------------------
+
+def test_split_prefix_tokenizes():
+    import runner as _runner
+    assert _runner.split_prefix("mpiexec -n 128") == ["mpiexec", "-n", "128"]
+    assert _runner.split_prefix("") == []
+    assert _runner.split_prefix(None) == []
+
+
+def test_runstruct_gets_vasp_launcher_tokens(tmp_path, monkeypatch):
+    """runstruct method must append the launcher as SEPARATE argv tokens
+    (not one space-containing string) after 'pollmach runstruct_vasp'."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          cmd_prefix="mpiexec -n 128")
+    assert rec.polled == [
+        ["pollmach", "runstruct_vasp", "mpiexec", "-n", "128"]], rec.polled
+
+
+def test_robustrelax_gets_launcher_and_relax_opts(tmp_path, monkeypatch):
+    """normal method: -mk first, then robustrelax with direct opts and the
+    launcher LAST (matches the reference NAS job
+    `robustrelax_vasp -id -c 0.05 mpiexec -n 128`)."""
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet",
+                          relax_opts="-c 0.05",
+                          cmd_prefix="mpiexec -n 128")
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [
+        ["robustrelax_vasp", "-id", "-c", "0.05",
+         "mpiexec", "-n", "128"]], rec.polled
+
+
+def test_empty_prefix_leaves_commands_unchanged(tmp_path, monkeypatch):
+    rec = _RecCalls()
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=400, kppra=8000)
+    assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
+
+
+def test_static_point_gets_launcher(tmp_path, monkeypatch):
+    """The convergence sweep — where the user's OSZICAR failure occurred —
+    must pass the launcher to runstruct_vasp."""
+    calls = []
+
+    def fake_logged(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        calls.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(converge.runner, "run_logged", fake_logged)
+    monkeypatch.setattr(converge, "build_vasp_wrap",
+                        lambda kind, encut, kppra, dlm=None, algo="All":
+                        "# stub\n")
+    monkeypatch.setattr(converge, "energy_per_atom", lambda d: -5.0)
+
+    src = tmp_path / "sqs"; src.mkdir()
+    (src / "str.out").write_text("stub\n")
+    e = converge.run_static_point(src, tmp_path / "pt", encut=268, kppra=6000,
+                                  cmd_prefix="mpiexec -n 128")
+    assert e == -5.0
+    assert calls == [
+        ["runstruct_vasp", "mpiexec", "-n", "128"]], calls
+
+
+# ---- link-only dirs and wait-marker semantics (per sqs2tdb source) ----------
+
+def test_generate_phase_sqs_accepts_link_only_dirs(tmp_path, monkeypatch):
+    """sqs2tdb writes only a `link` file (no str.out) for SQS equivalent
+    to a permuted-site twin or endmembers reducible to a parent lattice.
+    The post-copy verification must accept a tree of link-only dirs."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        tdir = Path(cwd) / "BCC_B2"
+        sp = tdir / "species.in"
+        if not sp.is_file():
+            tdir.mkdir(parents=True, exist_ok=True)
+            sp.write_text("Co,Cr\n")
+        else:
+            d = tdir / "sqs_lev=0_a_Co=1,b_Co=1"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "link").write_text("BCC_A2/sqs_lev=0_a_Co=1\n")
+        return 0
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    out = sqsgen.generate_phase_sqs(tmp_path, "BCC_B2",
+                                    elements=["Co", "Cr"], use_small=False)
+    assert any(out.rglob("link"))     # verification passed on links alone
+
+
+def test_process_one_sqs_clears_wait_marker(tmp_path, monkeypatch):
+    """sqs2tdb -cp drops a `wait` queue marker in every to-be-computed
+    dir; after a successful relax we must remove it (the reference NAS
+    workflow's manual `rm wait`)."""
+    import types
+
+    sqs = tmp_path / "sqs_lev=2_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "wait").write_text("")
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def fake_relax(calc_dir, **kwargs):
+        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert not (sqs / "wait").exists(), "wait marker must be cleared"
+    assert (sqs / "str_relax.out").is_file()
+
+
+# ---- fitfc orchestration (verified against fitfc.c++ source) ---------------
+
+def test_fitfc_gen_args_harmonic_default():
+    """Default recipe = sqs2tdb vibrational workflow: relative radius,
+    single volume, no re-relax, ideal structure = relaxed structure."""
+    args = phonon.build_fitfc_gen_args(ernn=2.0, er=None, ns=1, ms=0.02,
+                                       dr=None, nrr=True)
+    assert args[0] == "-si=str_relax.out"
+    assert "-ernn=2.0" in args
+    assert "-ns=1" in args
+    assert "-nrr" in args
+    assert not any(a.startswith("-dr") for a in args)  # fitfc default 0.2
+    assert not any(a.startswith("-er=") for a in args)
+
+
+def test_fitfc_gen_args_er_wins_and_requires_radius():
+    args = phonon.build_fitfc_gen_args(ernn=2.0, er=5.5, ns=3, ms=0.02,
+                                       dr=0.1, nrr=False)
+    assert "-er=5.5" in args and not any(a.startswith("-ernn") for a in args)
+    assert "-dr=0.1" in args and "-nrr" not in args
+    with pytest.raises(ValueError):
+        phonon.build_fitfc_gen_args(ernn=None, er=None, ns=1, ms=0.02,
+                                    dr=None, nrr=True)
+
+
+def test_fitfc_fit_args():
+    """fitfc -f ERRORQUITs without -fr/-frnn; -si must match generation."""
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=None)
+    assert "-f" in args and "-frnn=1.5" in args and "-si=str_relax.out" in args
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=4.0)
+    assert "-fr=4.0" in args and not any(a.startswith("-frnn") for a in args)
+    with pytest.raises(ValueError):
+        phonon.build_fitfc_fit_args(frnn=None, fr=None)
+
+
+def test_run_fitfc_requires_str_relax(tmp_path):
+    """fitfc generation dies without str_relax.out; fail fast with a
+    message instead of a cryptic fitfc log."""
+    with pytest.raises(RuntimeError, match="str_relax.out"):
+        phonon.run_fitfc(tmp_path, encut=400, kppra=6000)
+
+
+def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
+    """With -nrr (ns=1 default) fitfc emits vol_0 AND the perturbations in
+    ONE invocation, so run_fitfc must call fitfc exactly twice (gen, fit)
+    and pollmach exactly once (force runs), and must copy vol_0/svib_ht
+    to the top level (the only path sqs2tdb -fit reads)."""
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+    (sqs / "energy").write_text("-42.0\n")
+
+    calls = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        calls.append(("logged", list(cmd)))
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            # simulate -nrr generation: vol_0 + pert dirs in one shot
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str.out").write_text("s\n")
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("3.21\n")
+            (Path(cwd) / "fitfc.out").write_text("fit\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        calls.append(("polled", list(cmd)))
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0 0 0\n")
+            (d / "str_relax.out").write_text("s\n")
+        assert done_when(Path(cwd))
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    out = phonon.run_fitfc(sqs, encut=400, kppra=6000,
+                           cmd_prefix="mpiexec -n 128")
+
+    fitfc_calls = [c for k, c in calls if k == "logged" and c[0] == "fitfc"]
+    assert len(fitfc_calls) == 2, "harmonic path: gen once, fit once"
+    assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
+    polled = [c for k, c in calls if k == "polled"]
+    assert len(polled) == 1, "only the force runs need pollmach"
+    assert polled[0][:2] == ["pollmach", "runstruct_vasp"]
+    assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
+    # svib_ht promoted top-level for sqs2tdb -fit
+    assert (sqs / "svib_ht").read_text() == "3.21\n"
+    # -nrr: static energy seeded into vol_0 so fitfc.out has a T=0 term
+    assert (sqs / "vol_0" / "energy").read_text() == "-42.0\n"
+    assert out == sqs / "fitfc.out"
+
+
+def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
+    """ns>1 without -nrr follows fitfc's two-invocation contract: gen
+    (vol_* + wait), relax vols with a per-vol ISIF=2 wrap (removed
+    afterwards so p* runs inherit the frozen top wrap), gen again with
+    the SAME args, force runs, fit."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+
+    fitfc_gen_calls = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            fitfc_gen_calls.append(list(cmd))
+            for name in ("vol_0", "vol_2"):
+                vol = Path(cwd) / name
+                vol.mkdir(exist_ok=True)
+                (vol / "str.out").write_text("s\n")
+                if (vol / "str_relax.out").is_file():
+                    pert = vol / "p+0.2_5.1_0"
+                    pert.mkdir(exist_ok=True)
+                    (pert / "str.out").write_text("s\n")
+                    (pert / "str_unpert.out").write_text("s\n")
+                else:
+                    (vol / "wait").write_text("")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("3.3\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for vol in Path(cwd).glob("vol_*"):
+            if not (vol / "str_relax.out").is_file():
+                # vol relax stage: relax wrap must be present NOW
+                assert (vol / "vasp.wrap").is_file()
+                assert "ISIF = 2" in (vol / "vasp.wrap").read_text()
+                (vol / "str_relax.out").write_text("s\n")
+                (vol / "energy").write_text("-1.0\n")
+            for d in vol.glob("p*"):
+                (d / "force.out").write_text("0\n")
+                (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, ns=3)
+
+    assert len(fitfc_gen_calls) == 2
+    assert fitfc_gen_calls[0] == fitfc_gen_calls[1], \
+        "fitfc must be re-run with the SAME command-line options"
+    assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
+    # per-vol relax wraps removed so p* force runs see the frozen top wrap
+    for vol in sqs.glob("vol_*"):
+        assert not (vol / "vasp.wrap").is_file()
+    assert (sqs / "vasp.wrap").is_file()
+    assert (sqs / "svib_ht").read_text() == "3.3\n"
+
+
+def test_promote_svib_ht_noop_without_source(tmp_path):
+    assert phonon.promote_svib_ht(tmp_path) is None
+    (tmp_path / "vol_0").mkdir()
+    (tmp_path / "vol_0" / "svib_ht").write_text("1.1\n")
+    dst = phonon.promote_svib_ht(tmp_path)
+    assert dst == tmp_path / "svib_ht" and dst.read_text() == "1.1\n"
+
+
+# ---- fitfc unstable-mode safeguards ----------------------------------------
+
+def test_fitfc_fit_args_rl_and_fn():
+    args = phonon.build_fitfc_fit_args(frnn=1.5, fr=None, rl=0.3, fn=True)
+    assert "-rl=0.3" in args and "-fn" in args
+
+
+def test_detect_unstable_modes(tmp_path):
+    log = tmp_path / "fitfc_fit.log"
+    assert phonon.detect_unstable_modes(log) == []  # missing log = no fit
+    log.write_text("Reading...\nvol_0\n"
+                   "Warning: p+0.2_5.1_3 is an unstable mode.\n"
+                   "Unstable modes found.\nAborting.\n")
+    hits = phonon.detect_unstable_modes(log)
+    assert len(hits) == 2 and "Unstable modes found." in hits[1]
+
+
+def _unstable_sqs(tmp_path):
+    """SQS dir with STALE fit outputs from a previous (good) run — the
+    refit will hit unstable modes and must not resurrect these."""
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    (sqs / "vol_0").mkdir(parents=True)
+    (sqs / "str.out").write_text("stub\n")
+    (sqs / "str_relax.out").write_text("stub\n")
+    (sqs / "svib_ht").write_text("STALE\n")
+    (sqs / "fitfc.out").write_text("STALE\n")
+    (sqs / "vol_0" / "svib_ht").write_text("STALE\n")
+    return sqs
+
+
+def test_run_fitfc_unstable_mark_no_stale_svib(tmp_path, monkeypatch):
+    """Default policy: unstable fit aborts -> stale svib_ht cleared, NOT
+    promoted; unstable_modes.log written; no -fn retry."""
+    sqs = _unstable_sqs(tmp_path)
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            Path(log).write_text(
+                "Warning: p+0.2_5.1_0 is an unstable mode.\n"
+                "Unstable modes found.\nAborting.\n")  # no svib_ht written
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000)  # on_unstable="mark"
+
+    assert len(fit_cmds) == 1 and "-fn" not in fit_cmds[0]
+    assert not (sqs / "svib_ht").exists(), "stale svib_ht must be gone"
+    assert not (sqs / "vol_0" / "svib_ht").exists()
+    marker = sqs / "unstable_modes.log"
+    assert marker.is_file() and "energy-only" in marker.read_text()
+    assert "unstable" in (sqs / "fitfc_fit.log").read_text().lower()
+
+
+def test_run_fitfc_unstable_force_retries_with_fn(tmp_path, monkeypatch):
+    """on_unstable='force': one retry with -fn; the forced svib_ht is
+    promoted and the marker records the -fn provenance."""
+    sqs = _unstable_sqs(tmp_path)
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            vol = Path(cwd) / "vol_0"
+            pert = vol / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            if "-fn" in cmd:
+                Path(log).write_text("Unstable modes found.\n")
+                (Path(cwd) / "vol_0" / "svib_ht").write_text("2.2\n")
+                (Path(cwd) / "fitfc.out").write_text("forced\n")
+            else:
+                Path(log).write_text("Unstable modes found.\nAborting.\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="force")
+
+    assert len(fit_cmds) == 2
+    assert "-fn" not in fit_cmds[0] and "-fn" in fit_cmds[1]
+    assert (sqs / "svib_ht").read_text() == "2.2\n", "forced svib promoted"
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "-fn" in marker and "lower bound" in marker
+
+
+def test_run_fitfc_rl_passthrough_and_bad_policy(tmp_path, monkeypatch):
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    with pytest.raises(ValueError, match="on_unstable"):
+        phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="ignore")
+
+    fit_cmds = []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled",
+                        lambda *a, **k: 0)
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, rl=0.3)
+    assert any("-rl=0.3" in c for cmd in fit_cmds for c in cmd)
+
+
+def _escalation_fakes(monkeypatch, resolves: bool):
+    """Fake runner where the first fit is unstable; the escalated fit
+    succeeds iff `resolves`. Returns (gen_cmds, fit_cmds, forced_pert)."""
+    gen_cmds, fit_cmds, forced_pert = [], [], []
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        cwd = Path(cwd)
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            gen_cmds.append(list(cmd))
+            vol = cwd / "vol_0"
+            er = [a for a in cmd if a.startswith(("-er", "-ernn"))][0]
+            radius = er.split("=")[1]
+            pert = vol / f"p+0.2_{radius}_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            (vol / "str_relax.out").write_text("s\n")
+            (pert / "str_unpert.out").write_text("s\n")
+            (pert / "wait").write_text("")
+        if "-f" in cmd:
+            fit_cmds.append(list(cmd))
+            if len(fit_cmds) == 1 or not resolves:
+                Path(log).write_text("Unstable modes found.\nAborting.\n")
+            else:
+                Path(log).write_text("fitted fine\n")
+                (cwd / "vol_0" / "svib_ht").write_text("4.4\n")
+                (cwd / "fitfc.out").write_text("ok\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        for d in Path(cwd).glob("vol_*/p*"):
+            if not (d / "force.out").is_file():
+                forced_pert.append(d.name)
+                (d / "force.out").write_text("0\n")
+                (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+    return gen_cmds, fit_cmds, forced_pert
+
+
+def test_run_fitfc_escalate_resolves(tmp_path, monkeypatch):
+    """escalate: regenerate at 1.5x -ernn, force-run ONLY the new p*
+    dirs, refit; resolved -> escalated svib_ht promoted + marker says so."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    gen_cmds, fit_cmds, forced_pert = _escalation_fakes(monkeypatch, True)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate")
+
+    assert len(gen_cmds) == 2, "one normal gen + one escalated gen"
+    assert "-ernn=2.0" in gen_cmds[0] and "-ernn=3.0" in gen_cmds[1]
+    assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
+    # the original pert kept its force.out; only the new dir was run
+    assert forced_pert.count("p+0.2_2.0_0") == 1
+    assert forced_pert.count("p+0.2_3.0_0") == 1
+    assert (sqs / "svib_ht").read_text() == "4.4\n"
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "RESOLVED" in marker and "-ernn=3.0" in marker
+
+
+def test_run_fitfc_escalate_persists_marks_energy_only(tmp_path, monkeypatch):
+    """escalate, still unstable: no svib_ht, no -fn fallback; marker
+    calls it likely genuine dynamical instability with manual options."""
+    sqs = tmp_path / "sqs"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("s\n")
+    (sqs / "str_relax.out").write_text("s\n")
+    gen_cmds, fit_cmds, _ = _escalation_fakes(monkeypatch, False)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate",
+                     escalate_ernn=4.0)
+
+    assert "-ernn=4.0" in gen_cmds[1], "explicit escalate_ernn honoured"
+    assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
+    assert not (sqs / "svib_ht").exists()
+    marker = (sqs / "unstable_modes.log").read_text()
+    assert "PERSISTS" in marker and "genuine dynamical instability" in marker
+    assert "-fu" in marker and "-rl" in marker, "manual options named"
+
+
+# ---- spin polarization (advisor review F1) ---------------------------------
+
+def test_wrap_spin_flag_sets_ispin2():
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=True)
+    assert "ISPIN = 2" in w
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=False)
+    assert "ISPIN" not in w
+
+
+def test_wrap_spin_module_default(monkeypatch):
+    """run_upstream sets vaspwrap.DEFAULT_SPIN once; every wrap written by
+    converge/relax/phonon then inherits it without explicit plumbing."""
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", True)
+    for mode in ("static", "relax", "phonon"):
+        assert "ISPIN = 2" in vaspwrap.build_vasp_wrap(mode, encut=400,
+                                                       kppra=6000)
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", False)
+    assert "ISPIN" not in vaspwrap.build_vasp_wrap("static", encut=400,
+                                                   kppra=6000)
+
+
+def test_wrap_spin_skipped_for_dlm():
+    """DLM spin handling comes from SUBATOM moments (ezvasp emits the
+    magnetic INCAR); no bare ISPIN=2 on top."""
+    dlm = DLMConfig(enabled=True, subatom={"Co": ("Co", 1.8)})
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000,
+                                 dlm=dlm, spin=True)
+    assert "ISPIN" not in w
+    assert "NUPDOWN = 0" in w and "SUBATOM = s/Co+2/Co+1.8/g" in w
+
+
+def test_wants_spin_detects_magnetic_3d():
+    assert vaspwrap.wants_spin(["Co", "Cr"])
+    assert vaspwrap.wants_spin(["Al", "Ni"])
+    assert not vaspwrap.wants_spin(["Al", "Ti"])
+
+
+# ---- Pulay ENCUT floor + phase-uniform convergence (review F2/F4) ----------
+
+def test_pulay_safe_encut():
+    # 1.3 x 267.882 = 348.2 -> ceil to 350; sweep choice below the floor
+    # is raised, above it is kept.
+    assert potcar.pulay_safe_encut(300, 267.882) == 350
+    assert potcar.pulay_safe_encut(400, 267.882) == 400
+    assert potcar.pulay_safe_encut(350, 267.882) == 350
+
+
+def test_process_one_sqs_preset_skips_sweep_and_bumps_relax_encut(
+        tmp_path, monkeypatch):
+    """Preset (phase-scope) settings must skip converge_sqs entirely, and
+    the relax wrap must get the Pulay-floored ENCUT while the record
+    keeps the sweep-chosen one for statics/phonons."""
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    (sqs / "str.out").write_text("stub\n")
+    pot = tmp_path / "POTCAR"
+    pot.write_text(POTCAR_CO)   # ENMAX 267.882 -> floor 350
+
+    def boom(*a, **k):
+        raise AssertionError("convergence sweep must not run with preset")
+
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs", boom)
+
+    seen = {}
+
+    def fake_relax(calc_dir, encut, kppra, **kwargs):
+        seen["encut"], seen["kppra"] = encut, kppra
+        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[pot], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60,
+        preset_encut=300, preset_kppra=6000)
+
+    assert res["convergence_reused"] is True
+    assert res["chosen_encut"] == 300 and res["relax_encut"] == 350
+    assert seen["encut"] == 350, "relax must use the Pulay-floored ENCUT"
+    assert seen["kppra"] == 6000
+
+
+# ---- lattice-drift metric + gate (review F3) --------------------------------
+
+from strfile import parse_cell, cell_distortion, lattice_drift
+
+
+def _write_str(path, cell_rows, coord="1 0 0\n0 1 0\n0 0 1"):
+    rows = "\n".join(" ".join(f"{v}" for v in r) for r in cell_rows)
+    path.write_text(f"{coord}\n{rows}\n0 0 0 Co\n0.5 0.5 0.5 Cr\n")
+
+
+def test_parse_cell_both_header_layouts(tmp_path):
+    p = tmp_path / "a.out"
+    _write_str(p, [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    c = parse_cell(read_structure(p))
+    assert c[0][0] == pytest.approx(3.5) and c[1][2] == pytest.approx(0.0)
+    # (a b c alpha beta gamma) header with identity lattice rows
+    q = tmp_path / "b.out"
+    q.write_text("3.5 3.5 3.5 90 90 90\n1 0 0\n0 1 0\n0 0 1\n0 0 0 Co\n")
+    c2 = parse_cell(read_structure(q))
+    assert c2[0][0] == pytest.approx(3.5)
+    assert c2[2][2] == pytest.approx(3.5)
+
+
+def test_cell_distortion_invariances():
+    ident = [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]]
+    # pure volume change is NOT drift
+    scaled = [[3.9, 0, 0], [0, 3.9, 0], [0, 0, 3.9]]
+    assert cell_distortion(ident, scaled) == pytest.approx(0.0, abs=1e-10)
+    # rigid rotation is NOT drift (90 deg about z)
+    rot = [[0, 3.5, 0], [-3.5, 0, 0], [0, 0, 3.5]]
+    assert cell_distortion(ident, rot) == pytest.approx(0.0, abs=1e-10)
+    # shear IS drift
+    shear = [[3.5, 1.4, 0], [0, 3.5, 0], [0, 0, 3.5]]
+    assert cell_distortion(ident, shear) > 0.1
+
+
+def test_process_one_sqs_flags_relaxed_away(tmp_path, monkeypatch):
+    """A relax that shears the cell beyond max_checkrelax must leave
+    checkrelax.out + relaxaway.flag and mark the manifest record."""
+    import types
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def fake_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.5, 1.4, 0], [0, 3.5, 0], [0, 0, 3.5]])
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert (sqs / "checkrelax.out").is_file()
+    assert res["checkrelax"] > 0.1 and res["relaxed_away"] is True
+    assert (sqs / "relaxaway.flag").is_file()
+    # and a faithful relax must NOT be flagged
+    sqs2 = tmp_path / "sqs_lev=2_a_Co=0.25,a_Cr=0.75"
+    sqs2.mkdir()
+    _write_str(sqs2 / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    def faithful_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.62, 0, 0], [0, 3.62, 0], [0, 0, 3.62]])
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure",
+                        faithful_relax)
+    res2 = run_upstream.process_one_sqs(
+        sqs2, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="runstruct", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+    assert res2["relaxed_away"] is False
+    assert not (sqs2 / "relaxaway.flag").exists()
+
+
+# ---- NAS smoke suite (dry-run only — VASP paths run on the node) -----------
+
+def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_smoke
+    rc = run_smoke.main(["--dry-run", "--workdir", str(tmp_path),
+                         "--element", "Co",
+                         "--cmd-prefix", "mpiexec -n 8"])
+    assert rc == 0
+    import json
+    plan = {c["test"]: c for c in
+            json.loads((tmp_path / "plan.json").read_text())}
+    assert set(plan) == {"T1_static", "T2_runstruct", "T3_robustrelax",
+                         "T4_fitfc_wrap", "T5_pollmach"}
+    # each distinct call form, launcher trailing
+    assert plan["T1_static"]["argv"] == ["runstruct_vasp",
+                                         "mpiexec", "-n", "8"]
+    assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
+    assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
+                                                 "fvasp.wrap"]
+    assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
+    # inputs on disk: frozen wrap under the separate name, wait markers,
+    # displaced structure for the force run
+    assert (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").is_file()
+    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").read_text()
+    assert "0.52" in (tmp_path / "T4_fitfc_wrap" / "str.out").read_text()
+    assert (tmp_path / "T5_pollmach" / "p_1" / "wait").is_file()
+    assert (tmp_path / "T5_pollmach" / "vasp.wrap").is_file()
+    # smoke wraps are tiny-run tuned and spin-off (plumbing test)
+    w = (tmp_path / "T1_static" / "vasp.wrap").read_text()
+    assert "NELM = 25" in w and "NCORE = 1" in w and "ISPIN" not in w

@@ -119,6 +119,15 @@ class TargetGate:
     n_contributing: np.ndarray
     dft_noise_floor_ev: float
     source_path: str
+    # Absolute floor on the gating sigma (eV/atom). Honesty guard for
+    # METASTABLE composition ranges: assessed TDBs constrain G only
+    # where a phase is stable (or measured); elsewhere the "consensus"
+    # is often several assessments inheriting the SAME SGTE lattice
+    # stabilities, so the cross-TDB spread coincidentally shrinks and
+    # a 3-sigma gate there can reject perfectly correct DFT. A floor of
+    # ~0.010-0.020 eV/atom keeps the gate meaningful where data exist
+    # without letting artificial consensus tighten it where none do.
+    min_sigma_ev: float = 0.0
 
     # --- factories ---
 
@@ -127,6 +136,7 @@ class TargetGate:
         cls,
         path: Path,
         dft_noise_floor_ev: float = 0.005,
+        min_sigma_ev: float = 0.0,
     ) -> "TargetGate":
         with Path(path).open() as f:
             cons = json.load(f)
@@ -169,6 +179,7 @@ class TargetGate:
             n_contributing=n_contrib,
             dft_noise_floor_ev=float(dft_noise_floor_ev),
             source_path=str(Path(path).resolve()),
+            min_sigma_ev=float(min_sigma_ev),
         )
 
     # --- query ---
@@ -178,13 +189,14 @@ class TargetGate:
         the DFT/SQS noise floor — see notebook cell 13)."""
         ok = ~np.isnan(self.sigma_grid_E)
         if not np.any(ok):
-            return self.dft_noise_floor_ev
+            return max(self.dft_noise_floor_ev, self.min_sigma_ev)
         sig_tdb = float(np.interp(
             x_B,
             self.sigma_grid_x[ok],
             self.sigma_grid_E[ok],
         ))
-        return math.sqrt(sig_tdb ** 2 + self.dft_noise_floor_ev ** 2)
+        sig = math.sqrt(sig_tdb ** 2 + self.dft_noise_floor_ev ** 2)
+        return max(sig, self.min_sigma_ev)
 
     def evaluate(
         self,
@@ -247,6 +259,7 @@ def load_target_dir(
     elements: List[str],
     phases: List[str],
     dft_noise_floor_ev: float = 0.005,
+    min_sigma_ev: float = 0.0,
 ) -> Dict[str, TargetGate]:
     """Walk target_dir and load the consensus JSONs whose filename
     matches `<elements>_<phase>_consensus.json`. Missing phases are
@@ -264,6 +277,7 @@ def load_target_dir(
                 try:
                     out[phase] = TargetGate.from_consensus_json(
                         cand, dft_noise_floor_ev=dft_noise_floor_ev,
+                        min_sigma_ev=min_sigma_ev,
                     )
                     break
                 except Exception as exc:

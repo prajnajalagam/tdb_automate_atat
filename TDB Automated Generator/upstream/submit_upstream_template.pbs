@@ -33,11 +33,61 @@ TEMPLATE_ROOT="atat/data/sqsdb"
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 RELAX_METHOD="infdet"            # normal | infdet
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
+
+# Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
+# runs — NM energies for these metals are wrong by tens of meV/atom.
+# Set to "no" only for a deliberate non-magnetic control run.
+SPIN="auto"                      # auto | no
+# Convergence scope: "phase" converges ENCUT/KPPRA on the first SQS of
+# each phase and reuses it for all siblings (uniform settings = clean
+# mixing energies + ~N x less sweep compute). "sqs" = old per-SQS mode.
+CONVERGENCE_SCOPE="phase"
+# Lattice-drift threshold (ATAT checkrelax analogue). Every SQS gets
+# checkrelax.out; above this it is flagged relaxaway (left its parent
+# lattice) and downstream fitting drops it.
+MAX_CHECKRELAX="0.1"
+
+# Command used to launch VASP. ATAT's runstruct_vasp / robustrelax_vasp
+# take it as TRAILING arguments (reference NAS job:
+#   robustrelax_vasp -id -c 0.05 mpiexec -n 128
+# ). REQUIRED on mil_ait: the MPI vasp binary dies without its launcher
+# and every run fails with "unable to open OSZICAR". Match -n to the
+# ncpus in the #PBS select line above.
+CMD_PREFIX="mpiexec -n 128"
+
+# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet,
+# e.g. "-c 0.05" (constraint tolerance from the reference job).
+# Ignored for runstruct. Leave empty for defaults.
+RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
 SQS_LEVEL=""                     # e.g. "1" to pass -lev=1; empty = default
 
+# Unstable-mode policy for the phonon fit. fitfc -f ABORTS (no svib_ht)
+# when the force constants give imaginary modes, unless told otherwise:
+#   mark     (default) record unstable_modes.log, leave the SQS energy-only
+#   escalate regenerate perturbations at a 1.5x larger displacement radius
+#            and refit — rules out the finite-supercell artifact (costs
+#            extra VASP force runs); persists -> marked energy-only as
+#            likely genuine dynamical instability
+#   force    retry once with fitfc -fn (svib_ht then OMITS the unstable
+#            branches — a lower bound; flagged in the log)
+FITFC_ON_UNSTABLE="mark"
+# Optional fitfc -rl=<len> robust-length soft-mode treatment (beta);
+# also prevents the abort. Leave empty to keep it off.
+FITFC_RL=""
+
+# SQS composition-mesh cutoff (sqs2tdb -lv=N). CUMULATIVE: N copies ALL
+# levels <= N, so "2" yields endmembers (lev=0) + midpoints (lev=1) +
+# the lev=2 mesh in one shot. To refine later just raise the number
+# (e.g. "3") and re-run — sqs2tdb skips dirs that already have str.out,
+# so only the new level's structures are added.
+SQS_LEVEL="2"
+
+# Site-specific environment (matches the NAS reference PBS for the
+# user's default VASP setup — comp-intel/2023.2.1 + mpi-intel/2021.16
+# on mil_ait, ATAT under ~/bin, VASP under zwu6's tree).
 # Site-specific environment.
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
@@ -60,6 +110,9 @@ source "$VENV_ACTIVATE"
 
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
 export OMP_NUM_THREADS=1
+# Live logging: without this, Python buffers stdout when piped and the
+# job looks dead until buffers flush. Belt-and-braces with `python3 -u`.
+export PYTHONUNBUFFERED=1
 
 if ! command -v sqs2tdb  >/dev/null 2>&1; then echo "no sqs2tdb on PATH";  exit 1; fi
 if ! command -v fitfc    >/dev/null 2>&1; then echo "no fitfc on PATH";    exit 1; fi
@@ -70,8 +123,30 @@ EXTRA=()
 [ "${SKIP_PHONON}" = "yes" ] && EXTRA+=(--skip-phonon)
 [ -n "${SQS_LEVEL}" ]        && EXTRA+=(--sqs-level "${SQS_LEVEL}")
 [ -n "${TEMPLATE_ROOT}" ]    && EXTRA+=(--template-root "${TEMPLATE_ROOT}")
+# VASP launcher — REQUIRED for MPI builds (see USER CONFIG note).
+[ -n "${CMD_PREFIX}" ]       && EXTRA+=(--cmd-prefix "${CMD_PREFIX}")
+[ -n "${RELAX_OPTS}" ]       && EXTRA+=(--relax-opts "${RELAX_OPTS}")
+EXTRA+=(--fitfc-on-unstable "${FITFC_ON_UNSTABLE:-mark}")
+[ -n "${FITFC_RL}" ]         && EXTRA+=(--fitfc-rl "${FITFC_RL}")
+[ "${SPIN}" = "no" ]         && EXTRA+=(--no-spin)
+EXTRA+=(--convergence-scope "${CONVERGENCE_SCOPE:-phase}")
+EXTRA+=(--max-checkrelax "${MAX_CHECKRELAX:-0.1}")
 
-python3 "${SCRIPT_DIR}/run_upstream.py" \
+# Live log in the submit dir (PBS -o only arrives after the job ends).
+# run_upstream.py ALSO tees itself to <WORK_ROOT>/upstream_live.log with
+# per-line timestamps; either file works with tail -f. Per-command detail
+# (VASP output, sqs2tdb chatter) is in the per-step logs under WORK_ROOT:
+#   sqs2tdb_cp_<PHASE>.log / .2.log     SQS generation, pass 1 / pass 2
+#   <sqs>/convergence/*/vasp.log        ENCUT/KPPRA sweep points
+#   <sqs>/runstruct.log                 pollmach runstruct_vasp relaxation
+#   <sqs>/robustrelax_mk.log            robustrelax input generation
+#   <sqs>/robustrelax_{normal,infdet}.log
+#   <sqs>/fitfc_*.log                   phonon stages
+LIVE_LOG="${SCRIPT_DIR}/upstream_live_${ELEMENT_A}${ELEMENT_B}_$(date +%Y%m%d_%H%M%S).log"
+echo "Live log (tail -f me): ${LIVE_LOG}"
+
+set +e   # capture the python exit code through the tee pipe
+python3 -u "${SCRIPT_DIR}/run_upstream.py" \
     --element1 "${ELEMENT_A}" \
     --element2 "${ELEMENT_B}" \
     --work-root "${WORK_ROOT}" \
@@ -80,6 +155,14 @@ python3 "${SCRIPT_DIR}/run_upstream.py" \
     --relax-method "${RELAX_METHOD}" \
     --tol-ev "${TOL_EV}" \
     --env-bin "${ATAT_BIN}" \
-    "${EXTRA[@]}"
+    "${EXTRA[@]}" \
+    2>&1 | tee "${LIVE_LOG}"
+RC=${PIPESTATUS[0]}
+set -e
+
+if [ "${RC}" -ne 0 ]; then
+    echo "ERROR: run_upstream.py exited rc=${RC}; see ${LIVE_LOG}" >&2
+    exit "${RC}"
+fi
 
 echo "Upstream generation complete. Feed ${WORK_ROOT} to select_endmembers.py."

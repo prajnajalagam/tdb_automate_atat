@@ -131,12 +131,18 @@ def run_static_point(src_sqs: Path,
                      dlm: Optional[DLMConfig] = None,
                      algo: str = "All",
                      env_bin: Optional[str] = None,
-                     timeout: int = 7200) -> Optional[float]:
+                     timeout: int = 7200,
+                     cmd_prefix: str = "") -> Optional[float]:
     """Set up and run one static VASP point at (encut, kppra); return eV/atom.
 
     Copies str.out (and any POTCAR/species files) from src_sqs into dst, writes
     a static vasp.wrap with the requested ENCUT/KPPRA, runs runstruct_vasp, and
     reads back the energy. Returns None if the run produced no energy.
+
+    cmd_prefix: the VASP launch command (e.g. "mpiexec -n 128"), passed to
+    runstruct_vasp as trailing arguments. Without it, runstruct_vasp
+    launches the MPI vasp binary bare and it dies before writing OSZICAR
+    ("Problem running vasp command ... unable to open OSZICAR").
     """
     import shutil
     src_sqs = Path(src_sqs)
@@ -151,7 +157,8 @@ def run_static_point(src_sqs: Path,
                            dlm=dlm, algo=algo)
     (dst / "vasp.wrap").write_text(wrap)
 
-    runner.run_logged(["runstruct_vasp"], cwd=dst,
+    runner.run_logged(["runstruct_vasp"] + runner.split_prefix(cmd_prefix),
+                      cwd=dst,
                       log=dst / "runstruct.log",
                       env_bin=env_bin, timeout=timeout, check=False)
     return energy_per_atom(dst)
@@ -166,7 +173,8 @@ def run_sweep(parameter: str,
               algo: str = "All",
               tol_ev: float = DEFAULT_TOL_EV,
               env_bin: Optional[str] = None,
-              timeout: int = 7200) -> ConvergenceResult:
+              timeout: int = 7200,
+              cmd_prefix: str = "") -> ConvergenceResult:
     """Run a 1-D convergence sweep over `settings` for ENCUT or KPPRA.
 
     parameter   "ENCUT" or "KPPRA". The other parameter is held at
@@ -182,7 +190,8 @@ def run_sweep(parameter: str,
             encut, kppra = fixed_other, val
         e_pa.append(run_static_point(
             src_sqs, dst, encut=encut, kppra=kppra,
-            dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout))
+            dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
+            cmd_prefix=cmd_prefix))
 
     chosen, converged, reference = select_converged(settings, e_pa, tol_ev)
     return ConvergenceResult(
@@ -197,7 +206,8 @@ def converge_sqs(src_sqs: Path,
                  algo: str = "All",
                  tol_ev: float = DEFAULT_TOL_EV,
                  env_bin: Optional[str] = None,
-                 timeout: int = 7200
+                 timeout: int = 7200,
+                 cmd_prefix: str = ""
                  ) -> Tuple[int, int, ConvergenceResult, ConvergenceResult]:
     """Full per-SQS convergence: KPPRA sweep first, then ENCUT sweep.
 
@@ -212,14 +222,14 @@ def converge_sqs(src_sqs: Path,
         "KPPRA", src_sqs, Path(sweep_root) / "kppra_sweep",
         settings=kgrid, fixed_other=probe_encut,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
-        env_bin=env_bin, timeout=timeout)
+        env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
     chosen_kppra = kppra_res.chosen
 
     encut_res = run_sweep(
         "ENCUT", src_sqs, Path(sweep_root) / "encut_sweep",
         settings=egrid, fixed_other=chosen_kppra,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
-        env_bin=env_bin, timeout=timeout)
+        env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
     chosen_encut = encut_res.chosen
 
     return chosen_encut, chosen_kppra, kppra_res, encut_res

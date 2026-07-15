@@ -59,13 +59,24 @@ def generate_phase_sqs(work_root: Path,
 
     elements  passed as -sp=El1,El2. Required unless a species.in already
               exists at the work_root level (sqs2tdb falls back to it).
-    level     restricts generation to one composition mesh level via
-              ``-lv=<n>`` (the actual flag name -- NOT -lev, which sqs2tdb
-              silently ignores).
+    level     composition-mesh cutoff passed as ``-lv=<n>`` (the actual
+              flag name -- NOT -lev, which sqs2tdb silently ignores).
+              CUMULATIVE semantics, per the sqs2tdb source
+              (`if ($levs[1] <= $cmdline{"-lv"})`): -lv=N copies ALL
+              database entries with level <= N, so -lv=2 yields the
+              lev=0 endmembers, lev=1 midpoints AND lev=2 mesh in one
+              invocation. Omitting it behaves like -lv=0 (endmembers
+              only) because undef compares as 0 in Perl. Re-invoking
+              with a larger N later only ADDS the new levels: sqs2tdb
+              skips any sqs_ dir that already has str.out.
     use_small  default: True for single-sublattice phases, False otherwise.
     Runs ``randomspin`` in the produced *_small directory when dlm is set.
     Returns the directory sqs2tdb populated (work_root/<target>).
-    Raises RuntimeError if no sqsdb_* structure directories exist afterwards.
+    Raises RuntimeError if the copy produced neither str.out files nor
+    `link` files. (`link`-only dirs are legitimate: sqs2tdb writes a
+    link instead of structure files when an SQS is symmetry-equivalent
+    to a permuted-site twin or when an endmember reduces to a parent
+    lattice via parentlat.in.)
     """
     work_root = Path(work_root)
     work_root.mkdir(parents=True, exist_ok=True)
@@ -104,11 +115,15 @@ def generate_phase_sqs(work_root: Path,
         target_dir = work_root
 
     # Verify the copy actually happened -- both passes exit 0 even when
-    # nothing was copied, so rc alone proves nothing.
-    if not any(target_dir.rglob("str.out")):
+    # nothing was copied, so rc alone proves nothing. Accept `link`-only
+    # dirs too: sqs2tdb legitimately writes just a link file for SQS
+    # equivalent to a permuted-site twin or an endmember reducible to a
+    # parent lattice (parentlat.in), with no str.out of their own.
+    if not any(target_dir.rglob("str.out")) \
+            and not any(target_dir.rglob("link")):
         raise RuntimeError(
-            f"sqs2tdb -cp -l={target} produced no str.out under "
-            f"{target_dir} after two passes; see "
+            f"sqs2tdb -cp -l={target} produced no str.out (nor link "
+            f"files) under {target_dir} after two passes; see "
             f"{work_root / f'sqs2tdb_cp_{target}.2.log'}")
 
     if dlm and phase in SINGLE_SUBLATTICE_PHASES:
