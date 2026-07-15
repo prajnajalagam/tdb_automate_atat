@@ -53,7 +53,7 @@ MAX_CHECKRELAX="0.1"
 # ). REQUIRED on mil_ait: the MPI vasp binary dies without its launcher
 # and every run fails with "unable to open OSZICAR". Match -n to the
 # ncpus in the #PBS select line above.
-CMD_PREFIX="mpiexec -n 128"
+CMD_PREFIX="mpiexec -n 32"
 
 # Direct robustrelax_vasp options for RELAX_METHOD normal|infdet,
 # e.g. "-c 0.05" (constraint tolerance from the reference job).
@@ -62,7 +62,6 @@ RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
-SQS_LEVEL=""                     # e.g. "1" to pass -lev=1; empty = default
 
 # Unstable-mode policy for the phonon fit. fitfc -f ABORTS (no svib_ht)
 # when the force constants give imaginary modes, unless told otherwise:
