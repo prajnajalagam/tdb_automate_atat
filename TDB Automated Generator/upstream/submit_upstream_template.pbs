@@ -1,8 +1,8 @@
 #!/bin/bash
 #PBS -S /bin/bash
-#PBS -N TODO_UPSTREAM            # e.g. CoCr_upstream
+#PBS -N CoCr_UPSTREAM
 #PBS -q long
-#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
+#PBS -l select=1:ncpus=32:mpiprocs=32:model=mil_ait
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -o upstream_pbs.log
@@ -19,19 +19,19 @@
 set -euo pipefail
 
 # ───────────────────────── USER CONFIG (edit me) ────────────────────────────
-ELEMENT_A="TODO_A"               # e.g. Co
-ELEMENT_B="TODO_B"               # e.g. Cr
+ELEMENT_A="Co"               # e.g. Co
+ELEMENT_B="Cr"               # e.g. Cr
 
-WORK_ROOT="TODO_PATH/${ELEMENT_A}${ELEMENT_B}_upstream"
+WORK_ROOT="/nobackupp27/pjalagam/${ELEMENT_A}${ELEMENT_B}_upstream"
 
 # Comma-separated POTCAR paths (one per element, or a combined POTCAR).
-POTCARS="TODO_VASP_PP/${ELEMENT_A}/POTCAR,TODO_VASP_PP/${ELEMENT_B}/POTCAR"
+POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
 
 # Directory holding the *_small single-sublattice template systems (caveat 1).
-TEMPLATE_ROOT="TODO_PATH/atat_small_templates"
+TEMPLATE_ROOT="atat/data/sqsdb"
 
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
-RELAX_METHOD="runstruct"         # runstruct (default) | normal | infdet
+RELAX_METHOD="infdet"            # normal | infdet
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
 
 # Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
@@ -62,6 +62,7 @@ RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
 SKIP_PHONON="no"                 # "yes" for an energy-only upstream pass
+SQS_LEVEL=""                     # e.g. "1" to pass -lev=1; empty = default
 
 # Unstable-mode policy for the phonon fit. fitfc -f ABORTS (no svib_ht)
 # when the force constants give imaginary modes, unless told otherwise:
@@ -87,9 +88,11 @@ SQS_LEVEL="2"
 # Site-specific environment (matches the NAS reference PBS for the
 # user's default VASP setup — comp-intel/2023.2.1 + mpi-intel/2021.16
 # on mil_ait, ATAT under ~/bin, VASP under zwu6's tree).
+# Site-specific environment.
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
-VASP_BIN="/home1/zwu6/vasp"      # directory containing vasp_std etc.
+
+VASP_BIN="/home1/zwu6/vasp"    # directory containing vasp_std etc.
 SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
 # ───────────────────────── END USER CONFIG ──────────────────────────────────
 
@@ -103,10 +106,6 @@ set -x
 module purge
 module load python3
 module load gcc
-# Match the reference NAS PBS for VASP on mil_ait.
-module load comp-intel/2023.2.1
-module use -a /nasa/modulefiles/testing
-module load mpi-intel/2021.16
 source "$VENV_ACTIVATE"
 
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
@@ -122,8 +121,7 @@ if ! command -v pollmach >/dev/null 2>&1; then echo "no pollmach on PATH"; exit 
 EXTRA=()
 [ "${DLM}" = "yes" ]         && EXTRA+=(--dlm --dlm-moment "${DLM_MOMENT}")
 [ "${SKIP_PHONON}" = "yes" ] && EXTRA+=(--skip-phonon)
-# SQS_LEVEL default is "2" (see USER CONFIG); pass through as-is.
-EXTRA+=(--sqs-level "${SQS_LEVEL:-2}")
+[ -n "${SQS_LEVEL}" ]        && EXTRA+=(--sqs-level "${SQS_LEVEL}")
 [ -n "${TEMPLATE_ROOT}" ]    && EXTRA+=(--template-root "${TEMPLATE_ROOT}")
 # VASP launcher — REQUIRED for MPI builds (see USER CONFIG note).
 [ -n "${CMD_PREFIX}" ]       && EXTRA+=(--cmd-prefix "${CMD_PREFIX}")
