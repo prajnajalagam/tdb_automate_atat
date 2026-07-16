@@ -39,8 +39,14 @@ TIMEOUT_S="4800"                 # per-poll cap inside the pipeline
 
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
-VASP_BIN="/home1/zwu6/vasp"
+VASP_BIN="/home1/zwu6/vasp/6.6.0/bin_PFE"  # the ACTUAL binary dir
+# (ezvasp launches vasp via ~/.ezvasp.rc regardless; having the
+#  real bin dir on PATH just makes the `which vasp_std` sanity
+#  check meaningful instead of reporting MISSING)
 SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
+# Only needed if nas_smoke was copied OUT of the upstream/ package —
+# point this at the directory containing runner.py / run_upstream.py.
+UPSTREAM_DIR=""
 # ───────────────────────── END USER CONFIG ──────────────────────────────────
 
 module purge
@@ -54,6 +60,7 @@ source "$VENV_ACTIVATE"
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
+[ -n "${UPSTREAM_DIR}" ] && export UPSTREAM_DIR
 
 mkdir -p "${WORK_ROOT}"
 {
