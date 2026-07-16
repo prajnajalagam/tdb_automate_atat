@@ -187,9 +187,14 @@ CATALOG: List[Signature] = [
               "geometry or set SYMPREC explicitly."),
 
     # ── k-points / tetrahedron ──────────────────────────────────────
+    # NB: a bare "BZINTS: Fermi energy: ..." line is ROUTINE per-step
+    # output under ISMEAR=-5, not an error (false-positived on the
+    # 2026-07-16 smoke run) — only match actual failure text.
     Signature("tet", "kpoints_tet",
               r"Tetrahedron method fails|Fatal error detecting k-mesh"
-              r"|Fatal error: unable to match k-point|BZINTS",
+              r"|Fatal error: unable to match k-point"
+              r"|BZINTS: Fermi energy not converged"
+              r"|WARNING: DENTET",
               "stdout",
               "Use ISMEAR=1 (metals, SIGMA=0.2) or 0 instead of -5, or "
               "densify the k-mesh (higher KPPRA). ISMEAR=-5 requires "

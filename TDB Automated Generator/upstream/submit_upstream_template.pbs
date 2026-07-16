@@ -27,9 +27,12 @@ WORK_ROOT="/nobackupp27/pjalagam/${ELEMENT_A}${ELEMENT_B}_upstream"
 # Comma-separated POTCAR paths (one per element, or a combined POTCAR).
 POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
 
-# Directory holding the *_small single-sublattice template systems (caveat 1).
-TEMPLATE_ROOT="$HOME/atat/data/sqsdb"   # absolute — a relative path
-                                        # resolves against the job cwd
+# DEPRECATED (2026-07-16): TEMPLATE_ROOT used to copy the raw sqsdb
+# database into the work root, which polluted discovery with
+# undecorated sqsdb_lev=* entries (they are NOT calculations).
+# sqs2tdb -cp reads its database from $atatdir/data/sqsdb directly —
+# if a *_small lattice is missing there, add it to $atatdir, not here.
+TEMPLATE_ROOT=""
 
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 RELAX_METHOD="infdet"            # infdet (default: robustrelax -id -c 0.05)
