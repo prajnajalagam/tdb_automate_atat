@@ -99,8 +99,16 @@ def dlm_fixup(sqs_dir: Path,
 
 def _write_phonon_wrap(calc_dir: Path, encut: int, kppra: int,
                        dlm: Optional[DLMConfig], algo: str) -> None:
+    # natoms from the SQS cell: perturbation supercells are LARGER, so
+    # the small-cell NCORE/KPAR override is conservative there — safe
+    # (slightly under-parallel) rather than crash-prone.
+    try:
+        from strfile import read_structure
+        natoms = len(read_structure(Path(calc_dir) / "str.out").atoms) or None
+    except OSError:
+        natoms = None
     wrap = build_vasp_wrap("phonon", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo)
+                           dlm=dlm, algo=algo, natoms=natoms)
     (Path(calc_dir) / "vasp.wrap").write_text(wrap)
 
 
@@ -335,8 +343,13 @@ def run_fitfc(sqs_dir: Path,
         #     to the frozen wrap for their force runs.
         pending = [d for d in vol_dirs if not (d / "str_relax.out").is_file()]
         if pending:
+            try:
+                from strfile import read_structure
+                nat = len(read_structure(sqs_dir / "str.out").atoms) or None
+            except OSError:
+                nat = None
             relax_wrap = build_vasp_wrap("relax", encut=encut, kppra=kppra,
-                                         dlm=dlm, algo=algo,
+                                         dlm=dlm, algo=algo, natoms=nat,
                                          extra={"ISIF": 2})
             for d in pending:
                 (d / "vasp.wrap").write_text(relax_wrap)

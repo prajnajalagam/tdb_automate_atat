@@ -85,6 +85,28 @@ def wants_spin(elements) -> bool:
     return any(str(e).capitalize() in MAGNETIC_3D for e in elements)
 
 
+def parallel_overrides(natoms: Optional[int]) -> Dict[str, int]:
+    """NCORE/KPAR safe for the cell size.
+
+    The reference wrap's NCORE=8 + KPAR=4 assumes production-size SQS.
+    On a 1-atom endmember it asks VASP to split a handful of bands over
+    32 cores per k-group — in the real Co-Cr run every such cell died
+    with EDWAV "gradient is not orthogonal" / "Sub-Space-Matrix is not
+    hermitian" followed by MPI_Abort, which then cascaded (empty
+    CONTCAR -> 0-ion static POSCAR -> bogus XC_FOCK_READER abort).
+    Small cells get a conservative decomposition; production cells keep
+    the wrap defaults. Safe beats optimal here — a 1-atom cell is fast
+    on any layout.
+    """
+    if natoms is None:
+        return {}
+    if natoms <= 4:
+        return {"NCORE": 1, "KPAR": 1}
+    if natoms <= 12:
+        return {"NCORE": 2, "KPAR": 2}
+    return {}
+
+
 # Base INCAR shared by all modes (mirrors the reference file minus the
 # mode-specific relaxation keys, which are layered on per mode).
 _BASE_INCAR: List[Tuple[str, object]] = [
@@ -164,6 +186,7 @@ def build_vasp_wrap(mode: str,
                     algo: str = "All",
                     usepot: str = "PAWPBE",
                     spin: Optional[bool] = None,
+                    natoms: Optional[int] = None,
                     extra: Optional[Dict[str, object]] = None) -> str:
     """Return the text of a vasp.wrap file.
 
@@ -174,6 +197,9 @@ def build_vasp_wrap(mode: str,
             USEPOT, and the SUBATOM moment-substitution lines.
     algo    ALGO value (default 'All' per spec; pass 'Fast' to match the
             reference file).
+    natoms  atom count of the cell this wrap will run; small cells get
+            conservative NCORE/KPAR (see parallel_overrides) — the
+            reference NCORE=8/KPAR=4 crashes VASP on 1-atom endmembers.
     spin    ISPIN=2 collinear spin polarization. None (default) falls back
             to the module-level DEFAULT_SPIN, which run_upstream turns on
             automatically for MAGNETIC_3D elements. Initial moments ride
@@ -212,6 +238,9 @@ def build_vasp_wrap(mode: str,
         if k == "_dostatic":
             dostatic = bool(v)
             continue
+        put(k, v)
+
+    for k, v in parallel_overrides(natoms).items():
         put(k, v)
 
     if kppra is not None:

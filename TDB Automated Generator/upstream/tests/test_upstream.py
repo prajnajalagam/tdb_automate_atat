@@ -343,7 +343,7 @@ def _stub_encut_kppra(monkeypatch, calc_dir):
     doesn't need a real POTCAR."""
     monkeypatch.setattr(
         relax, "build_vasp_wrap",
-        lambda kind, encut, kppra, dlm=None, algo="All": f"# stub {kind}\n",
+        lambda kind, *a, **k: f"# stub {kind}\n",
     )
 
 
@@ -540,8 +540,7 @@ def test_static_point_gets_launcher(tmp_path, monkeypatch):
 
     monkeypatch.setattr(converge.runner, "run_logged", fake_logged)
     monkeypatch.setattr(converge, "build_vasp_wrap",
-                        lambda kind, encut, kppra, dlm=None, algo="All":
-                        "# stub\n")
+                        lambda kind, *a, **k: "# stub\n")
     monkeypatch.setattr(converge, "energy_per_atom", lambda d: -5.0)
 
     src = tmp_path / "sqs"; src.mkdir()
@@ -593,7 +592,9 @@ def test_process_one_sqs_clears_wait_marker(tmp_path, monkeypatch):
                         lambda *a, **k: (400, 6000, fake_res, fake_res))
 
     def fake_relax(calc_dir, **kwargs):
-        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        (Path(calc_dir) / "str_relax.out").write_text(
+            "1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n"
+            "0 0 0 Co\n")
         return Path(calc_dir) / "str_relax.out"
 
     monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
@@ -1187,3 +1188,116 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     # smoke wraps are tiny-run tuned and spin-off (plumbing test)
     w = (tmp_path / "T1_static" / "vasp.wrap").read_text()
     assert "NELM = 25" in w and "NCORE = 1" in w and "ISPIN" not in w
+
+
+# ---- CoCr-run regression fixes (diagnosed from real NAS outputs) -----------
+
+from strfile import validate_structure_file
+
+
+def test_parallel_overrides_small_cells():
+    assert vaspwrap.parallel_overrides(1) == {"NCORE": 1, "KPAR": 1}
+    assert vaspwrap.parallel_overrides(8) == {"NCORE": 2, "KPAR": 2}
+    assert vaspwrap.parallel_overrides(30) == {}
+    assert vaspwrap.parallel_overrides(None) == {}
+    w = vaspwrap.build_vasp_wrap("static", encut=300, kppra=1000, natoms=1)
+    assert "NCORE = 1" in w and "KPAR = 1" in w
+    w = vaspwrap.build_vasp_wrap("static", encut=300, kppra=1000, natoms=30)
+    assert "NCORE = 8" in w and "KPAR = 4" in w
+
+
+def test_validate_structure_file_catches_degenerate_stub(tmp_path):
+    """Exact stub robustrelax/infdet left behind in the real Co-Cr run
+    after its inner VASP crashed."""
+    stub = tmp_path / "str_relax.out"
+    stub.write_text("1 0 0\n0 1 0\n0 0 1\n\tCo\n")
+    ok, why = validate_structure_file(stub)
+    assert not ok and "no atom lines" in why
+    ok, why = validate_structure_file(tmp_path / "nope.out")
+    assert not ok and why == "missing"
+    good = tmp_path / "good.out"
+    good.write_text("1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n"
+                    "0 0 0 Co\n")
+    ok, why = validate_structure_file(good)
+    assert ok and "1 atoms" in why
+
+
+def test_process_one_sqs_failed_relax_skips_phonons(tmp_path, monkeypatch):
+    import types
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    (sqs / "wait").write_text("")
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def stub_relax(calc_dir, **kwargs):
+        (Path(calc_dir) / "str_relax.out").write_text(
+            "1 0 0\n0 1 0\n0 0 1\n\tCo\n")     # the degenerate stub
+        (Path(calc_dir) / "energy").write_text("")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", stub_relax)
+    monkeypatch.setattr(run_upstream.phonon, "run_fitfc",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("phonons must not run")))
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="infdet", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=False, timeout=60)
+
+    assert res["relax_ok"] is False and "no atom lines" in res["relax_msg"]
+    assert res["phonon_out"] is None
+    assert res["energy_present"] is False
+    assert (sqs / "wait").exists(), "wait must NOT be cleared on failure"
+
+
+def test_process_one_sqs_adopts_infdet_energy_end(tmp_path, monkeypatch):
+    """robustrelax -id writes energy_end and often leaves `energy` empty
+    even on success (seen in the real run); the pipeline must adopt it."""
+    import types
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def infdet_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.6, 0, 0], [0, 3.6, 0], [0, 0, 3.6]])
+        (Path(calc_dir) / "energy").write_text("")            # empty!
+        (Path(calc_dir) / "energy_end").write_text("-.13017812E+03\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", infdet_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="infdet", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert res["relax_ok"] is True and res["energy_present"] is True
+    assert float((sqs / "energy").read_text().split()[0]) == \
+        pytest.approx(-130.17812)
+
+
+def test_vasp_triage_reads_gz_and_suffixed_logs(tmp_path):
+    import gzip as _gzip
+    import vasp_triage
+    d = tmp_path / "case"
+    d.mkdir()
+    with _gzip.open(d / "OUTCAR.static.gz", "wt") as fh:
+        fh.write("|  ---->  I REFUSE TO CONTINUE WITH THIS SICK JOB ..."
+                 " BYE!!! <----  |\n")
+    (d / "vasp.out.static").write_text(
+        " POSCAR found :  0 types and       0 ions\n")
+    reports = vasp_triage.scan_tree(tmp_path)
+    assert len(reports) == 1
+    ids = {f.error_id for f in reports[0].findings}
+    assert "sick_job" in ids and "empty_poscar" in ids
+    assert reports[0].outcar_seen is True

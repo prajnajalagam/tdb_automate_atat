@@ -214,15 +214,42 @@ def process_one_sqs(sqs_dir: Path,
         method=relax_method, dlm=dlm, algo=algo,
         env_bin=env_bin, timeout=timeout,
         cmd_prefix=cmd_prefix, relax_opts=relax_opts)
+    # Validate the RESULT, not just file existence: a crashed
+    # robustrelax/infdet leaves a degenerate str_relax.out stub (seen in
+    # the real Co-Cr run: identity cell + coordinate-less atom line),
+    # which then poisons checkrelax and fitfc downstream.
+    from strfile import validate_structure_file
+    relax_ok, relax_msg = validate_structure_file(sqs_dir / "str_relax.out")
     stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation done "
-          f"(str_relax.out present: "
-          f"{(sqs_dir / 'str_relax.out').is_file()})")
+          f"(str_relax.out: {relax_msg})")
+    if not relax_ok:
+        stamp(f"[{sqs_dir.name}] STAGE 2/3 RELAXATION FAILED — "
+              f"str_relax.out unusable; phonons will be SKIPPED. "
+              f"Triage the VASP logs (python3 vasp_triage.py {sqs_dir})")
+
+    # robustrelax -id (infdet) reports its result in energy_end (the
+    # inflection-detection energy); the plain `energy` file is often
+    # left EMPTY even on success. Downstream reads `energy`, so adopt
+    # energy_end when energy is missing/unparseable.
+    def _parseable(pth: Path) -> bool:
+        try:
+            float(pth.read_text().split()[0])
+            return True
+        except (OSError, ValueError, IndexError):
+            return False
+
+    energy_f = sqs_dir / "energy"
+    energy_end_f = sqs_dir / "energy_end"
+    if relax_ok and not _parseable(energy_f) and _parseable(energy_end_f):
+        energy_f.write_text(energy_end_f.read_text())
+        stamp(f"[{sqs_dir.name}] energy adopted from infdet energy_end "
+              f"({energy_end_f.read_text().strip()})")
 
     # Clear the ATAT 'wait' queue marker once the relax has produced its
     # result — sqs2tdb -cp drops a `wait` file in every to-be-computed
     # dir, and pollmach-style pollers treat its presence as "pending".
     # Mirrors the manual `rm wait` in the reference NAS workflow.
-    if (sqs_dir / "str_relax.out").is_file():
+    if relax_ok:
         wait_marker = sqs_dir / "wait"
         if wait_marker.is_file():
             wait_marker.unlink()
@@ -233,7 +260,7 @@ def process_one_sqs(sqs_dir: Path,
     # it. Value recorded in checkrelax.out; drift beyond max_checkrelax
     # additionally drops a relaxaway.flag marker.
     checkrelax_val = None
-    if (sqs_dir / "str_relax.out").is_file():
+    if relax_ok:
         try:
             from strfile import lattice_drift
             checkrelax_val = lattice_drift(sqs_dir / "str.out",
@@ -256,7 +283,9 @@ def process_one_sqs(sqs_dir: Path,
                   f"{exc}")
 
     phonon_out = None
-    if not skip_phonon:
+    if not relax_ok:
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 skipped (failed relaxation)")
+    elif not skip_phonon:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
         phonon_out = str(phonon.run_fitfc(
             sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
@@ -281,6 +310,9 @@ def process_one_sqs(sqs_dir: Path,
         "encut_converged": eres.converged if eres else None,
         "relax_method": relax_method,
         "str_relax_present": (sqs_dir / "str_relax.out").is_file(),
+        "relax_ok": relax_ok,
+        "relax_msg": relax_msg,
+        "energy_present": _parseable(sqs_dir / "energy"),
         "checkrelax": checkrelax_val,
         "relaxed_away": (sqs_dir / "relaxaway.flag").is_file(),
         "phonon_out": phonon_out,

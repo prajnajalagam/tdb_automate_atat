@@ -43,8 +43,13 @@ def write_relax_wrap(calc_dir: Path,
                      algo: str = "All") -> Path:
     """Write a 'relax' vasp.wrap (all DOF) into calc_dir."""
     calc_dir = Path(calc_dir)
+    try:
+        from strfile import read_structure
+        natoms = len(read_structure(calc_dir / "str.out").atoms) or None
+    except OSError:
+        natoms = None
     wrap = build_vasp_wrap("relax", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo)
+                           dlm=dlm, algo=algo, natoms=natoms)
     path = calc_dir / "vasp.wrap"
     path.write_text(wrap)
     return path

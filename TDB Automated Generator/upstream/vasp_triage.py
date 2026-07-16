@@ -36,6 +36,7 @@ remediation workflows per category.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import re
 import sys
@@ -66,6 +67,23 @@ class Signature:
 
 
 CATALOG: List[Signature] = [
+    # ── input/chain sanity (diagnose FIRST — later errors are often
+    #    consequences of these) ────────────────────────────────────────
+    Signature("empty_poscar", "cell_basis",
+              r"POSCAR found :\s+0 types and\s+0 ions",
+              "both",
+              "The static step inherited an EMPTY CONTCAR — the relax "
+              "substep crashed before writing geometry. Fix the relax-"
+              "step error (often MPI decomposition: NCORE/KPAR too "
+              "large for a small cell, or rank oversubscription); any "
+              "error VASP prints after this line is a red herring."),
+    Signature("sick_job", "cell_basis",
+              r"REFUSE TO CONTINUE WITH THIS SICK JOB",
+              "both",
+              "VASP input-validation abort. Read the reason printed "
+              "just above; if the same output shows 'POSCAR found : 0 "
+              "types', the real cause is an earlier crashed step, not "
+              "the tag it names."),
     # ── electronic SCF / diagonalization ────────────────────────────
     Signature("edddav", "electronic_scf",
               r"Error EDDDAV: Call to ZHEGV failed",
@@ -270,7 +288,25 @@ CATEGORY_ORDER = [
 ]
 
 OUTCAR_NAMES = ("OUTCAR.relax", "OUTCAR.static", "OUTCAR")
+# runstruct_vasp gzips OUTCARs after extraction; scan those too.
+OUTCAR_GZ_NAMES = tuple(n + ".gz" for n in OUTCAR_NAMES)
+
+
+def _outcar_base(name: str) -> str:
+    """OUTCAR.relax.gz -> OUTCAR.relax (identity for plain names)."""
+    return name[:-3] if name.endswith(".gz") else name
+
+
+def _open_text(path):
+    """Text handle that transparently decompresses .gz files."""
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", errors="ignore")
+    return path.open(errors="ignore")
+
+
 STDOUT_NAMES = ("vasp.out", "out.log", "vasp.log", "runstruct.log",
+                # ezvasp DOSTATIC two-step suffixed stdout captures
+                "vasp.out.relax", "vasp.out.static",
                 "stdout", "vasp.err")
 
 
@@ -305,7 +341,7 @@ def _scan_file(path: Path, max_bytes: int = 50_000_000) -> List[Finding]:
     compiled = [(s, s.regex()) for s in CATALOG]
     try:
         read = 0
-        with path.open(errors="ignore") as fh:
+        with _open_text(path) as fh:
             for i, line in enumerate(fh, 1):
                 read += len(line)
                 if read > max_bytes:
@@ -329,7 +365,7 @@ def _completion_state(outcar: Path) -> Tuple[bool, bool]:
     """(footer_present, reached_required_accuracy) for one OUTCAR."""
     footer = reached = False
     try:
-        with outcar.open(errors="ignore") as fh:
+        with _open_text(outcar) as fh:
             for line in fh:
                 if not footer and FOOTER_RE.search(line):
                     footer = True
@@ -354,7 +390,7 @@ def scan_tree(root: Path,
         return by_dir[d]
 
     candidates: List[Path] = []
-    for name in OUTCAR_NAMES + STDOUT_NAMES:
+    for name in OUTCAR_NAMES + OUTCAR_GZ_NAMES + STDOUT_NAMES:
         candidates.extend(root.rglob(name))
     for pattern in (extra_stdout_globs or []):
         candidates.extend(root.rglob(pattern))
@@ -364,14 +400,15 @@ def scan_tree(root: Path,
             continue
         rep = report_for(path.parent)
         rep.findings.extend(_scan_file(path))
-        if path.name in OUTCAR_NAMES:
+        base = _outcar_base(path.name)
+        if base in OUTCAR_NAMES:
             rep.outcar_seen = True
             footer, reached = _completion_state(path)
             # A dir may hold several OUTCARs; "complete" if ANY has the
             # footer (the .static usually finishes even when .relax was
             # interrupted — per-file detail stays in findings).
             rep.outcar_complete = bool(rep.outcar_complete) or footer
-            if path.name == "OUTCAR.relax" or path.name == "OUTCAR":
+            if base == "OUTCAR.relax" or base == "OUTCAR":
                 rep.relax_converged = bool(rep.relax_converged) or reached
 
     # classify
