@@ -38,7 +38,6 @@ one devel-queue node, well under the 2 h devel walltime.
 Usage (see submit_endmember_e2e.pbs for the PBS wrapper):
   python3 run_endmember_e2e.py \
       --potcars $PP/Co/POTCAR,$PP/Cr/POTCAR \
-      --template-root $HOME/atat/data/sqsdb \
       --cmd-prefix "mpiexec -n 32" --env-bin $HOME/bin
   python3 run_endmember_e2e.py --verify-only <WORK_ROOT>   # re-grade only
 """
@@ -87,6 +86,7 @@ UPSTREAM = _locate_upstream()
 sys.path.insert(0, str(UPSTREAM))
 
 from strfile import validate_structure_file          # noqa: E402
+from sqsgen import DECORATED_SQS_RE                   # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,8 @@ def find_endmember_dirs(work_root: Path) -> List[Path]:
         root = work_root / phase_dir
         if root.is_dir():
             out += [d for d in sorted(root.iterdir())
-                    if d.is_dir() and "lev=0" in d.name]
+                    if d.is_dir() and "lev=0" in d.name
+                    and DECORATED_SQS_RE.search(d.name)]
     return out
 
 

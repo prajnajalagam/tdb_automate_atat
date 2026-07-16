@@ -258,7 +258,7 @@ def _fake_sqs2tdb(work_root, target, calls):
             tdir.mkdir(parents=True, exist_ok=True)
             sp.write_text("Co,Cr\n")
         else:
-            d = tdir / "sqsdb_lev=1_a_0.5_b_0.5"
+            d = tdir / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
             d.mkdir(parents=True, exist_ok=True)
             (d / "str.out").write_text("1 0 0\n0 1 0\n0 0 1\n")
         return 0
@@ -315,7 +315,7 @@ def test_generate_phase_sqs_fails_if_nothing_copied(tmp_path, monkeypatch):
         (Path(cwd) / "BCC_A2_small").mkdir(exist_ok=True)
         return 0
     monkeypatch.setattr(sqsgen.runner, "run_logged", noop)
-    with pytest.raises(RuntimeError, match="no str.out"):
+    with pytest.raises(RuntimeError, match="no element-decorated"):
         sqsgen.generate_phase_sqs(tmp_path, "BCC_A2", elements=["Co", "Cr"])
 
 
@@ -1426,3 +1426,54 @@ def test_triage_tet_not_triggered_by_routine_bzints(tmp_path):
                                 "k-points < 4)\n")
     reports = vasp_triage.scan_tree(tmp_path)
     assert any("kpoints_tet" in r.categories for r in reports)
+
+
+
+# ---- raw-sqsdb pollution regression (2026-07-16 e2e failure) ----------------
+
+def test_discover_sqs_dirs_ignores_raw_sqsdb_entries(tmp_path):
+    """A stray copy of the ATAT database inside the work root must not
+    be treated as calculations: raw entries are undecorated
+    (sqsdb_lev=0_a=1); only element-decorated dirs count."""
+    root = tmp_path / "FCC_A1_small"
+    for name in ("sqsdb_lev=0_a=1", "sqsdb_lev=1_a=0.5,0.5",
+                 "sqsdb_lev=3_a=0.33333,0.33333,0.33333"):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "str.out").write_text("raw db entry\n")
+    good = root / "sqs_lev=0_a_Co=1"
+    good.mkdir()
+    (good / "str.out").write_text("decorated\n")
+    found = run_upstream.discover_sqs_dirs(root)
+    assert found == [good]
+
+
+def test_generate_phase_sqs_rejects_raw_db_only_output(tmp_path,
+                                                       monkeypatch):
+    """If -cp copies nothing but a raw database tree sits in the work
+    root, verification must FAIL (the old any-str.out check passed)."""
+    def fake(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        tdir = Path(cwd) / "FCC_A1_small"
+        sp = tdir / "species.in"
+        if not sp.is_file():
+            tdir.mkdir(parents=True, exist_ok=True)
+            sp.write_text("Co,Cr\n")
+            raw = tdir / "sqsdb_lev=0_a=1"     # raw DB pollution only
+            raw.mkdir()
+            (raw / "str.out").write_text("raw\n")
+        return 0
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake)
+    with pytest.raises(RuntimeError, match="no element-decorated"):
+        sqsgen.generate_phase_sqs(tmp_path, "FCC_A1",
+                                  elements=["Co", "Cr"], level=0)
+
+
+def test_e2e_find_endmembers_skips_raw_db_dirs(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_endmember_e2e as e2e
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Co=1", good=True)
+    raw = tmp_path / "FCC_A1_small" / "sqsdb_lev=0_a=1"
+    raw.mkdir(parents=True, exist_ok=True)
+    (raw / "str.out").write_text("raw db\n")
+    dirs = e2e.find_endmember_dirs(tmp_path)
+    assert [d.name for d in dirs] == ["sqs_lev=0_a_Co=1"]

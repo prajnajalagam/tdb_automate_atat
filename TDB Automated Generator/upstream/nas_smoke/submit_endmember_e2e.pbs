@@ -27,7 +27,6 @@ set -euo pipefail
 ELEMENT_A="Co"
 ELEMENT_B="Cr"
 POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
-TEMPLATE_ROOT="$HOME/atat/data/sqsdb"
 # Home directory on purpose (nobackup currently unavailable). Fine at
 # this scale: 2 endmembers + one ~32-atom supercell each, LWAVE/LCHARG
 # off — well under the NAS home quota. Move back to /nobackupp27 for
@@ -78,7 +77,6 @@ set +e
 python3 -u "${SCRIPT_DIR}/run_endmember_e2e.py" \
     --element1 "${ELEMENT_A}" --element2 "${ELEMENT_B}" \
     --potcars "${POTCARS}" \
-    --template-root "${TEMPLATE_ROOT}" \
     --work-root "${WORK_ROOT}" \
     --cmd-prefix "${CMD_PREFIX}" \
     --env-bin "${ATAT_BIN}" \

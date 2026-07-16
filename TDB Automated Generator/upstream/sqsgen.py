@@ -21,10 +21,17 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
+import re
+
 from phases import (
     SMALL_SYSTEM, SINGLE_SUBLATTICE_PHASES, SigmaDLMSpec,
     DLM_SPIN_UP, DLM_SPIN_DOWN,
 )
+
+# Element-DECORATED calc dirs written by sqs2tdb -cp carry substituted
+# species in their composition tokens ("sqs_lev=0_a_Co=1"); the raw
+# DATABASE entries under $atatdir/data/sqsdb do not ("sqsdb_lev=0_a=1").
+DECORATED_SQS_RE = re.compile(r"lev=\d+.*_[A-Z][a-z]?[+-]?\d*=")
 from strfile import read_structure, Structure
 import runner
 
@@ -115,16 +122,28 @@ def generate_phase_sqs(work_root: Path,
         target_dir = work_root
 
     # Verify the copy actually happened -- both passes exit 0 even when
-    # nothing was copied, so rc alone proves nothing. Accept `link`-only
-    # dirs too: sqs2tdb legitimately writes just a link file for SQS
-    # equivalent to a permuted-site twin or an endmember reducible to a
-    # parent lattice (parentlat.in), with no str.out of their own.
-    if not any(target_dir.rglob("str.out")) \
-            and not any(target_dir.rglob("link")):
+    # nothing was copied, so rc alone proves nothing. Only element-
+    # DECORATED dirs count: a stray copy of the raw database (sqsdb_lev=*
+    # with undecorated names) in the work root satisfied the old
+    # any-str.out check in the 2026-07-16 e2e run while -cp had actually
+    # produced nothing. Accept `link`-only decorated dirs too (permuted-
+    # site twins / parentlat.in reductions have no str.out of their own).
+    def _has_decorated_output(root: Path) -> bool:
+        for d in root.rglob("*"):
+            if d.is_dir() and DECORATED_SQS_RE.search(d.name) \
+                    and ((d / "str.out").is_file()
+                         or (d / "link").is_file()):
+                return True
+        return False
+
+    if not _has_decorated_output(target_dir):
         raise RuntimeError(
-            f"sqs2tdb -cp -l={target} produced no str.out (nor link "
-            f"files) under {target_dir} after two passes; see "
-            f"{work_root / f'sqs2tdb_cp_{target}.2.log'}")
+            f"sqs2tdb -cp -l={target} produced no element-decorated "
+            f"sqs dirs (str.out or link) under {target_dir} after two "
+            f"passes; see {work_root / f'sqs2tdb_cp_{target}.2.log'}. "
+            f"(Raw sqsdb_lev= database entries do not count.) Check "
+            f"that '{target}' exists in $atatdir/data/sqsdb and that "
+            f"species.in lists the intended elements.")
 
     if dlm and phase in SINGLE_SUBLATTICE_PHASES:
         apply_randomspin(target_dir, env_bin=env_bin, timeout=timeout)
@@ -236,9 +255,13 @@ def sigma_lev3_to_lev0_dlm(src_dir: Path,
 def copy_small_systems(template_root: Path,
                        work_root: Path,
                        phases: List[str]) -> List[Path]:
-    """Copy the *_small single-sublattice systems from a template directory
-    into the working area (caveat 1 in the spec). Returns the destinations
-    that were created."""
+    """DEPRECATED (2026-07-16): copying raw sqsdb database entries into
+    the WORK ROOT is useless (sqs2tdb -cp reads its database from
+    $atatdir/data/sqsdb, never from the work root) and polluted the
+    e2e run's discovery with undecorated sqsdb_lev=* entries. If a
+    *_small lattice is missing from an ATAT install, add it under
+    $atatdir/data/sqsdb instead. Kept only for API compatibility;
+    no longer called by run_upstream."""
     template_root = Path(template_root)
     work_root = Path(work_root)
     work_root.mkdir(parents=True, exist_ok=True)

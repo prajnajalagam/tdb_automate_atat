@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import asdict
@@ -131,11 +132,22 @@ def stamp(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# Single source of truth for "is this an element-decorated calc dir"
+_DECORATED_RE = sqsgen.DECORATED_SQS_RE
+
+
 def discover_sqs_dirs(phase_root: Path) -> List[Path]:
-    """All lev>0 SQS directories produced by sqs2tdb -cp under phase_root."""
+    """All element-DECORATED SQS calc dirs produced by sqs2tdb -cp.
+
+    Raw database entries (sqsdb_lev=* with undecorated "a=1"-style
+    names, as found in $atatdir/data/sqsdb) are explicitly excluded —
+    in the 2026-07-16 e2e run a stray copy of the database inside the
+    work root was picked up as calculations, ternary meshes included.
+    """
     out: List[Path] = []
     for d in sorted(phase_root.rglob("*")):
-        if d.is_dir() and (d / "str.out").is_file() and "lev=" in d.name:
+        if d.is_dir() and (d / "str.out").is_file() \
+                and _DECORATED_RE.search(d.name):
             out.append(d)
     if not out and (phase_root / "str.out").is_file():
         out = [phase_root]
@@ -342,10 +354,20 @@ def process_phase(phase: str,
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
+    # NOTE (2026-07-16 e2e failure): the old behavior here copied the
+    # RAW sqsdb database entry (sqsdb_lev=* dirs with undecorated
+    # compositions + sqsgen.in) from --template-root into the work
+    # root. That is useless — sqs2tdb -cp reads its database from
+    # $atatdir/data/sqsdb, never from the work root — and harmful:
+    # discovery then picked up the raw entries as SQS to compute.
+    # The correct invocation is simply
+    #     sqs2tdb -cp -l=<lattice> -sp=El1,El2 -lv=N
+    # If a *_small lattice is missing from your ATAT install, add it
+    # under $atatdir/data/sqsdb — not here.
     if template_root and phase in SMALL_SYSTEM:
-        made = sqsgen.copy_small_systems(template_root, work_root, [phase])
-        if made:
-            print(f"    copied template: {made[0].name}")
+        print(f"    NOTE: --template-root is deprecated and ignored "
+              f"(sqs2tdb reads its own database under $atatdir); "
+              f"NOT copying {template_root} into the work root.")
 
     # SIGMA endmember-only handling (caveat 2).
     if phase in ENDMEMBER_ONLY_PHASES:
@@ -481,6 +503,8 @@ def main():
                     help="Comma-separated POTCAR paths (one per element, or a "
                          "pre-assembled multi-element POTCAR). Used for ENMAX.")
     ap.add_argument("--template-root", default=None,
+                    # deprecated 2026-07-16 — kept so old PBS scripts parse
+
                     help="Directory holding the *_small single-sublattice "
                          "template systems to copy (caveat 1).")
     ap.add_argument("--dlm", action="store_true",
