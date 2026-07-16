@@ -95,7 +95,10 @@ SQS_LEVEL="2"
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
 
-VASP_BIN="/home1/zwu6/vasp"    # directory containing vasp_std etc.
+VASP_BIN="/home1/zwu6/vasp/6.6.0/bin_PFE"  # the ACTUAL binary dir
+# (ezvasp launches vasp via ~/.ezvasp.rc regardless; having the
+#  real bin dir on PATH just makes the `which vasp_std` sanity
+#  check meaningful instead of reporting MISSING)
 SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
 # ───────────────────────── END USER CONFIG ──────────────────────────────────
 

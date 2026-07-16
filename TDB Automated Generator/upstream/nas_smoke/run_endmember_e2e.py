@@ -53,7 +53,37 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-UPSTREAM = Path(__file__).resolve().parent.parent
+
+def _locate_upstream() -> Path:
+    """Find the upstream package (runner.py, vaspwrap.py, run_upstream.py).
+
+    Intended layout: nas_smoke/ lives INSIDE the upstream/ directory, so
+    the parent is the package. But this suite gets copied around on NAS,
+    so also accept: $UPSTREAM_DIR, the script's own directory (flat
+    copy), and the cwd — with a copy-paste-able error when none work.
+    """
+    import os
+    cands = []
+    if os.environ.get("UPSTREAM_DIR"):
+        cands.append(Path(os.environ["UPSTREAM_DIR"]).expanduser())
+    here = Path(__file__).resolve().parent
+    cands += [here.parent, here, Path.cwd()]
+    for c in cands:
+        if (c / "runner.py").is_file() and (c / "vaspwrap.py").is_file():
+            return c.resolve()
+    sys.exit(
+        "ERROR: cannot find the upstream package (runner.py / "
+        "vaspwrap.py).\n"
+        "Searched: " + ", ".join(str(c) for c in cands) + "\n"
+        "nas_smoke/ must live INSIDE 'TDB Automated Generator/upstream/'."
+        "\nCopy the WHOLE upstream directory to NAS (the e2e test also "
+        "needs its run_upstream.py), e.g.:\n"
+        "    scp -r 'TDB Automated Generator/upstream' pfe:~/upstream\n"
+        "    cd ~/upstream/nas_smoke && qsub submit_smoke.pbs\n"
+        "or point at an existing copy:  export UPSTREAM_DIR=~/upstream")
+
+
+UPSTREAM = _locate_upstream()
 sys.path.insert(0, str(UPSTREAM))
 
 from strfile import validate_structure_file          # noqa: E402
