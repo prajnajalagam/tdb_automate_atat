@@ -1409,3 +1409,20 @@ def test_e2e_verifier_fails_regressed_tree(tmp_path):
     e2e.write_report(tmp_path, results, ok, {"timestamp": "t"})
     txt = (tmp_path / "e2e_report.txt").read_text()
     assert "SUITE: FAIL" in txt and "XX str_relax_valid" in txt
+
+
+def test_triage_tet_not_triggered_by_routine_bzints(tmp_path):
+    """'BZINTS: Fermi energy: 17.9; 18 electrons' is routine ISMEAR=-5
+    output, not an error (false positive on the 2026-07-16 smoke run);
+    only genuine tetrahedron failures may flag kpoints_tet."""
+    import vasp_triage
+    d = tmp_path / "case"
+    d.mkdir()
+    (d / "vasp.out").write_text(
+        " BZINTS: Fermi energy:   17.925019;   18.000000 electrons\n")
+    reports = vasp_triage.scan_tree(tmp_path)
+    assert all("kpoints_tet" not in r.categories for r in reports)
+    (d / "vasp.out").write_text("Tetrahedron method fails (number of "
+                                "k-points < 4)\n")
+    reports = vasp_triage.scan_tree(tmp_path)
+    assert any("kpoints_tet" in r.categories for r in reports)
