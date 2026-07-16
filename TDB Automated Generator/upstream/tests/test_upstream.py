@@ -1342,3 +1342,70 @@ def test_wrap_dlm_keeps_subatom_route_no_magmom():
     w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
                                  dlm=dlm, spin=True, natoms=32)
     assert "MAGMOM" not in w and "SUBATOM = s/Co+2/Co+1.8/g" in w
+
+
+# ---- endmember end-to-end verifier (nas_smoke/run_endmember_e2e.py) --------
+
+def _mk_e2e_endmember(root, name, good=True, svib=True):
+    d = root / "FCC_A1_small" / name
+    d.mkdir(parents=True)
+    _write_str(d / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    if good:
+        _write_str(d / "str_relax.out",
+                   [[3.55, 0, 0], [0, 3.55, 0], [0, 0, 3.55]])
+        (d / "energy").write_text("-7.1\n")
+        (d / "vasp.wrap").write_text("[INCAR]\nISPIN = 2\nMAGMOM = 1*3\n")
+        (d / "INCAR.relax").write_text("ISPIN = 2\nMAGMOM = 1*3\n")
+        (d / "robustrelax_infdet.log").write_text(
+            "$ robustrelax_vasp -id -c 0.05 mpiexec -n 32\n")
+        (d / "checkrelax.out").write_text("0.012\n")
+        (d / "fvasp.wrap").write_text("[INCAR]\nNSW = 0\n")
+        pert = d / "vol_0" / "p+0.2_5.1_0"
+        pert.mkdir(parents=True)
+        (pert / "force.out").write_text("0 0 0\n")
+        if svib:
+            (d / "svib_ht").write_text("3.4\n")
+        else:
+            (d / "unstable_modes.log").write_text(
+                "Unstable modes found.\nDisposition: energy-only\n")
+    else:
+        (d / "str_relax.out").write_text("1 0 0\n0 1 0\n0 0 1\n\tCo\n")
+        (d / "energy").write_text("")
+        (d / "vasp.wrap").write_text("[INCAR]\nISPIN = 2\n")   # no MAGMOM
+        (d / "robustrelax_infdet.log").write_text(
+            "$ robustrelax_vasp -id mpiexec -n 128\n")         # no -c
+    return d
+
+
+def test_e2e_verifier_grades_good_tree(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_endmember_e2e as e2e
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Co=1", good=True, svib=True)
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Cr=1", good=True, svib=False)
+    results, ok = e2e.verify_tree(tmp_path)
+    assert ok and len(results) == 2
+    cr = next(r for r in results if "Cr" in r["dir"])
+    # unstable disposition counts as correct phonon-machinery behavior
+    assert cr["checks"]["svib_or_disposition"]["pass"]
+    assert "energy-only by policy" in \
+        cr["checks"]["svib_or_disposition"]["detail"]
+
+
+def test_e2e_verifier_fails_regressed_tree(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_endmember_e2e as e2e
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Co=1", good=True)
+    bad = _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Cr=1", good=False)
+    results, ok = e2e.verify_tree(tmp_path)
+    assert not ok
+    r = next(x for x in results if x["dir"] == str(bad))
+    c = r["checks"]
+    assert not c["str_relax_valid"]["pass"]      # degenerate stub caught
+    assert not c["energy_present"]["pass"]       # empty energy caught
+    assert not c["wrap_spin_magmom"]["pass"]     # missing MAGMOM caught
+    assert not c["infdet_with_cutoff"]["pass"]   # missing -c 0.05 caught
+    assert not c["checkrelax_recorded"]["pass"]
+    # report writing works and flags the suite as FAIL
+    e2e.write_report(tmp_path, results, ok, {"timestamp": "t"})
+    txt = (tmp_path / "e2e_report.txt").read_text()
+    assert "SUITE: FAIL" in txt and "XX str_relax_valid" in txt

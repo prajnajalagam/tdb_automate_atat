@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -N e2e_fcc_em
+#PBS -q devel
+#PBS -l select=1:ncpus=32:mpiprocs=32:model=mil_ait
+#PBS -l walltime=01:45:00
+#PBS -j oe
+#PBS -o e2e_fcc_em_pbs.log
+#PBS -W group_list=a1485
+
+# ============================================================================
+#  Mini end-to-end test: REAL pipeline, FCC Co-Cr endmembers only, with
+#  phonons. Exercises generation -> convergence -> infdet relax
+#  (-id -c 0.05) -> validation/checkrelax -> fitfc force runs (fvasp.wrap)
+#  -> svib_ht promotion, then grades every step (e2e_report.txt).
+#
+#  Scope: 2 one-atom endmembers + one ~32-atom perturbation supercell
+#  each. ncpus=32 chosen deliberately: 32 ranks fits NCORE=8 x KPAR=4
+#  for the perturbation cells exactly, while the 1-atom endmembers get
+#  the adaptive NCORE=1/KPAR=1. Rank count comes from $NCPUS so the
+#  select line and the launcher cannot disagree.
+# ============================================================================
+
+set -euo pipefail
+
+# ───────────────────────── USER CONFIG (edit me) ────────────────────────────
+ELEMENT_A="Co"
+ELEMENT_B="Cr"
+POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
+TEMPLATE_ROOT="$HOME/atat/data/sqsdb"
+WORK_ROOT="/nobackupp27/pjalagam/e2e_fcc_endmembers_$(date +%Y%m%d_%H%M%S)"
+CMD_PREFIX="mpiexec -n ${NCPUS:-32}"
+FITFC_ON_UNSTABLE="mark"         # "escalate" also fine; costs a 2nd force set
+TIMEOUT_S="4800"                 # per-poll cap inside the pipeline
+
+VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
+ATAT_BIN="/home7/pjalagam/bin"
+VASP_BIN="/home1/zwu6/vasp"
+SCRIPT_DIR="${PBS_O_WORKDIR:-$PWD}"
+# ───────────────────────── END USER CONFIG ──────────────────────────────────
+
+module purge
+module load python3
+module load gcc
+module load comp-intel/2023.2.1
+module use -a /nasa/modulefiles/testing
+module load mpi-intel/2021.16
+source "$VENV_ACTIVATE"
+
+export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+mkdir -p "${WORK_ROOT}"
+{
+  echo "== module list ==";  module list 2>&1
+  echo "== which =="
+  for b in sqs2tdb runstruct_vasp robustrelax_vasp pollmach fitfc \
+           ezvasp mpiexec vasp_std; do
+      printf '%-18s %s\n' "$b" "$(command -v "$b" || echo MISSING)"
+  done
+  echo "== mpi sanity (2 ranks) =="
+  mpiexec -n 2 hostname 2>&1 || echo "MPI LAUNCH FAILED"
+} > "${WORK_ROOT}/environment.txt" 2>&1
+
+set +e
+python3 -u "${SCRIPT_DIR}/run_endmember_e2e.py" \
+    --element1 "${ELEMENT_A}" --element2 "${ELEMENT_B}" \
+    --potcars "${POTCARS}" \
+    --template-root "${TEMPLATE_ROOT}" \
+    --work-root "${WORK_ROOT}" \
+    --cmd-prefix "${CMD_PREFIX}" \
+    --env-bin "${ATAT_BIN}" \
+    --fitfc-on-unstable "${FITFC_ON_UNSTABLE}" \
+    --timeout "${TIMEOUT_S}" \
+    2>&1 | tee "${WORK_ROOT}/e2e_console.log"
+RC=${PIPESTATUS[0]}
+set -e
+
+echo ""
+echo "E2E suite exit code: ${RC}  (0 = all hard criteria green)"
+echo "Report : ${WORK_ROOT}/e2e_report.txt"
+echo "Debug  : ${WORK_ROOT}/e2e_report.json + environment.txt + upstream_live.log"
+exit "${RC}"

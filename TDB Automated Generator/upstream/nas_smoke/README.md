@@ -66,3 +66,39 @@ Typical failure signatures:
 | T4 alone fails | `-w` wrap-name path broken / frozen-run extraction | check `fvasp.wrap` was read (grep `T4_fitfc_wrap/INCAR` for `NSW = 0`) |
 | T5 alone fails | pollmach dispatch (wait files, walk-up wrap) | check `T5_pollmach/pollmach.log`; ensure `stoppoll` isn't pre-existing |
 | PASS but slow / timeout kills | node/queue contention or NELM too low to converge SCF | raise `--timeout`; NELM non-convergence still writes outputs (rc recorded) |
+
+## run_endmember_e2e.py — mini end-to-end test (FCC endmembers + phonons)
+
+Where the five-test suite above checks call paths in isolation,
+`run_endmember_e2e.py` drives the **real production entry point**
+(`run_upstream.py --phases FCC_A1 --sqs-level 0`) at the smallest
+meaningful scope: the two 1-atom Co/Cr FCC endmembers — exactly the
+cells that died in the 2026-07-14 run — through generation →
+convergence sweeps → infdet relaxation → validation/checkrelax →
+full fitfc phonons. Then it grades every step and writes
+`e2e_report.{txt,json}`.
+
+```bash
+qsub submit_endmember_e2e.pbs                       # devel queue, ~1 h
+python3 run_endmember_e2e.py --verify-only <TREE>   # re-grade any tree
+```
+
+Hard criteria (any failure fails the suite): valid `str_relax.out`,
+parseable `energy` (adopted `energy_end` counts), `ISPIN=2` + explicit
+`MAGMOM` in the wrap, `robustrelax_vasp -id -c 0.05` actually invoked,
+`checkrelax.out` recorded. Phonon criteria are graded but soft:
+`fvasp.wrap`, force runs in `vol_0/p*`, and **either** a promoted
+`svib_ht` **or** an `unstable_modes.log` disposition — FCC Cr may be
+genuinely dynamically unstable, and "energy-only by policy" is correct
+machinery behavior, not a failure.
+
+Resource note: `ncpus=32` is deliberate — 32 ranks exactly fits the
+production `NCORE=8 × KPAR=4` decomposition of the ~32-atom
+perturbation supercells, while the 1-atom endmembers get the adaptive
+`NCORE=1/KPAR=1`. Run this after `run_smoke.py` passes and before any
+full multi-phase submission.
+
+Negative control: pointed at the archived 2026-07-14 tree, the grader
+fails it with every diagnosed defect named (degenerate `str_relax.out`,
+empty `energy`, missing `MAGMOM`, missing `-c 0.05`, no
+`checkrelax.out`).
