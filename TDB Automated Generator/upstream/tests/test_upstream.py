@@ -79,19 +79,24 @@ def test_wrap_static_has_dostatic_and_algo_all():
 
 def test_wrap_relax_has_dostatic_full_dof():
     # The reference workflow keeps DOSTATIC on relax (relax + final static E).
+    # ISIF=3 + IBRION=2 = full relaxation; NSW=100 per the production INCAR.
     w = vaspwrap.build_vasp_wrap("relax", encut=300, kppra=6000)
     assert "DOSTATIC" in w
     assert "ISIF = 3" in w
     assert "IBRION = 2" in w
-    assert "NSW = 300" in w
+    assert "NSW = 100" in w
+    assert "ISMEAR = 1" in w and "SIGMA = 0.08" in w
 
 
-def test_wrap_phonon_icharg_frozen():
+def test_wrap_phonon_matches_fvasp_conventions():
+    """Frozen force-run wrap = the user's fvasp.wrap: NSW=0/IBRION=-1/
+    ISIF=2, PREC=Accurate, ALGO=Fast, and NO ICHARG=1 (hard-errors when
+    no CHGCAR exists — the first force run never has one)."""
     w = vaspwrap.build_vasp_wrap("phonon", encut=300, kppra=6000)
     assert "DOSTATIC" not in w
-    assert "ICHARG = 1" in w
-    assert "NSW = 0" in w
-    assert "LWAVE = .TRUE." in w
+    assert "ICHARG" not in w
+    assert "NSW = 0" in w and "IBRION = -1" in w and "ISIF = 2" in w
+    assert "PREC = Accurate" in w and "ALGO = Fast" in w
 
 
 def test_wrap_algo_override():
@@ -343,20 +348,21 @@ def _stub_encut_kppra(monkeypatch, calc_dir):
     doesn't need a real POTCAR."""
     monkeypatch.setattr(
         relax, "build_vasp_wrap",
-        lambda kind, encut, kppra, dlm=None, algo="All": f"# stub {kind}\n",
+        lambda kind, *a, **k: f"# stub {kind}\n",
     )
 
 
-def test_runstruct_is_now_the_default(tmp_path, monkeypatch):
-    """--relax-method default must be 'runstruct' (was 'normal')."""
+def test_infdet_is_now_the_default(tmp_path, monkeypatch):
+    """--relax-method default is 'infdet' (user decision 2026-07-15):
+    robustrelax_vasp -id with the -c 0.05 strain cutoff it REQUIRES."""
     rec = _RecCalls()
     _stub_encut_kppra(monkeypatch, tmp_path)
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
     relax.relax_structure(tmp_path, encut=400, kppra=8000)  # no method= arg
-    # runstruct: no -mk prep, one polled pollmach runstruct_vasp call.
-    assert rec.logged == [], f"runstruct should not run robustrelax_vasp -mk; got {rec.logged}"
-    assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [["robustrelax_vasp", "-id", "-c", "0.05"]], \
+        rec.polled
 
 
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
@@ -379,7 +385,8 @@ def test_robustrelax_infdet_runs_mk_first(tmp_path, monkeypatch):
     relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet",
                           infdet_opts="-t 1e-3")
     assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
-    assert rec.polled == [["robustrelax_vasp", "-id", "-idop", "-t 1e-3"]], rec.polled
+    assert rec.polled == [["robustrelax_vasp", "-id", "-c", "0.05",
+                           "-idop", "-t 1e-3"]], rec.polled
 
 
 def test_relax_rejects_unknown_method(tmp_path, monkeypatch):
@@ -498,6 +505,7 @@ def test_runstruct_gets_vasp_launcher_tokens(tmp_path, monkeypatch):
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
     relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          method="runstruct",
                           cmd_prefix="mpiexec -n 128")
     assert rec.polled == [
         ["pollmach", "runstruct_vasp", "mpiexec", "-n", "128"]], rec.polled
@@ -525,7 +533,8 @@ def test_empty_prefix_leaves_commands_unchanged(tmp_path, monkeypatch):
     _stub_encut_kppra(monkeypatch, tmp_path)
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
-    relax.relax_structure(tmp_path, encut=400, kppra=8000)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          method="runstruct")
     assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
 
 
@@ -540,8 +549,7 @@ def test_static_point_gets_launcher(tmp_path, monkeypatch):
 
     monkeypatch.setattr(converge.runner, "run_logged", fake_logged)
     monkeypatch.setattr(converge, "build_vasp_wrap",
-                        lambda kind, encut, kppra, dlm=None, algo="All":
-                        "# stub\n")
+                        lambda kind, *a, **k: "# stub\n")
     monkeypatch.setattr(converge, "energy_per_atom", lambda d: -5.0)
 
     src = tmp_path / "sqs"; src.mkdir()
@@ -593,7 +601,9 @@ def test_process_one_sqs_clears_wait_marker(tmp_path, monkeypatch):
                         lambda *a, **k: (400, 6000, fake_res, fake_res))
 
     def fake_relax(calc_dir, **kwargs):
-        (Path(calc_dir) / "str_relax.out").write_text("relaxed\n")
+        (Path(calc_dir) / "str_relax.out").write_text(
+            "1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n"
+            "0 0 0 Co\n")
         return Path(calc_dir) / "str_relax.out"
 
     monkeypatch.setattr(run_upstream.relax, "relax_structure", fake_relax)
@@ -698,7 +708,8 @@ def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
     assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
     polled = [c for k, c in calls if k == "polled"]
     assert len(polled) == 1, "only the force runs need pollmach"
-    assert polled[0][:2] == ["pollmach", "runstruct_vasp"]
+    assert polled[0][:4] == ["pollmach", "runstruct_vasp",
+                             "-w", "fvasp.wrap"]
     assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
     # svib_ht promoted top-level for sqs2tdb -fit
     assert (sqs / "svib_ht").read_text() == "3.21\n"
@@ -759,10 +770,11 @@ def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
     assert fitfc_gen_calls[0] == fitfc_gen_calls[1], \
         "fitfc must be re-run with the SAME command-line options"
     assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
-    # per-vol relax wraps removed so p* force runs see the frozen top wrap
+    # per-vol relax wraps removed; force runs use the separate top-level
+    # fvasp.wrap (selected with -w), never the relax-stage vasp.wrap
     for vol in sqs.glob("vol_*"):
         assert not (vol / "vasp.wrap").is_file()
-    assert (sqs / "vasp.wrap").is_file()
+    assert (sqs / "fvasp.wrap").is_file()
     assert (sqs / "svib_ht").read_text() == "3.3\n"
 
 
@@ -1174,6 +1186,8 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     assert plan["T1_static"]["argv"] == ["runstruct_vasp",
                                          "mpiexec", "-n", "8"]
     assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
+    assert plan["T3_robustrelax"]["argv"][:4] == \
+        ["robustrelax_vasp", "-id", "-c", "0.05"]
     assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
                                                  "fvasp.wrap"]
     assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
@@ -1187,3 +1201,211 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     # smoke wraps are tiny-run tuned and spin-off (plumbing test)
     w = (tmp_path / "T1_static" / "vasp.wrap").read_text()
     assert "NELM = 25" in w and "NCORE = 1" in w and "ISPIN" not in w
+
+
+# ---- CoCr-run regression fixes (diagnosed from real NAS outputs) -----------
+
+from strfile import validate_structure_file
+
+
+def test_parallel_overrides_small_cells():
+    assert vaspwrap.parallel_overrides(1) == {"NCORE": 1, "KPAR": 1}
+    assert vaspwrap.parallel_overrides(8) == {"NCORE": 2, "KPAR": 2}
+    assert vaspwrap.parallel_overrides(30) == {}
+    assert vaspwrap.parallel_overrides(None) == {}
+    w = vaspwrap.build_vasp_wrap("static", encut=300, kppra=1000, natoms=1)
+    assert "NCORE = 1" in w and "KPAR = 1" in w
+    w = vaspwrap.build_vasp_wrap("static", encut=300, kppra=1000, natoms=30)
+    assert "NCORE = 8" in w and "KPAR = 4" in w
+
+
+def test_validate_structure_file_catches_degenerate_stub(tmp_path):
+    """Exact stub robustrelax/infdet left behind in the real Co-Cr run
+    after its inner VASP crashed."""
+    stub = tmp_path / "str_relax.out"
+    stub.write_text("1 0 0\n0 1 0\n0 0 1\n\tCo\n")
+    ok, why = validate_structure_file(stub)
+    assert not ok and "no atom lines" in why
+    ok, why = validate_structure_file(tmp_path / "nope.out")
+    assert not ok and why == "missing"
+    good = tmp_path / "good.out"
+    good.write_text("1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n"
+                    "0 0 0 Co\n")
+    ok, why = validate_structure_file(good)
+    assert ok and "1 atoms" in why
+
+
+def test_process_one_sqs_failed_relax_skips_phonons(tmp_path, monkeypatch):
+    import types
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    (sqs / "wait").write_text("")
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def stub_relax(calc_dir, **kwargs):
+        (Path(calc_dir) / "str_relax.out").write_text(
+            "1 0 0\n0 1 0\n0 0 1\n\tCo\n")     # the degenerate stub
+        (Path(calc_dir) / "energy").write_text("")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", stub_relax)
+    monkeypatch.setattr(run_upstream.phonon, "run_fitfc",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("phonons must not run")))
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="infdet", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=False, timeout=60)
+
+    assert res["relax_ok"] is False and "no atom lines" in res["relax_msg"]
+    assert res["phonon_out"] is None
+    assert res["energy_present"] is False
+    assert (sqs / "wait").exists(), "wait must NOT be cleared on failure"
+
+
+def test_process_one_sqs_adopts_infdet_energy_end(tmp_path, monkeypatch):
+    """robustrelax -id writes energy_end and often leaves `energy` empty
+    even on success (seen in the real run); the pipeline must adopt it."""
+    import types
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def infdet_relax(calc_dir, **kwargs):
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[3.6, 0, 0], [0, 3.6, 0], [0, 0, 3.6]])
+        (Path(calc_dir) / "energy").write_text("")            # empty!
+        (Path(calc_dir) / "energy_end").write_text("-.13017812E+03\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", infdet_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="infdet", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert res["relax_ok"] is True and res["energy_present"] is True
+    assert float((sqs / "energy").read_text().split()[0]) == \
+        pytest.approx(-130.17812)
+
+
+def test_vasp_triage_reads_gz_and_suffixed_logs(tmp_path):
+    import gzip as _gzip
+    import vasp_triage
+    d = tmp_path / "case"
+    d.mkdir()
+    with _gzip.open(d / "OUTCAR.static.gz", "wt") as fh:
+        fh.write("|  ---->  I REFUSE TO CONTINUE WITH THIS SICK JOB ..."
+                 " BYE!!! <----  |\n")
+    (d / "vasp.out.static").write_text(
+        " POSCAR found :  0 types and       0 ions\n")
+    reports = vasp_triage.scan_tree(tmp_path)
+    assert len(reports) == 1
+    ids = {f.error_id for f in reports[0].findings}
+    assert "sick_job" in ids and "empty_poscar" in ids
+    assert reports[0].outcar_seen is True
+
+
+# ---- MAGMOM generation (user correction 2026-07-15) -------------------------
+
+def test_wrap_spin_writes_uniform_magmom_and_mixing():
+    """Spin-on wraps must carry an explicit MAGMOM (the 2026-07-14 run's
+    OUTCARs all warned about the missing tag) — uniform init moment via
+    VASP multiplier syntax, order-independent — plus the production
+    INCAR's magnetic-mixing keys."""
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 spin=True, natoms=32)
+    assert "ISPIN = 2" in w and "MAGMOM = 32*3" in w
+    assert "AMIX = 0.03" in w and "AMIX_MAG = 0.8" in w
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 spin=True, natoms=8, magmom_init=1.5)
+    assert "MAGMOM = 8*1.5" in w
+
+
+def test_wrap_spin_without_natoms_omits_magmom():
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=True)
+    assert "ISPIN = 2" in w and "MAGMOM" not in w
+
+
+def test_wrap_dlm_keeps_subatom_route_no_magmom():
+    dlm = DLMConfig(enabled=True, subatom={"Co": ("Co", 1.8)})
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 dlm=dlm, spin=True, natoms=32)
+    assert "MAGMOM" not in w and "SUBATOM = s/Co+2/Co+1.8/g" in w
+
+
+# ---- endmember end-to-end verifier (nas_smoke/run_endmember_e2e.py) --------
+
+def _mk_e2e_endmember(root, name, good=True, svib=True):
+    d = root / "FCC_A1_small" / name
+    d.mkdir(parents=True)
+    _write_str(d / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    if good:
+        _write_str(d / "str_relax.out",
+                   [[3.55, 0, 0], [0, 3.55, 0], [0, 0, 3.55]])
+        (d / "energy").write_text("-7.1\n")
+        (d / "vasp.wrap").write_text("[INCAR]\nISPIN = 2\nMAGMOM = 1*3\n")
+        (d / "INCAR.relax").write_text("ISPIN = 2\nMAGMOM = 1*3\n")
+        (d / "robustrelax_infdet.log").write_text(
+            "$ robustrelax_vasp -id -c 0.05 mpiexec -n 32\n")
+        (d / "checkrelax.out").write_text("0.012\n")
+        (d / "fvasp.wrap").write_text("[INCAR]\nNSW = 0\n")
+        pert = d / "vol_0" / "p+0.2_5.1_0"
+        pert.mkdir(parents=True)
+        (pert / "force.out").write_text("0 0 0\n")
+        if svib:
+            (d / "svib_ht").write_text("3.4\n")
+        else:
+            (d / "unstable_modes.log").write_text(
+                "Unstable modes found.\nDisposition: energy-only\n")
+    else:
+        (d / "str_relax.out").write_text("1 0 0\n0 1 0\n0 0 1\n\tCo\n")
+        (d / "energy").write_text("")
+        (d / "vasp.wrap").write_text("[INCAR]\nISPIN = 2\n")   # no MAGMOM
+        (d / "robustrelax_infdet.log").write_text(
+            "$ robustrelax_vasp -id mpiexec -n 128\n")         # no -c
+    return d
+
+
+def test_e2e_verifier_grades_good_tree(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_endmember_e2e as e2e
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Co=1", good=True, svib=True)
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Cr=1", good=True, svib=False)
+    results, ok = e2e.verify_tree(tmp_path)
+    assert ok and len(results) == 2
+    cr = next(r for r in results if "Cr" in r["dir"])
+    # unstable disposition counts as correct phonon-machinery behavior
+    assert cr["checks"]["svib_or_disposition"]["pass"]
+    assert "energy-only by policy" in \
+        cr["checks"]["svib_or_disposition"]["detail"]
+
+
+def test_e2e_verifier_fails_regressed_tree(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import run_endmember_e2e as e2e
+    _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Co=1", good=True)
+    bad = _mk_e2e_endmember(tmp_path, "sqs_lev=0_a_Cr=1", good=False)
+    results, ok = e2e.verify_tree(tmp_path)
+    assert not ok
+    r = next(x for x in results if x["dir"] == str(bad))
+    c = r["checks"]
+    assert not c["str_relax_valid"]["pass"]      # degenerate stub caught
+    assert not c["energy_present"]["pass"]       # empty energy caught
+    assert not c["wrap_spin_magmom"]["pass"]     # missing MAGMOM caught
+    assert not c["infdet_with_cutoff"]["pass"]   # missing -c 0.05 caught
+    assert not c["checkrelax_recorded"]["pass"]
+    # report writing works and flags the suite as FAIL
+    e2e.write_report(tmp_path, results, ok, {"timestamp": "t"})
+    txt = (tmp_path / "e2e_report.txt").read_text()
+    assert "SUITE: FAIL" in txt and "XX str_relax_valid" in txt

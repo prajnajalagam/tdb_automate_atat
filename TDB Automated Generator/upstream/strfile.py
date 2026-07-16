@@ -210,3 +210,30 @@ def lattice_drift(ideal_path: Path, relaxed_path: Path) -> float:
     """cell_distortion() straight from two ATAT structure files."""
     return cell_distortion(parse_cell(read_structure(ideal_path)),
                            parse_cell(read_structure(relaxed_path)))
+
+
+def validate_structure_file(path: Path) -> Tuple[bool, str]:
+    """Is this a USABLE ATAT structure file? (exists, has a parseable
+    non-singular cell, and at least one atom line with coordinates).
+
+    Motivated by a real failure: robustrelax/infdet left a degenerate
+    str_relax.out stub ("1 0 0 / 0 1 0 / 0 0 1 / <tab>Co") after its
+    inner VASP crashed — the file EXISTS, so existence checks pass, and
+    the garbage then propagates into checkrelax and fitfc ("Lattice
+    vectors are coplanar"). Returns (ok, reason).
+    """
+    p = Path(path)
+    if not p.is_file():
+        return False, "missing"
+    try:
+        st = read_structure(p)
+    except OSError as exc:
+        return False, f"unreadable ({exc})"
+    if not st.atoms:
+        return False, "no atom lines with coordinates (degenerate stub " \
+                      "— the relaxation likely crashed)"
+    try:
+        parse_cell(st)
+    except (ValueError, IndexError) as exc:
+        return False, f"bad cell header ({exc})"
+    return True, f"ok ({len(st.atoms)} atoms)"

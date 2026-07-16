@@ -99,9 +99,21 @@ def dlm_fixup(sqs_dir: Path,
 
 def _write_phonon_wrap(calc_dir: Path, encut: int, kppra: int,
                        dlm: Optional[DLMConfig], algo: str) -> None:
+    # natoms from the SQS cell: perturbation supercells are LARGER, so
+    # the small-cell NCORE/KPAR override is conservative there — safe
+    # (slightly under-parallel) rather than crash-prone.
+    try:
+        from strfile import read_structure
+        natoms = len(read_structure(Path(calc_dir) / "str.out").atoms) or None
+    except OSError:
+        natoms = None
     wrap = build_vasp_wrap("phonon", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo)
-    (Path(calc_dir) / "vasp.wrap").write_text(wrap)
+                           dlm=dlm, algo=algo, natoms=natoms)
+    # Separate wrap FILE (fvasp.wrap) so the frozen force-run settings
+    # never clobber (or get shadowed by) the relax-stage vasp.wrap that
+    # already lives in the SQS dir; the force runs select it with
+    # `runstruct_vasp -w fvasp.wrap` (the fitfc convention).
+    (Path(calc_dir) / "fvasp.wrap").write_text(wrap)
 
 
 def build_fitfc_gen_args(ernn: Optional[float], er: Optional[float],
@@ -315,8 +327,10 @@ def run_fitfc(sqs_dir: Path,
                                     dr=dr, nrr=nrr)
     vasp_launch = runner.split_prefix(cmd_prefix)
 
-    # Frozen-geometry wrap at the TOP level: runstruct_vasp searches
-    # upward for vasp.wrap, so the vol_*/p*/ force runs inherit this one.
+    # Frozen-geometry wrap at the TOP level as fvasp.wrap: the vol_*/p*/
+    # force runs are launched with `runstruct_vasp -w fvasp.wrap` and
+    # find it via the upward wrap search, without touching the relax
+    # stage's vasp.wrap.
     _write_phonon_wrap(sqs_dir, encut, kppra, dlm, algo)
 
     # 1. generate. With -nrr this single invocation writes vol_* AND the
@@ -335,8 +349,13 @@ def run_fitfc(sqs_dir: Path,
         #     to the frozen wrap for their force runs.
         pending = [d for d in vol_dirs if not (d / "str_relax.out").is_file()]
         if pending:
+            try:
+                from strfile import read_structure
+                nat = len(read_structure(sqs_dir / "str.out").atoms) or None
+            except OSError:
+                nat = None
             relax_wrap = build_vasp_wrap("relax", encut=encut, kppra=kppra,
-                                         dlm=dlm, algo=algo,
+                                         dlm=dlm, algo=algo, natoms=nat,
                                          extra={"ISIF": 2})
             for d in pending:
                 (d / "vasp.wrap").write_text(relax_wrap)
@@ -368,11 +387,13 @@ def run_fitfc(sqs_dir: Path,
                 if not (d / "energy").is_file():
                     shutil.copy2(top_energy, d / "energy")
 
-    # 3. force runs for the perturbations (frozen wrap, launcher LAST).
+    # 3. force runs for the perturbations (frozen fvasp.wrap via -w,
+    #    launcher LAST).
     pert_dirs = _pert_dirs(sqs_dir)
     if pert_dirs:
         runner.run_polled(
-            ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
+            ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
+            + vasp_launch, cwd=sqs_dir,
             log=sqs_dir / "fitfc_force_runs.log",
             done_when=all_force_runs_done(pert_dirs),
             stop_sentinel="stoppoll",
@@ -435,7 +456,8 @@ def run_fitfc(sqs_dir: Path,
                     if not (d / "force.out").is_file()]
         if new_pert:
             runner.run_polled(
-                ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=sqs_dir,
+                ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
+                + vasp_launch, cwd=sqs_dir,
                 log=sqs_dir / "fitfc_force_runs_escalated.log",
                 done_when=all_force_runs_done(new_pert),
                 stop_sentinel="stoppoll",

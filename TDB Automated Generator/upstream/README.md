@@ -48,9 +48,16 @@ For each SQS (and each SIGMA endmember):
      setting's — is within `--tol-ev` (default **1 meV/atom**) of the
      highest-setting reference.
    - `ALGO = All` by default.
-3. **Relaxation** — `--relax-method normal` (robustrelax) or `infdet`
-   (inflection detection), using the converged ENCUT/KPPRA. Produces
-   `str_relax.out`.
+3. **Relaxation** — `--relax-method infdet` is the DEFAULT (user
+   decision 2026-07-15): `robustrelax_vasp -mk` then
+   `robustrelax_vasp -id -c 0.05 <launcher>` — inflection detection
+   with the 5% strain cutoff it requires to engage (override the
+   cutoff via `--relax-opts "-c 0.10"`). `normal` (plain robustrelax)
+   and `runstruct` remain available. Uses the converged KPPRA and the
+   Pulay-floored ENCUT; the result is VALIDATED (parseable cell +
+   atoms) before the pipeline moves on, and the energy is taken from
+   infdet's `energy_end` when the plain `energy` file is empty.
+   ISIF=3 / IBRION=2 / ISMEAR=1 / NSW=100 per the production INCAR.
 4. **Phonons** — the `fitfc` workflow, verified against the
    `$atatdir/src/fitfc.c++` source. Default recipe is the sqs2tdb
    vibrational (harmonic) one:
@@ -94,6 +101,15 @@ For each SQS (and each SIGMA endmember):
    temperature-dependent `fvib`, drop a `Trange.in` (e.g. `2000 21`) in
    the **phase directory** — fitfc reads `../Trange.in` relative to each
    SQS dir; `svib_ht` itself is the T-independent high-T limit.
+
+Spin-polarized (non-DLM) runs write an explicit
+`MAGMOM = <natoms>*3` line (uniform 3 μB initialization, the
+production-INCAR convention; `--magmom-init` to change) plus the
+magnetic-mixing keys — VASP's "did not specify MAGMOM" warning means a
+wrap predates this and should be regenerated. fitfc force runs use a
+separate `fvasp.wrap` (PREC=Accurate, ISIF=2 frozen statics) selected
+with `runstruct_vasp -w fvasp.wrap`, so they never clobber the relax
+wrap.
 
 With `--dlm`, random spins are applied after SQS generation: `randomspin` is
 run inside each `*_small` directory so `str.out` gains `+2` / `-2` tags, which

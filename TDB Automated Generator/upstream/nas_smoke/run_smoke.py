@@ -15,10 +15,10 @@ own modules, it does not re-implement them):
   T2_runstruct   runstruct_vasp relaxation (NSW-capped) — the
                  --relax-method runstruct path. Checks str_relax.out,
                  energy, force.out extraction.
-  T3_robustrelax robustrelax_vasp -mk, then robustrelax_vasp with the
-                 launcher trailing — the --relax-method normal path,
-                 early-stopped via the 'stop' sentinel as soon as
-                 str_relax.out appears (relax.relax_structure).
+  T3_robustrelax robustrelax_vasp -mk, then robustrelax_vasp -id -c 0.05
+                 with the launcher trailing — the --relax-method infdet
+                 path (the production default), early-stopped via the
+                 'stop' sentinel as soon as str_relax.out appears.
   T4_fitfc_wrap  runstruct_vasp -w fvasp.wrap on a frozen, displaced
                  cell — the fitfc force-run convention (separate wrap
                  file, NSW=0, forces extracted to force.out).
@@ -141,12 +141,15 @@ def build_cases(workdir: Path, element: str,
                   wrap_extra={"NSW": 5, "EDIFFG": -0.3})
     cases.append({
         "test": "T3_robustrelax", "dir": str(d3),
-        "argv": ["robustrelax_vasp"] + launch,      # preceded by -mk
+        # The production default: inflection detection with its
+        # REQUIRED strain cutoff (reference job: -id -c 0.05).
+        "argv": ["robustrelax_vasp", "-id", "-c", "0.05"] + launch,
         "pre_argv": ["robustrelax_vasp", "-mk"],
         "expect": ["str_relax.out"],
         "log": "robustrelax.log",
-        "covers": "--relax-method normal chain (-mk prep + crash-"
-                  "tolerant relax loop, stop sentinel early-exit)"})
+        "covers": "--relax-method infdet chain (default: -mk prep + "
+                  "robustrelax_vasp -id -c 0.05, stop sentinel "
+                  "early-exit)"})
 
     # T4: fitfc force-run convention — frozen wrap under a SEPARATE
     # file name, selected with runstruct_vasp -w fvasp.wrap.

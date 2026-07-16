@@ -214,15 +214,42 @@ def process_one_sqs(sqs_dir: Path,
         method=relax_method, dlm=dlm, algo=algo,
         env_bin=env_bin, timeout=timeout,
         cmd_prefix=cmd_prefix, relax_opts=relax_opts)
+    # Validate the RESULT, not just file existence: a crashed
+    # robustrelax/infdet leaves a degenerate str_relax.out stub (seen in
+    # the real Co-Cr run: identity cell + coordinate-less atom line),
+    # which then poisons checkrelax and fitfc downstream.
+    from strfile import validate_structure_file
+    relax_ok, relax_msg = validate_structure_file(sqs_dir / "str_relax.out")
     stamp(f"[{sqs_dir.name}] STAGE 2/3 relaxation done "
-          f"(str_relax.out present: "
-          f"{(sqs_dir / 'str_relax.out').is_file()})")
+          f"(str_relax.out: {relax_msg})")
+    if not relax_ok:
+        stamp(f"[{sqs_dir.name}] STAGE 2/3 RELAXATION FAILED — "
+              f"str_relax.out unusable; phonons will be SKIPPED. "
+              f"Triage the VASP logs (python3 vasp_triage.py {sqs_dir})")
+
+    # robustrelax -id (infdet) reports its result in energy_end (the
+    # inflection-detection energy); the plain `energy` file is often
+    # left EMPTY even on success. Downstream reads `energy`, so adopt
+    # energy_end when energy is missing/unparseable.
+    def _parseable(pth: Path) -> bool:
+        try:
+            float(pth.read_text().split()[0])
+            return True
+        except (OSError, ValueError, IndexError):
+            return False
+
+    energy_f = sqs_dir / "energy"
+    energy_end_f = sqs_dir / "energy_end"
+    if relax_ok and not _parseable(energy_f) and _parseable(energy_end_f):
+        energy_f.write_text(energy_end_f.read_text())
+        stamp(f"[{sqs_dir.name}] energy adopted from infdet energy_end "
+              f"({energy_end_f.read_text().strip()})")
 
     # Clear the ATAT 'wait' queue marker once the relax has produced its
     # result — sqs2tdb -cp drops a `wait` file in every to-be-computed
     # dir, and pollmach-style pollers treat its presence as "pending".
     # Mirrors the manual `rm wait` in the reference NAS workflow.
-    if (sqs_dir / "str_relax.out").is_file():
+    if relax_ok:
         wait_marker = sqs_dir / "wait"
         if wait_marker.is_file():
             wait_marker.unlink()
@@ -233,7 +260,7 @@ def process_one_sqs(sqs_dir: Path,
     # it. Value recorded in checkrelax.out; drift beyond max_checkrelax
     # additionally drops a relaxaway.flag marker.
     checkrelax_val = None
-    if (sqs_dir / "str_relax.out").is_file():
+    if relax_ok:
         try:
             from strfile import lattice_drift
             checkrelax_val = lattice_drift(sqs_dir / "str.out",
@@ -256,10 +283,12 @@ def process_one_sqs(sqs_dir: Path,
                   f"{exc}")
 
     phonon_out = None
-    if not skip_phonon:
+    if not relax_ok:
+        stamp(f"[{sqs_dir.name}] STAGE 3/3 skipped (failed relaxation)")
+    elif not skip_phonon:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
         phonon_out = str(phonon.run_fitfc(
-            sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
+            sqs_dir, encut=relax_encut, kppra=chosen_kppra,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
             cmd_prefix=cmd_prefix, **(fitfc_opts or {})))
         unstable_log = sqs_dir / "unstable_modes.log"
@@ -281,6 +310,9 @@ def process_one_sqs(sqs_dir: Path,
         "encut_converged": eres.converged if eres else None,
         "relax_method": relax_method,
         "str_relax_present": (sqs_dir / "str_relax.out").is_file(),
+        "relax_ok": relax_ok,
+        "relax_msg": relax_msg,
+        "energy_present": _parseable(sqs_dir / "energy"),
         "checkrelax": checkrelax_val,
         "relaxed_away": (sqs_dir / "relaxaway.flag").is_file(),
         "phonon_out": phonon_out,
@@ -466,12 +498,15 @@ def main():
                     help="VASP ALGO (default 'All' per spec; use 'Fast' to "
                          "match the reference vasp.wrap).")
     ap.add_argument("--relax-method",
-                    choices=["runstruct", "normal", "infdet"],
-                    default="runstruct",
-                    help="Structural relaxation method. 'runstruct' "
-                         "(default) invokes 'pollmach runstruct_vasp' — "
-                         "simplest, fastest for well-converged cases. "
-                         "'normal' and 'infdet' both wrap "
+                    choices=["infdet", "normal", "runstruct"],
+                    default="infdet",
+                    help="Structural relaxation method. 'infdet' "
+                         "(default) runs robustrelax_vasp -id -c 0.05 — "
+                         "inflection detection with the 5%% strain "
+                         "cutoff it needs to engage (override -c via "
+                         "--relax-opts). 'runstruct' invokes 'pollmach "
+                         "runstruct_vasp' — simplest for well-behaved "
+                         "cases. 'normal' and 'infdet' both wrap "
                          "robustrelax_vasp and are automatically "
                          "preceded by 'robustrelax_vasp -mk' to build "
                          "the input files robustrelax needs.")
@@ -556,6 +591,11 @@ def main():
                          f"{sorted(vaspwrap.MAGNETIC_3D)} and the run is "
                          "not DLM — non-magnetic energies for these metals "
                          "are wrong by tens of meV/atom.")
+    ap.add_argument("--magmom-init", type=float, default=None,
+                    help="Uniform initial magnetic moment (muB/atom) for "
+                         "the MAGMOM line of spin-polarized non-DLM runs "
+                         "(default 3, the production-INCAR convention). "
+                         "DLM runs set moments via SUBATOM instead.")
     ap.add_argument("--spin", action="store_true",
                     help="Force ISPIN=2 even for elements outside the "
                          "magnetic-3d set.")
@@ -626,9 +666,12 @@ def main():
         spin_on = args.spin or vaspwrap.wants_spin(
             [args.element1, args.element2])
     vaspwrap.DEFAULT_SPIN = spin_on and not args.dlm
+    if args.magmom_init is not None:
+        vaspwrap.DEFAULT_MAGMOM_INIT = args.magmom_init
     print(f"  Spin        : "
           + ("DLM (SUBATOM moments)" if args.dlm else
-             ("ISPIN=2, VASP-default init moments" if vaspwrap.DEFAULT_SPIN
+             (f"ISPIN=2, MAGMOM={vaspwrap.DEFAULT_MAGMOM_INIT:g} muB/atom "
+              f"init" if vaspwrap.DEFAULT_SPIN
               else "off (ISPIN=1)"))
           + ("  [--no-spin]" if args.no_spin else ""))
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
@@ -662,6 +705,8 @@ def main():
         "relax_opts": args.relax_opts,
         "fitfc_opts": fitfc_opts,
         "spin_polarized": vaspwrap.DEFAULT_SPIN,
+        "magmom_init": vaspwrap.DEFAULT_MAGMOM_INIT
+                       if vaspwrap.DEFAULT_SPIN else None,
         "convergence_scope": args.convergence_scope,
         "max_checkrelax": args.max_checkrelax,
         "phases": [],

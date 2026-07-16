@@ -29,6 +29,15 @@ import potcar
 import runner
 from strfile import read_structure
 from vaspwrap import build_vasp_wrap
+
+
+def _count_atoms(str_out) -> "int | None":
+    """Atom count for the NCORE/KPAR guard; None if unreadable."""
+    try:
+        from strfile import read_structure
+        return len(read_structure(str_out).atoms) or None
+    except OSError:
+        return None
 from phases import DLMConfig
 
 # Default convergence tolerance: 1 meV/atom.
@@ -153,8 +162,9 @@ def run_static_point(src_sqs: Path,
         if s.is_file():
             shutil.copy2(s, dst / fn)
 
+    natoms = _count_atoms(dst / "str.out")
     wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo)
+                           dlm=dlm, algo=algo, natoms=natoms)
     (dst / "vasp.wrap").write_text(wrap)
 
     runner.run_logged(["runstruct_vasp"] + runner.split_prefix(cmd_prefix),

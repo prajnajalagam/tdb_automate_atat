@@ -9,7 +9,7 @@
 #PBS -W group_list=a1485
 
 # ============================================================================
-#  Upstream generator submission template (Milan/AIT, 128 cores)
+#  Upstream generator submission template (Milan/AIT)
 #  Generates SQS, runs ENCUT/KPPRA convergence, relaxation, and fitfc phonons,
 #  driving VASP on the node. Output tree feeds sqs2tdb_pipeline.py.
 #
@@ -28,10 +28,12 @@ WORK_ROOT="/nobackupp27/pjalagam/${ELEMENT_A}${ELEMENT_B}_upstream"
 POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
 
 # Directory holding the *_small single-sublattice template systems (caveat 1).
-TEMPLATE_ROOT="atat/data/sqsdb"
+TEMPLATE_ROOT="$HOME/atat/data/sqsdb"   # absolute — a relative path
+                                        # resolves against the job cwd
 
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
-RELAX_METHOD="infdet"            # normal | infdet
+RELAX_METHOD="infdet"            # infdet (default: robustrelax -id -c 0.05)
+                                 # | normal | runstruct
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
 
 # Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
@@ -51,13 +53,15 @@ MAX_CHECKRELAX="0.1"
 # take it as TRAILING arguments (reference NAS job:
 #   robustrelax_vasp -id -c 0.05 mpiexec -n 128
 # ). REQUIRED on mil_ait: the MPI vasp binary dies without its launcher
-# and every run fails with "unable to open OSZICAR". Match -n to the
-# ncpus in the #PBS select line above.
-CMD_PREFIX="mpiexec -n 32"
+# and every run fails with "unable to open OSZICAR". The rank count is
+# taken from $NCPUS (set by PBS to the ncpus in the select line) so the
+# two can never disagree again — the 2026-07-14 CoCr run oversubscribed
+# 128 ranks onto 32 cores because they were edited independently.
+CMD_PREFIX="mpiexec -n ${NCPUS:-32}"
 
-# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet,
-# e.g. "-c 0.05" (constraint tolerance from the reference job).
-# Ignored for runstruct. Leave empty for defaults.
+# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet.
+# infdet already gets "-c 0.05" automatically; set e.g. "-c 0.10"
+# here to override the strain cutoff. Ignored for runstruct.
 RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"
@@ -105,6 +109,11 @@ set -x
 module purge
 module load python3
 module load gcc
+# Match the reference NAS PBS for VASP on mil_ait (these two were lost
+# in the 2026-07 merge; the Intel-MPI runtime comes from them).
+module load comp-intel/2023.2.1
+module use -a /nasa/modulefiles/testing
+module load mpi-intel/2021.16
 source "$VENV_ACTIVATE"
 
 export PATH="${ATAT_BIN}:${VASP_BIN}:${PATH}"
