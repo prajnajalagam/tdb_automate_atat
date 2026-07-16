@@ -97,23 +97,46 @@ def dlm_fixup(sqs_dir: Path,
     return changed
 
 
-def _write_phonon_wrap(calc_dir: Path, encut: int, kppra: int,
-                       dlm: Optional[DLMConfig], algo: str) -> None:
-    # natoms from the SQS cell: perturbation supercells are LARGER, so
-    # the small-cell NCORE/KPAR override is conservative there — safe
-    # (slightly under-parallel) rather than crash-prone.
+def _count_atoms(str_out: Path) -> Optional[int]:
     try:
         from strfile import read_structure
-        natoms = len(read_structure(Path(calc_dir) / "str.out").atoms) or None
+        return len(read_structure(str_out).atoms) or None
     except OSError:
-        natoms = None
+        return None
+
+
+def _write_force_wrap(sqs_dir: Path, pert_dirs: List[Path],
+                      encut: int, kppra: int,
+                      dlm: Optional[DLMConfig], algo: str) -> None:
+    """Write fvasp.wrap sized for the PERTURBATION SUPERCELL.
+
+    The force runs execute in vol_*/p*/ on the enclosing supercell
+    fitfc built (e.g. 8 atoms for a 1-atom FCC endmember at -ernn=2),
+    NOT on the SQS cell. MAGMOM must have exactly NIONS entries —
+    VASP 6.6 hard-errors otherwise ("You have set 1 value(s) for
+    MAGMOM; ... NIONS=8", seen in the 2026-07-16 e2e run when the
+    wrap was sized from the 1-atom SQS cell). So this wrap is written
+    AFTER fitfc generation, counting atoms from the first pending
+    perturbation dir; it is also REwritten before escalated force
+    runs, whose regenerated supercells are larger again. All p* dirs
+    of a batch share one supercell, so one wrap per batch is exact.
+
+    Separate wrap FILE (fvasp.wrap) so the frozen force-run settings
+    never clobber (or get shadowed by) the relax-stage vasp.wrap in
+    the same directory; the force runs select it with
+    `runstruct_vasp -w fvasp.wrap` (the fitfc convention).
+    """
+    natoms = None
+    for d in pert_dirs:
+        for name in ("str.out", "str_unpert.out"):
+            natoms = _count_atoms(d / name)
+            if natoms:
+                break
+        if natoms:
+            break
     wrap = build_vasp_wrap("phonon", encut=encut, kppra=kppra,
                            dlm=dlm, algo=algo, natoms=natoms)
-    # Separate wrap FILE (fvasp.wrap) so the frozen force-run settings
-    # never clobber (or get shadowed by) the relax-stage vasp.wrap that
-    # already lives in the SQS dir; the force runs select it with
-    # `runstruct_vasp -w fvasp.wrap` (the fitfc convention).
-    (Path(calc_dir) / "fvasp.wrap").write_text(wrap)
+    (Path(sqs_dir) / "fvasp.wrap").write_text(wrap)
 
 
 def build_fitfc_gen_args(ernn: Optional[float], er: Optional[float],
@@ -327,11 +350,10 @@ def run_fitfc(sqs_dir: Path,
                                     dr=dr, nrr=nrr)
     vasp_launch = runner.split_prefix(cmd_prefix)
 
-    # Frozen-geometry wrap at the TOP level as fvasp.wrap: the vol_*/p*/
-    # force runs are launched with `runstruct_vasp -w fvasp.wrap` and
-    # find it via the upward wrap search, without touching the relax
-    # stage's vasp.wrap.
-    _write_phonon_wrap(sqs_dir, encut, kppra, dlm, algo)
+    # NOTE: fvasp.wrap is written AFTER generation (see
+    # _write_force_wrap) — its MAGMOM must be sized for the
+    # perturbation supercell, whose atom count only exists once fitfc
+    # has built the p* dirs.
 
     # 1. generate. With -nrr this single invocation writes vol_* AND the
     #    perturbation dirs (vol str_relax.out exists immediately).
@@ -388,9 +410,10 @@ def run_fitfc(sqs_dir: Path,
                     shutil.copy2(top_energy, d / "energy")
 
     # 3. force runs for the perturbations (frozen fvasp.wrap via -w,
-    #    launcher LAST).
+    #    launcher LAST). Wrap sized for the perturbation supercell.
     pert_dirs = _pert_dirs(sqs_dir)
     if pert_dirs:
+        _write_force_wrap(sqs_dir, pert_dirs, encut, kppra, dlm, algo)
         runner.run_polled(
             ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
             + vasp_launch, cwd=sqs_dir,
@@ -455,6 +478,9 @@ def run_fitfc(sqs_dir: Path,
         new_pert = [d for d in _pert_dirs(sqs_dir)
                     if not (d / "force.out").is_file()]
         if new_pert:
+            # Escalated supercells are larger (bigger -ernn): resize
+            # the wrap's MAGMOM/decomposition for the NEW batch.
+            _write_force_wrap(sqs_dir, new_pert, encut, kppra, dlm, algo)
             runner.run_polled(
                 ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
                 + vasp_launch, cwd=sqs_dir,

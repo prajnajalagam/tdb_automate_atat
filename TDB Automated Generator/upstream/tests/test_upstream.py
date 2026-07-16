@@ -1477,3 +1477,52 @@ def test_e2e_find_endmembers_skips_raw_db_dirs(tmp_path):
     (raw / "str.out").write_text("raw db\n")
     dirs = e2e.find_endmember_dirs(tmp_path)
     assert [d.name for d in dirs] == ["sqs_lev=0_a_Co=1"]
+
+
+
+# ---- fvasp.wrap sized for the perturbation supercell (2026-07-16) ----------
+
+def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
+    """VASP 6.6: MAGMOM must have exactly NIONS values. The force runs
+    execute in the perturbation SUPERCELL (8 atoms for a 1-atom FCC
+    endmember at -ernn=2), so fvasp.wrap must be sized from the p* dirs,
+    not the SQS cell — the e2e run died on "1 value(s) for MAGMOM ...
+    NIONS=8" when it was sized from the 1-atom cell."""
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", True)
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    (sqs / "str_relax.out").write_text(
+        "1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n0 0 0 Co\n")
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            pert = Path(cwd) / "vol_0" / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            rows = "2 0 0\n0 2 0\n0 0 2\n"     # 8-atom supercell
+            atoms = "\n".join(f"0 0 {i} Co" for i in range(8))
+            (pert / "str.out").write_text(
+                "1 0 0\n0 1 0\n0 0 1\n" + rows + atoms + "\n")
+            (pert / "wait").write_text("")
+            (Path(cwd) / "vol_0" / "str_relax.out").write_text("s\n")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("1.0\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        # the wrap must ALREADY be sized for the supercell when the
+        # force runs launch
+        wrap = (Path(cwd) / "fvasp.wrap").read_text()
+        assert "MAGMOM = 8*3" in wrap, wrap
+        assert "MAGMOM = 1*3" not in wrap
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000)
+    wrap = (sqs / "fvasp.wrap").read_text()
+    assert "MAGMOM = 8*3" in wrap and "ISPIN = 2" in wrap
