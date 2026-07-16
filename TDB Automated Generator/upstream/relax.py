@@ -33,7 +33,12 @@ from vaspwrap import build_vasp_wrap
 from phases import DLMConfig
 
 
-RELAX_METHODS = ("runstruct", "normal", "infdet")
+RELAX_METHODS = ("infdet", "normal", "runstruct")
+
+# Inflection detection needs a strain cutoff to work; the reference NAS
+# job uses 5% ("robustrelax_vasp -id -c 0.05 mpiexec -n 128"). Applied
+# by default unless the caller passes its own -c via relax_opts.
+INFDET_STRAIN_CUTOFF = 0.05
 
 
 def write_relax_wrap(calc_dir: Path,
@@ -58,7 +63,7 @@ def write_relax_wrap(calc_dir: Path,
 def relax_structure(calc_dir: Path,
                     encut: int,
                     kppra: int,
-                    method: str = "runstruct",
+                    method: str = "infdet",
                     dlm: Optional[DLMConfig] = None,
                     algo: str = "All",
                     env_bin: Optional[str] = None,
@@ -68,9 +73,12 @@ def relax_structure(calc_dir: Path,
                     cmd_prefix: str = "") -> Path:
     """Relax the structure in calc_dir, producing str_relax.out.
 
-    method   "runstruct" (default) -> pollmach runstruct_vasp [cmd_prefix]
+    method   "infdet" (default) -> robustrelax_vasp -mk;
+                 robustrelax_vasp -id -c 0.05 [cmd_prefix]
+                 (inflection detection; the -c strain cutoff is REQUIRED
+                 for it to engage — reference NAS job uses 0.05)
              "normal"    -> robustrelax_vasp -mk; robustrelax_vasp [cmd_prefix]
-             "infdet"    -> robustrelax_vasp -mk; robustrelax_vasp -id [cmd_prefix]
+             "runstruct" -> pollmach runstruct_vasp [cmd_prefix]
 
     cmd_prefix   the command used to launch VASP, e.g. "mpiexec -n 128".
                  ATAT tools take it as TRAILING arguments (reference NAS
@@ -122,6 +130,10 @@ def relax_structure(calc_dir: Path,
 
     if method == "infdet":
         cmd = ["robustrelax_vasp", "-id"]
+        # Strain cutoff is mandatory for inflection detection; add the
+        # 5% default unless the caller supplies their own -c.
+        if "-c" not in runner.split_prefix(relax_opts):
+            cmd += ["-c", f"{INFDET_STRAIN_CUTOFF}"]
         if infdet_opts:
             cmd += ["-idop", infdet_opts]
     else:  # method == "normal"

@@ -52,8 +52,9 @@ Key facts encoded here:
 Three modes:
   static  : single point (NSW=0), DOSTATIC -- convergence + final static E.
   relax   : full relaxation (NSW, IBRION=2, ISIF=3), DOSTATIC.
-  phonon  : frozen geometry (NSW=0), no DOSTATIC, ICHARG=1 + LWAVE/LCHARG on
-            so pollmach -lu can reuse WAVECAR/CHGCAR across force runs.
+  phonon  : frozen geometry (NSW=0, IBRION=-1, ISIF=2), PREC=Accurate,
+            ALGO=Fast, no DOSTATIC — the user's fvasp.wrap for fitfc
+            force runs.
 
 ALGO defaults to "All" (design spec) but is overridable to match the
 reference file's "Fast".
@@ -78,6 +79,15 @@ MAGNETIC_3D = {"Cr", "Mn", "Fe", "Co", "Ni"}
 # without threading a flag through each signature. Tests and callers can
 # always pass spin=True/False explicitly to override.
 DEFAULT_SPIN = False
+
+# Initial magnetic moment (muB/atom) written as a uniform MAGMOM line
+# for spin-polarized non-DLM runs — the user's working INCARs initialize
+# every site at 3 (high-spin start converges to the FM/ferrimagnetic
+# solution far more reliably than VASP's 1.0 default; the 2026-07-14
+# run's OUTCARs carried the "did not specify MAGMOM" warning on every
+# calculation). Overridable per-call (magmom_init) or via
+# --magmom-init in run_upstream.
+DEFAULT_MAGMOM_INIT = 3.0
 
 
 def wants_spin(elements) -> bool:
@@ -119,7 +129,7 @@ _BASE_INCAR: List[Tuple[str, object]] = [
     ("PREC", "Normal"),
     ("LORBIT", 11),
     ("ISMEAR", 1),
-    ("SIGMA", 0.1),
+    ("SIGMA", 0.08),
     ("NELM", 100),
     ("EDIFF", "1E-6"),
 ]
@@ -132,21 +142,34 @@ _MODE_INCAR: Dict[str, List[Tuple[str, object]]] = {
         ("_dostatic", True),
     ],
     "relax": [
-        ("NSW", 300),
+        ("NSW", 100),
         ("IBRION", 2),
         ("ISIF", 3),
         ("EDIFFG", -0.01),
         ("_dostatic", True),
     ],
     "phonon": [
+        # The user's fvasp.wrap: frozen ions (NSW=0/IBRION=-1/ISIF=2),
+        # PREC=Accurate for clean forces, ALGO=Fast (fine for a static
+        # point on a good geometry). No ICHARG=1 — it hard-errors when
+        # no CHGCAR exists, and the first force run never has one.
         ("NSW", 0),
         ("IBRION", -1),
-        ("ICHARG", 1),
-        ("LWAVE", ".TRUE."),    # reuse WAVECAR/CHGCAR for pollmach -lu
-        ("LCHARG", ".TRUE."),
+        ("ISIF", 2),
+        ("PREC", "Accurate"),
+        ("ALGO", "Fast"),
         ("_dostatic", False),
     ],
 }
+
+# Magnetic-mixing keys for spin-polarized (non-DLM) runs, from the
+# user's production INCAR: damped charge mixing + fast moment mixing.
+_SPIN_INCAR: List[Tuple[str, object]] = [
+    ("AMIX", 0.03),
+    ("BMIX", 0.0001),
+    ("AMIX_MAG", 0.8),
+    ("BMIX_MAG", 0.0001),
+]
 
 # DLM-only INCAR additions (magnetic mixing + symmetry), from the reference.
 _DLM_INCAR: List[Tuple[str, object]] = [
@@ -187,6 +210,7 @@ def build_vasp_wrap(mode: str,
                     usepot: str = "PAWPBE",
                     spin: Optional[bool] = None,
                     natoms: Optional[int] = None,
+                    magmom_init: Optional[float] = None,
                     extra: Optional[Dict[str, object]] = None) -> str:
     """Return the text of a vasp.wrap file.
 
@@ -202,12 +226,17 @@ def build_vasp_wrap(mode: str,
             reference NCORE=8/KPAR=4 crashes VASP on 1-atom endmembers.
     spin    ISPIN=2 collinear spin polarization. None (default) falls back
             to the module-level DEFAULT_SPIN, which run_upstream turns on
-            automatically for MAGNETIC_3D elements. Initial moments ride
-            on VASP's default (1 muB/atom); that reliably finds the FM
-            state for Co/Ni/Fe but can land Cr/Mn in low-moment local
-            minima — for those, prefer the DLM machinery (SUBATOM
-            moments) or pass explicit MAGMOM via `extra`. Not needed for
-            DLM runs, where ezvasp's MAGATOM/SUBATOM path handles spin.
+            automatically for MAGNETIC_3D elements. When natoms is known
+            a uniform "MAGMOM = <natoms>*<magmom_init>" line is emitted
+            (default 3 muB — the user's convention; a uniform value is
+            order-independent, so ezvasp's POSCAR grouping cannot
+            scramble it) plus the magnetic-mixing keys from the user's
+            production INCAR. Without natoms the MAGMOM line is omitted
+            and VASP's 1 muB default applies (warning in OUTCAR). Not
+            used for DLM runs, where ezvasp's MAGATOM/SUBATOM path
+            handles moments (and can swap POTCARs, e.g. Cr -> Cr_pv).
+    magmom_init  initial moment per atom for the MAGMOM line; None ->
+            module-level DEFAULT_MAGMOM_INIT (3.0).
     extra   INCAR key->value overrides merged last (highest priority).
     """
     if mode not in _MODE_INCAR:
@@ -255,6 +284,13 @@ def build_vasp_wrap(mode: str,
         # skip this: their spin handling comes from the SUBATOM moment
         # machinery (ezvasp emits the magnetic INCAR itself).
         put("ISPIN", 2)
+        if magmom_init is None:
+            magmom_init = DEFAULT_MAGMOM_INIT
+        if natoms:
+            # Uniform initial moment, VASP multiplier syntax ("32*3").
+            put("MAGMOM", f"{int(natoms)}*{magmom_init:g}")
+        for k, v in _SPIN_INCAR:
+            put(k, v)
     if dlm_on:
         for k, v in _DLM_INCAR:
             put(k, v)

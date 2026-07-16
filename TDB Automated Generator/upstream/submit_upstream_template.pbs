@@ -32,7 +32,8 @@ TEMPLATE_ROOT="$HOME/atat/data/sqsdb"   # absolute — a relative path
                                         # resolves against the job cwd
 
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
-RELAX_METHOD="infdet"            # runstruct | normal | infdet
+RELAX_METHOD="infdet"            # infdet (default: robustrelax -id -c 0.05)
+                                 # | normal | runstruct
 TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
 
 # Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
@@ -58,9 +59,9 @@ MAX_CHECKRELAX="0.1"
 # 128 ranks onto 32 cores because they were edited independently.
 CMD_PREFIX="mpiexec -n ${NCPUS:-32}"
 
-# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet,
-# e.g. "-c 0.05" (constraint tolerance from the reference job).
-# Ignored for runstruct. Leave empty for defaults.
+# Direct robustrelax_vasp options for RELAX_METHOD normal|infdet.
+# infdet already gets "-c 0.05" automatically; set e.g. "-c 0.10"
+# here to override the strain cutoff. Ignored for runstruct.
 RELAX_OPTS=""
 DLM="no"                         # "yes" for a disordered-local-moment run
 DLM_MOMENT="2.0"

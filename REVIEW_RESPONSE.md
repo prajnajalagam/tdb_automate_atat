@@ -39,11 +39,15 @@ driven by source-verification rather than trust-the-wrapper:
   Candidate fix: binary-level scope taking the max over phases; needs a
   re-run of affected statics, so it's a planned-run decision, not a
   silent default change.
-- **O2 — Initial-moment quality for Cr/Mn.** ISPIN=2 with VASP-default
-  1 μB starts reliably finds FM Co/Ni/Fe but can trap Cr/Mn in
-  low-moment minima. Proper fix is per-element MAGMOM through ezvasp's
-  MAGATOM/SUBATOM tag machinery (as the DLM path already does); needs
-  care because tags flow into downstream str.out parsers.
+- **O2 — Initial-moment quality. CLOSED 2026-07-15** (user correction
+  after the CoCr run: every OUTCAR warned about the missing MAGMOM).
+  Spin-polarized non-DLM wraps now emit a uniform
+  `MAGMOM = <natoms>*<init>` line (default 3 μB, the production-INCAR
+  convention; `--magmom-init` to change) plus the production magnetic-
+  mixing keys. A uniform value is POSCAR-order-independent, so ezvasp's
+  atom grouping cannot scramble it. Per-ELEMENT moments via the
+  MAGATOM/SUBATOM tag machinery remain future work for mixed-moment
+  starts (e.g. deliberately ferrimagnetic Cr configurations).
 - **O3 — Final-static protocol.** Energies come from the relax-run
   DOSTATIC at ISMEAR=1/PREC=Normal/LREAL=Auto. For publication-grade
   numbers: separate static on the relaxed geometry with ISMEAR=-5 (mesh

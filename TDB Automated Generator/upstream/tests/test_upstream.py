@@ -79,19 +79,24 @@ def test_wrap_static_has_dostatic_and_algo_all():
 
 def test_wrap_relax_has_dostatic_full_dof():
     # The reference workflow keeps DOSTATIC on relax (relax + final static E).
+    # ISIF=3 + IBRION=2 = full relaxation; NSW=100 per the production INCAR.
     w = vaspwrap.build_vasp_wrap("relax", encut=300, kppra=6000)
     assert "DOSTATIC" in w
     assert "ISIF = 3" in w
     assert "IBRION = 2" in w
-    assert "NSW = 300" in w
+    assert "NSW = 100" in w
+    assert "ISMEAR = 1" in w and "SIGMA = 0.08" in w
 
 
-def test_wrap_phonon_icharg_frozen():
+def test_wrap_phonon_matches_fvasp_conventions():
+    """Frozen force-run wrap = the user's fvasp.wrap: NSW=0/IBRION=-1/
+    ISIF=2, PREC=Accurate, ALGO=Fast, and NO ICHARG=1 (hard-errors when
+    no CHGCAR exists — the first force run never has one)."""
     w = vaspwrap.build_vasp_wrap("phonon", encut=300, kppra=6000)
     assert "DOSTATIC" not in w
-    assert "ICHARG = 1" in w
-    assert "NSW = 0" in w
-    assert "LWAVE = .TRUE." in w
+    assert "ICHARG" not in w
+    assert "NSW = 0" in w and "IBRION = -1" in w and "ISIF = 2" in w
+    assert "PREC = Accurate" in w and "ALGO = Fast" in w
 
 
 def test_wrap_algo_override():
@@ -347,16 +352,17 @@ def _stub_encut_kppra(monkeypatch, calc_dir):
     )
 
 
-def test_runstruct_is_now_the_default(tmp_path, monkeypatch):
-    """--relax-method default must be 'runstruct' (was 'normal')."""
+def test_infdet_is_now_the_default(tmp_path, monkeypatch):
+    """--relax-method default is 'infdet' (user decision 2026-07-15):
+    robustrelax_vasp -id with the -c 0.05 strain cutoff it REQUIRES."""
     rec = _RecCalls()
     _stub_encut_kppra(monkeypatch, tmp_path)
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
     relax.relax_structure(tmp_path, encut=400, kppra=8000)  # no method= arg
-    # runstruct: no -mk prep, one polled pollmach runstruct_vasp call.
-    assert rec.logged == [], f"runstruct should not run robustrelax_vasp -mk; got {rec.logged}"
-    assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
+    assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
+    assert rec.polled == [["robustrelax_vasp", "-id", "-c", "0.05"]], \
+        rec.polled
 
 
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
@@ -379,7 +385,8 @@ def test_robustrelax_infdet_runs_mk_first(tmp_path, monkeypatch):
     relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet",
                           infdet_opts="-t 1e-3")
     assert rec.logged == [["robustrelax_vasp", "-mk"]], rec.logged
-    assert rec.polled == [["robustrelax_vasp", "-id", "-idop", "-t 1e-3"]], rec.polled
+    assert rec.polled == [["robustrelax_vasp", "-id", "-c", "0.05",
+                           "-idop", "-t 1e-3"]], rec.polled
 
 
 def test_relax_rejects_unknown_method(tmp_path, monkeypatch):
@@ -498,6 +505,7 @@ def test_runstruct_gets_vasp_launcher_tokens(tmp_path, monkeypatch):
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
     relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          method="runstruct",
                           cmd_prefix="mpiexec -n 128")
     assert rec.polled == [
         ["pollmach", "runstruct_vasp", "mpiexec", "-n", "128"]], rec.polled
@@ -525,7 +533,8 @@ def test_empty_prefix_leaves_commands_unchanged(tmp_path, monkeypatch):
     _stub_encut_kppra(monkeypatch, tmp_path)
     monkeypatch.setattr(relax.runner, "run_logged", rec.logged_fn())
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
-    relax.relax_structure(tmp_path, encut=400, kppra=8000)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000,
+                          method="runstruct")
     assert rec.polled == [["pollmach", "runstruct_vasp"]], rec.polled
 
 
@@ -699,7 +708,8 @@ def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
     assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
     polled = [c for k, c in calls if k == "polled"]
     assert len(polled) == 1, "only the force runs need pollmach"
-    assert polled[0][:2] == ["pollmach", "runstruct_vasp"]
+    assert polled[0][:4] == ["pollmach", "runstruct_vasp",
+                             "-w", "fvasp.wrap"]
     assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
     # svib_ht promoted top-level for sqs2tdb -fit
     assert (sqs / "svib_ht").read_text() == "3.21\n"
@@ -760,10 +770,11 @@ def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
     assert fitfc_gen_calls[0] == fitfc_gen_calls[1], \
         "fitfc must be re-run with the SAME command-line options"
     assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
-    # per-vol relax wraps removed so p* force runs see the frozen top wrap
+    # per-vol relax wraps removed; force runs use the separate top-level
+    # fvasp.wrap (selected with -w), never the relax-stage vasp.wrap
     for vol in sqs.glob("vol_*"):
         assert not (vol / "vasp.wrap").is_file()
-    assert (sqs / "vasp.wrap").is_file()
+    assert (sqs / "fvasp.wrap").is_file()
     assert (sqs / "svib_ht").read_text() == "3.3\n"
 
 
@@ -1175,6 +1186,8 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     assert plan["T1_static"]["argv"] == ["runstruct_vasp",
                                          "mpiexec", "-n", "8"]
     assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
+    assert plan["T3_robustrelax"]["argv"][:4] == \
+        ["robustrelax_vasp", "-id", "-c", "0.05"]
     assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
                                                  "fvasp.wrap"]
     assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
@@ -1301,3 +1314,31 @@ def test_vasp_triage_reads_gz_and_suffixed_logs(tmp_path):
     ids = {f.error_id for f in reports[0].findings}
     assert "sick_job" in ids and "empty_poscar" in ids
     assert reports[0].outcar_seen is True
+
+
+# ---- MAGMOM generation (user correction 2026-07-15) -------------------------
+
+def test_wrap_spin_writes_uniform_magmom_and_mixing():
+    """Spin-on wraps must carry an explicit MAGMOM (the 2026-07-14 run's
+    OUTCARs all warned about the missing tag) — uniform init moment via
+    VASP multiplier syntax, order-independent — plus the production
+    INCAR's magnetic-mixing keys."""
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 spin=True, natoms=32)
+    assert "ISPIN = 2" in w and "MAGMOM = 32*3" in w
+    assert "AMIX = 0.03" in w and "AMIX_MAG = 0.8" in w
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 spin=True, natoms=8, magmom_init=1.5)
+    assert "MAGMOM = 8*1.5" in w
+
+
+def test_wrap_spin_without_natoms_omits_magmom():
+    w = vaspwrap.build_vasp_wrap("static", encut=400, kppra=6000, spin=True)
+    assert "ISPIN = 2" in w and "MAGMOM" not in w
+
+
+def test_wrap_dlm_keeps_subatom_route_no_magmom():
+    dlm = DLMConfig(enabled=True, subatom={"Co": ("Co", 1.8)})
+    w = vaspwrap.build_vasp_wrap("relax", encut=400, kppra=6000,
+                                 dlm=dlm, spin=True, natoms=32)
+    assert "MAGMOM" not in w and "SUBATOM = s/Co+2/Co+1.8/g" in w

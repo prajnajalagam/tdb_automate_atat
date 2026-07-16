@@ -9,7 +9,7 @@ ATAT→VASP chain is broken, instead of a 72-hour job dying at hour 3.
 |---|---|---|---|
 | `T1_static` | `runstruct_vasp <launcher>` + static `vasp.wrap` | `converge.run_static_point` — every ENCUT/KPPRA sweep point (the historical "unable to open OSZICAR" site) | `energy`, `str_relax.out` |
 | `T2_runstruct` | `runstruct_vasp <launcher>` + relax wrap (NSW=5) | `--relax-method runstruct` relaxation + extraction | `str_relax.out`, `energy`, `force.out` |
-| `T3_robustrelax` | `robustrelax_vasp -mk` then `robustrelax_vasp <launcher>` | `--relax-method normal` (crash-tolerant loop); early-stopped via the `stop` sentinel once `str_relax.out` exists | `str_relax.out` |
+| `T3_robustrelax` | `robustrelax_vasp -mk` then `robustrelax_vasp -id -c 0.05 <launcher>` | `--relax-method infdet` (the default: inflection detection with its required strain cutoff); early-stopped via the `stop` sentinel once `str_relax.out` exists | `str_relax.out` |
 | `T4_fitfc_wrap` | `runstruct_vasp -w fvasp.wrap <launcher>` on a displaced frozen cell | fitfc perturbation force runs (separate wrap file, NSW=0, forces → `force.out`) | `force.out`, `str_relax.out` |
 | `T5_pollmach` | `pollmach runstruct_vasp <launcher>` over two `wait`-marked subdirs | the dispatcher every stage routes through (wait consumption, walk-up `vasp.wrap`, `stoppoll` shutdown) | `p_1/energy`, `p_2/energy` |
 

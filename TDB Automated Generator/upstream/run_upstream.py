@@ -288,7 +288,7 @@ def process_one_sqs(sqs_dir: Path,
     elif not skip_phonon:
         stamp(f"[{sqs_dir.name}] STAGE 3/3 fitfc phonons starting")
         phonon_out = str(phonon.run_fitfc(
-            sqs_dir, encut=chosen_encut, kppra=chosen_kppra,
+            sqs_dir, encut=relax_encut, kppra=chosen_kppra,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
             cmd_prefix=cmd_prefix, **(fitfc_opts or {})))
         unstable_log = sqs_dir / "unstable_modes.log"
@@ -498,12 +498,15 @@ def main():
                     help="VASP ALGO (default 'All' per spec; use 'Fast' to "
                          "match the reference vasp.wrap).")
     ap.add_argument("--relax-method",
-                    choices=["runstruct", "normal", "infdet"],
-                    default="runstruct",
-                    help="Structural relaxation method. 'runstruct' "
-                         "(default) invokes 'pollmach runstruct_vasp' — "
-                         "simplest, fastest for well-converged cases. "
-                         "'normal' and 'infdet' both wrap "
+                    choices=["infdet", "normal", "runstruct"],
+                    default="infdet",
+                    help="Structural relaxation method. 'infdet' "
+                         "(default) runs robustrelax_vasp -id -c 0.05 — "
+                         "inflection detection with the 5%% strain "
+                         "cutoff it needs to engage (override -c via "
+                         "--relax-opts). 'runstruct' invokes 'pollmach "
+                         "runstruct_vasp' — simplest for well-behaved "
+                         "cases. 'normal' and 'infdet' both wrap "
                          "robustrelax_vasp and are automatically "
                          "preceded by 'robustrelax_vasp -mk' to build "
                          "the input files robustrelax needs.")
@@ -588,6 +591,11 @@ def main():
                          f"{sorted(vaspwrap.MAGNETIC_3D)} and the run is "
                          "not DLM — non-magnetic energies for these metals "
                          "are wrong by tens of meV/atom.")
+    ap.add_argument("--magmom-init", type=float, default=None,
+                    help="Uniform initial magnetic moment (muB/atom) for "
+                         "the MAGMOM line of spin-polarized non-DLM runs "
+                         "(default 3, the production-INCAR convention). "
+                         "DLM runs set moments via SUBATOM instead.")
     ap.add_argument("--spin", action="store_true",
                     help="Force ISPIN=2 even for elements outside the "
                          "magnetic-3d set.")
@@ -658,9 +666,12 @@ def main():
         spin_on = args.spin or vaspwrap.wants_spin(
             [args.element1, args.element2])
     vaspwrap.DEFAULT_SPIN = spin_on and not args.dlm
+    if args.magmom_init is not None:
+        vaspwrap.DEFAULT_MAGMOM_INIT = args.magmom_init
     print(f"  Spin        : "
           + ("DLM (SUBATOM moments)" if args.dlm else
-             ("ISPIN=2, VASP-default init moments" if vaspwrap.DEFAULT_SPIN
+             (f"ISPIN=2, MAGMOM={vaspwrap.DEFAULT_MAGMOM_INIT:g} muB/atom "
+              f"init" if vaspwrap.DEFAULT_SPIN
               else "off (ISPIN=1)"))
           + ("  [--no-spin]" if args.no_spin else ""))
     print(f"  DLM         : {'on' if args.dlm else 'off'}"
@@ -694,6 +705,8 @@ def main():
         "relax_opts": args.relax_opts,
         "fitfc_opts": fitfc_opts,
         "spin_polarized": vaspwrap.DEFAULT_SPIN,
+        "magmom_init": vaspwrap.DEFAULT_MAGMOM_INIT
+                       if vaspwrap.DEFAULT_SPIN else None,
         "convergence_scope": args.convergence_scope,
         "max_checkrelax": args.max_checkrelax,
         "phases": [],
