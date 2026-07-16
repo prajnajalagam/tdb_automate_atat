@@ -37,7 +37,11 @@ TEMPLATE_ROOT=""
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 RELAX_METHOD="infdet"            # infdet (default: robustrelax -id -c 0.05)
                                  # | normal | runstruct
-TOL_EV="0.001"                   # 1 meV/atom convergence tolerance
+TOL_EV="0.0001"                  # successive-step tolerance, 0.1 meV/atom:
+                                 # chosen setting must differ from the
+                                 # PREVIOUS point by < tol AND be confirmed
+                                 # by the NEXT (deliberately unneeded) point;
+                                 # ENCUT sweep extends upward until met
 
 # Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
 # runs — NM energies for these metals are wrong by tens of meV/atom.

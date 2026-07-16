@@ -247,7 +247,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "perturbation supercells exactly; the 1-atom "
                          "endmembers get the adaptive NCORE=1/KPAR=1.")
     ap.add_argument("--env-bin", default=None)
-    ap.add_argument("--tol-ev", default="0.001")
+    ap.add_argument("--tol-ev", default="0.0001",
+                    help="Successive-step convergence tolerance in "
+                         "eV/atom (default 0.1 meV/atom).")
     ap.add_argument("--fitfc-on-unstable", default="mark",
                     choices=("mark", "escalate", "force"))
     ap.add_argument("--timeout", type=int, default=5400)

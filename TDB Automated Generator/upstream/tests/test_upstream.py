@@ -137,31 +137,53 @@ def test_wrap_dlm_subatom_and_magatom():
     assert "MAGMOM" not in w     # moments come from SUBATOM, not MAGMOM
 
 
-# ---- convergence selection (1 meV/atom) ------------------------------------
+# ---- convergence selection: successive-difference + confirmation ----------
+# (2026-07-16 user criterion: step from PREVIOUS < tol AND step to NEXT
+#  < tol; the next point is the deliberately "unneeded" confirmation.)
 
-def test_select_converged_picks_smallest_stable():
-    settings = [4000, 5000, 6000, 7000]
-    # energies drift then settle within 1 meV of the 7000 reference from 6000 on
-    e = [-5.010, -5.0035, -5.0006, -5.0000]
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
-    assert ref == 7000
-    assert chosen == 6000
+def test_select_converged_real_kppra_data_picks_7000():
+    """The user's actual 2026-07-16 KPPRA sweep: manual analysis says
+    7000 (|7000-6000| = 0.082 meV < 0.1, |8000-7000| = 0.000 confirms).
+    4000/5000 must NOT win despite their small mutual step, because the
+    5000->6000 step (0.176 meV) breaks the plateau."""
+    settings = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    e = [-6.2614504, -6.2615232, -6.2616992, -6.2616170,
+         -6.2616170, -6.2617104, -6.2615474]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
     assert conv is True
+    assert chosen == 7000
+    assert ref == 8000                      # the confirming point
 
 
-def test_select_converged_not_converged_falls_back():
-    settings = [4000, 5000, 6000]
-    e = [-5.10, -5.05, -5.00]               # 50 meV gaps, never within 1 meV
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
+def test_select_converged_real_encut_data_not_converged():
+    """The user's actual ENCUT sweep: successive steps still 0.4-1.4
+    meV/atom at the top of the grid — must report NOT converged (the
+    old compare-to-reference rule wrongly accepted this)."""
+    settings = [268, 285, 301, 318, 335]
+    e = [-6.2500555, -6.2579381, -6.2614504, -6.2610447, -6.2596040]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
     assert conv is False
-    assert chosen == 6000                   # reference / highest
+    assert chosen == 335                    # fall back to highest
+
+
+def test_select_converged_needs_confirming_point_above():
+    # plateau reached at the LAST point only -> no confirmation -> not
+    # converged (drives the adaptive extension to add one more run)
+    settings = [300, 320, 340]
+    e = [-5.010, -5.0002, -5.00015]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
+    assert conv is False and chosen == 340
 
 
 def test_select_converged_ignores_missing():
-    settings = [4000, 5000, 6000]
-    e = [None, -5.0005, -5.0000]
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
-    assert chosen == 5000 and conv is True
+    settings = [4000, 5000, 6000, 7000]
+    e = [None, -5.00005, -5.00002, -5.00001]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
+    assert chosen == 6000 and conv is True and ref == 7000
 
 
 # ---- str.out parsing + DLM fixup -------------------------------------------
@@ -1526,3 +1548,40 @@ def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
     phonon.run_fitfc(sqs, encut=400, kppra=6000)
     wrap = (sqs / "fvasp.wrap").read_text()
     assert "MAGMOM = 8*3" in wrap and "ISPIN = 2" in wrap
+
+
+
+# ---- adaptive ENCUT extension (no convergence ceiling) ----------------------
+
+def test_run_sweep_extends_until_converged(tmp_path, monkeypatch):
+    """ENCUT sweep must climb past the initial grid until the
+    successive-difference + confirmation criterion is met."""
+    # plateau only reached at 400: initial grid [300..335] can't satisfy
+    energies = {300: -5.020, 317: -5.010, 335: -5.004,
+                352: -5.001, 369: -5.00030, 386: -5.00025, 403: -5.00022}
+
+    def fake_point(src, dst, encut, kppra, **kw):
+        return energies[encut]
+
+    monkeypatch.setattr(converge, "run_static_point", fake_point)
+    res = converge.run_sweep(
+        "ENCUT", tmp_path / "sqs", tmp_path / "sweep",
+        settings=[300, 317, 335], fixed_other=7000,
+        tol_ev=0.0001, extend_step=17, extend_max=500)
+    assert res.converged is True
+    assert res.chosen == 386                # 369->386 and 386->403 < tol
+    assert res.reference == 403             # confirmation point
+    assert res.settings[-1] == 403          # extended past the old grid
+
+
+def test_run_sweep_extension_hits_guard_and_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(converge, "run_static_point",
+                        lambda src, dst, encut, kppra, **kw:
+                        -5.0 - encut * 1e-4)   # never converges
+    res = converge.run_sweep(
+        "ENCUT", tmp_path / "sqs", tmp_path / "sweep",
+        settings=[300, 320], fixed_other=7000,
+        tol_ev=0.0001, extend_step=20, extend_max=400)
+    assert res.converged is False
+    assert res.settings[-1] <= 400          # guard respected
+    assert res.chosen == res.settings[-1]   # falls back to highest
