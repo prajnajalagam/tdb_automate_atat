@@ -33,12 +33,15 @@ driven by source-verification rather than trust-the-wrapper:
 
 ## Open items (flagged, deliberately not auto-fixed)
 
-- **O1 — Cross-phase settings consistency.** F4 unifies settings *within*
-  a phase; different phases can still land on different (ENCUT, KPPRA).
-  Lattice-stability comparisons across phases inherit that inconsistency.
-  Candidate fix: binary-level scope taking the max over phases; needs a
-  re-run of affected statics, so it's a planned-run decision, not a
-  silent default change.
+- **O1 — Cross-phase settings consistency. CLOSED 2026-07-17.**
+  `--convergence-scope system` (new default) runs ONE ENCUT/KPPRA sweep
+  per job and reuses it for every phase — uniform cross-phase settings
+  (consistent lattice stabilities) at ~1/4 the sweep compute; presets
+  (`--preset-encut/--preset-kppra`) extend the reuse across runs (e.g.
+  binaries → ternary at the max over the binaries). Applied together
+  with the paper-conformance pass against van de Walle et al., Calphad
+  58 (2017) 70 (phonon recipe values, vaspf.wrap, `-lu`, `-vib`,
+  endmember-only phonon scope).
 - **O2 — Initial-moment quality. CLOSED 2026-07-15** (user correction
   after the CoCr run: every OUTCAR warned about the missing MAGMOM).
   Spin-polarized non-DLM wraps now emit a uniform

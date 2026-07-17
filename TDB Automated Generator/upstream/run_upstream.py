@@ -154,6 +154,114 @@ def discover_sqs_dirs(phase_root: Path) -> List[Path]:
     return out
 
 
+# Composition tokens in a decorated calc-dir name: site_El=frac
+_COMP_TOKEN_RE = re.compile(r"[a-z]+_([A-Z][a-z]?)[+-]?\d*=([0-9.]+)")
+
+
+def site_fractions(dirname: str) -> Dict[str, float]:
+    """Element -> overall fraction parsed from a decorated dir name
+    (site multiplicities ignored — adequate for single-sublattice
+    phases, which is all the probe protocol samples)."""
+    fr: Dict[str, float] = {}
+    for el, v in _COMP_TOKEN_RE.findall(dirname):
+        fr[el] = fr.get(el, 0.0) + float(v)
+    tot = sum(fr.values())
+    return {el: v / tot for el, v in fr.items()} if tot > 0 else {}
+
+
+def pick_probe_dirs(dirs: List[Path], elements: List[str],
+                    rng) -> Dict[str, Path]:
+    """One randomly chosen SQS per element from that element's RICH
+    side (fraction > 0.5; pure endmembers qualify; lev irrelevant) —
+    the 2026-07-17 convergence-probe protocol."""
+    picks: Dict[str, Path] = {}
+    for el in elements:
+        key = el.capitalize()
+        rich = [d for d in sorted(dirs)
+                if site_fractions(d.name).get(key, 0.0) > 0.5]
+        if rich:
+            picks[el] = rng.choice(rich)
+    return picks
+
+
+def system_probe_convergence(work_root: Path,
+                             requested_phases: List[str],
+                             elements: List[str],
+                             potcar_paths: List[Path],
+                             dlm: DLMConfig,
+                             algo: str,
+                             tol_ev: float,
+                             sqs_levels: List[int],
+                             env_bin: Optional[str],
+                             timeout: int,
+                             cmd_prefix: str,
+                             seed: int) -> Optional[Dict]:
+    """The one-sweep-for-everything protocol (2026-07-17 user decision):
+
+    1. Randomly pick ONE single-sublattice phase among those requested.
+    2. From its generated SQS, randomly pick one structure on EACH
+       element-rich side (>50% of that element; endmembers count; lev
+       irrelevant).
+    3. ENCUT/KPPRA sweep each probe (successive-difference criterion,
+       unbounded ENCUT).
+    4. Global settings = elementwise MAX over the probes, with the
+       Pulay floor (1.3 x max ENMAX) folded in so relaxations, statics
+       and phonon force runs all share literally ONE (ENCUT, KPPRA).
+
+    Rich-side sampling matters because basis-completeness demand is
+    element-dependent (e.g. Cr_pv is harder than Co); taking the max is
+    conservative for the other side. Returns a manifest-able dict with
+    the picks, per-probe results and the final settings, or None if no
+    single-sublattice phase / probes are available (caller falls back
+    to first-SQS reuse).
+    """
+    import random
+    rng = random.Random(seed)
+    candidates = sorted(p for p in requested_phases
+                        if p in SINGLE_SUBLATTICE_PHASES)
+    if not candidates:
+        return None
+    phase = rng.choice(candidates)
+    gen_level = max(sqs_levels)
+    stamp(f"[probe] convergence-probe phase: {phase} (seed {seed}), "
+          f"generating at -lv={gen_level}")
+    phase_root = sqsgen.generate_phase_sqs(
+        work_root, phase, elements=elements,
+        level=gen_level, dlm=dlm.enabled, env_bin=env_bin)
+    dirs = discover_sqs_dirs(phase_root)
+    picks = pick_probe_dirs(dirs, elements, rng)
+    if not picks:
+        return None
+
+    probes = {}
+    encuts: List[int] = []
+    kppras: List[int] = []
+    for el, d in sorted(picks.items()):
+        stamp(f"[probe] {el}-rich probe: {d.name} — ENCUT/KPPRA sweep")
+        e_c, k_c, kres, eres = converge.converge_sqs(
+            d, d / "convergence", potcar_paths,
+            dlm=dlm, algo=algo, tol_ev=tol_ev,
+            env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
+        print(kres.table())
+        print(eres.table())
+        probes[el] = {"dir": str(d), "encut": e_c, "kppra": k_c,
+                      "encut_converged": eres.converged,
+                      "kppra_converged": kres.converged}
+        encuts.append(e_c)
+        kppras.append(k_c)
+
+    max_e = potcar.max_enmax(potcar_paths)
+    final_encut = potcar.pulay_safe_encut(max(encuts), max_e)
+    final_kppra = max(kppras)
+    stamp(f"[probe] GLOBAL settings: ENCUT={final_encut} eV "
+          f"(max over probes {encuts}, Pulay floor "
+          f"{potcar.PULAY_ENCUT_FACTOR} x ENMAX folded in), "
+          f"KPPRA={final_kppra} (max over {kppras}) — used for ALL "
+          f"energy, relaxation, inflection-detection and phonon runs")
+    return {"phase": phase, "seed": seed, "probes": probes,
+            "encut": final_encut, "kppra": final_kppra}
+
+
 def process_one_sqs(sqs_dir: Path,
                     potcar_paths: List[Path],
                     dlm: DLMConfig,
@@ -349,8 +457,10 @@ def process_phase(phase: str,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
                   fitfc_opts: Optional[Dict] = None,
-                  convergence_scope: str = "phase",
-                  max_checkrelax: float = 0.1) -> Dict:
+                  convergence_scope: str = "system",
+                  max_checkrelax: float = 0.1,
+                  phonon_scope: str = "endmembers",
+                  preset: Optional[tuple] = None) -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -380,7 +490,9 @@ def process_phase(phase: str,
                              cmd_prefix=cmd_prefix, relax_opts=relax_opts,
                              fitfc_opts=fitfc_opts,
                              convergence_scope=convergence_scope,
-                             max_checkrelax=max_checkrelax)
+                             max_checkrelax=max_checkrelax,
+                             phonon_scope=phonon_scope,
+                             preset=preset)
 
     # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
     # `level <= -lv`), so a single invocation at max(sqs_levels) copies
@@ -400,27 +512,43 @@ def process_phase(phase: str,
     sqs_dirs = discover_sqs_dirs(phase_root)
     print(f"    {len(sqs_dirs)} SQS directories")
 
-    # Phase-uniform convergence (default): sweep on the FIRST SQS only
-    # and reuse its (ENCUT, KPPRA) for every sibling — mixing energies
-    # subtract eV-scale totals, and that subtraction only cancels
-    # basis/k-mesh error when all structures share the same settings.
-    # --convergence-scope sqs restores the old per-SQS sweeps.
+    # Uniform convergence settings (mixing energies subtract eV-scale
+    # totals; the subtraction only cancels basis/k-mesh error when all
+    # structures share the same settings):
+    #   system (default) one sweep for the WHOLE run — ENCUT depends on
+    #                    the POTCARs (shared by every phase) far more
+    #                    than on the structure, and KPPRA already
+    #                    normalizes mesh density per atom; also closes
+    #                    review item O1 (cross-phase consistency)
+    #   phase            one sweep per phase
+    #   sqs              legacy per-SQS sweeps (diagnostics only)
+    # `preset` seeds from --preset-encut/--preset-kppra or, for
+    # scope=system, from an earlier phase of this run.
     results = []
-    preset: Optional[tuple] = None
     for d in sqs_dirs:
         print(f"\n  -- SQS {d.name} --")
+        # Paper (Calphad 58 (2017) 70): phonons are "typically done for
+        # the end members only"; sqs2tdb -fit then represents svib
+        # linearly across composition. --phonon-scope all overrides.
+        is_endmem = (d / "endmem").is_file() or "lev=0" in d.name
+        skip_ph = skip_phonon or (phonon_scope == "endmembers"
+                                  and not is_endmem)
+        if skip_ph and not skip_phonon:
+            print(f"    (phonons: endmember-only scope — skipped for "
+                  f"this mixing SQS)")
         res = process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
-            env_bin, skip_phonon, timeout,
+            env_bin, skip_ph, timeout,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
             fitfc_opts=fitfc_opts,
             preset_encut=preset[0] if preset else None,
             preset_kppra=preset[1] if preset else None,
             max_checkrelax=max_checkrelax)
         results.append(res)
-        if convergence_scope == "phase" and preset is None:
+        if convergence_scope in ("phase", "system") and preset is None:
             preset = (res["chosen_encut"], res["chosen_kppra"])
-    return {"phase": phase, "sqs": results}
+    return {"phase": phase, "sqs": results,
+            "preset_out": list(preset) if preset else None}
 
 
 def process_sigma(phase: str,
@@ -438,8 +566,10 @@ def process_sigma(phase: str,
                   cmd_prefix: str = "",
                   relax_opts: str = "",
                   fitfc_opts: Optional[Dict] = None,
-                  convergence_scope: str = "phase",
-                  max_checkrelax: float = 0.1) -> Dict:
+                  convergence_scope: str = "system",
+                  max_checkrelax: float = 0.1,
+                  phonon_scope: str = "endmembers",
+                  preset: Optional[tuple] = None) -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -470,9 +600,10 @@ def process_sigma(phase: str,
         endmember_dirs = [d for d in discover_sqs_dirs(phase_root)
                           if "lev=0" in d.name] or discover_sqs_dirs(phase_root)
 
-    # Same phase-uniform convergence policy as process_phase.
+    # Same uniform-convergence policy as process_phase. SIGMA dirs are
+    # all endmembers, so the endmember-only phonon scope never skips
+    # them.
     results = []
-    preset: Optional[tuple] = None
     for d in endmember_dirs:
         print(f"\n  -- SIGMA endmember {d.name} --")
         res = process_one_sqs(
@@ -484,9 +615,10 @@ def process_sigma(phase: str,
             preset_kppra=preset[1] if preset else None,
             max_checkrelax=max_checkrelax)
         results.append(res)
-        if convergence_scope == "phase" and preset is None:
+        if convergence_scope in ("phase", "system") and preset is None:
             preset = (res["chosen_encut"], res["chosen_kppra"])
-    return {"phase": phase, "sqs": results, "endmember_only": True}
+    return {"phase": phase, "sqs": results, "endmember_only": True,
+            "preset_out": list(preset) if preset else None}
 
 
 def main():
@@ -519,8 +651,13 @@ def main():
                          "('Co' == 'Co=Co:2.0'). Drives the s/EL+2/POT+m/g "
                          "and s/EL-2/POT-m/g SUBATOM lines in vasp.wrap.")
     ap.add_argument("--algo", default="All",
-                    help="VASP ALGO (default 'All' per spec; use 'Fast' to "
-                         "match the reference vasp.wrap).")
+                    type=vaspwrap.normalize_algo,
+                    help="VASP electronic algorithm, applied to EVERY "
+                         "wrap the pipeline writes: All (default, most "
+                         "robust), Normal (blocked Davidson, = the "
+                         "production INCARs' IALGO=38), VeryFast "
+                         "(RMM-DIIS, cheapest/least robust). "
+                         "Case-insensitive.")
     ap.add_argument("--relax-method",
                     choices=["infdet", "normal", "runstruct"],
                     default="infdet",
@@ -597,16 +734,43 @@ def main():
                          "having left its parent lattice (ATAT guidance: "
                          "~0.1). Downstream discovery drops flagged/"
                          "over-threshold SQS.")
-    ap.add_argument("--convergence-scope", choices=("phase", "sqs"),
-                    default="phase",
-                    help="'phase' (default): converge ENCUT/KPPRA on the "
-                         "first SQS of each phase and reuse for all its "
-                         "siblings, so every structure entering a mixing-"
-                         "energy fit shares identical settings (the "
-                         "subtraction of eV-scale totals only cancels "
-                         "basis/k-mesh error at uniform settings). 'sqs' "
-                         "restores per-SQS sweeps (more compute, "
-                         "inconsistent settings — for diagnostics only).")
+    ap.add_argument("--convergence-scope",
+                    choices=("system", "phase", "sqs"),
+                    default="system",
+                    help="'system' (default): ONE ENCUT/KPPRA sweep for "
+                         "the whole run, reused by every phase — ENCUT "
+                         "tracks the POTCARs (shared across phases) far "
+                         "more than the structure, KPPRA normalizes mesh "
+                         "density per atom, and uniform settings are what "
+                         "make cross-phase lattice stabilities consistent "
+                         "(closes review item O1) at ~1/4 the sweep "
+                         "compute. 'phase': one sweep per phase. 'sqs': "
+                         "legacy per-SQS sweeps (diagnostics only).")
+    ap.add_argument("--phonon-scope", choices=("endmembers", "all"),
+                    default="endmembers",
+                    help="'endmembers' (default, the published sqs2tdb "
+                         "workflow): fitfc phonons only where the endmem "
+                         "marker / lev=0 name says so; sqs2tdb -fit then "
+                         "fits svib linearly across composition. 'all' "
+                         "adds phonons on every mixing SQS (nonideal "
+                         "vibrational entropy; several x the phonon "
+                         "compute).")
+    ap.add_argument("--preset-encut", type=int, default=None,
+                    help="Skip the ENCUT sweep entirely and use this "
+                         "value (eV). With --preset-kppra, no convergence "
+                         "sweeps run at all — use to REUSE settings "
+                         "converged on a previous run of the same "
+                         "elements (e.g. take max over the binaries when "
+                         "moving to a ternary).")
+    ap.add_argument("--probe-seed", type=int, default=0,
+                    help="Seed for the random probe-phase/probe-SQS "
+                         "selection of the system convergence protocol "
+                         "(deterministic by default so runs are "
+                         "reproducible; picks are recorded in the "
+                         "manifest).")
+    ap.add_argument("--preset-kppra", type=int, default=None,
+                    help="Skip the KPPRA sweep entirely and use this "
+                         "value. See --preset-encut.")
     ap.add_argument("--no-spin", action="store_true",
                     help="Force ISPIN=1 (non-spin-polarized) even for "
                          "magnetic elements. Default: spin polarization is "
@@ -623,6 +787,17 @@ def main():
     ap.add_argument("--spin", action="store_true",
                     help="Force ISPIN=2 even for elements outside the "
                          "magnetic-3d set.")
+    ap.add_argument("--fitfc-ernn", type=float, default=None,
+                    help="fitfc displacement radius in nearest-neighbour "
+                         "units (default 4, the published value; smaller "
+                         "= cheaper force runs, shorter-ranged force "
+                         "constants).")
+    ap.add_argument("--fitfc-frnn", type=float, default=None,
+                    help="fitfc force-constant range in nn units "
+                         "(default 2, the published value).")
+    ap.add_argument("--fitfc-dr", type=float, default=None,
+                    help="fitfc displacement magnitude in Angstrom "
+                         "(default 0.04, the published value).")
     ap.add_argument("--fitfc-rl", type=float, default=None,
                     help="Pass fitfc's -rl=<len> robust-length soft-mode "
                          "treatment (beta) to the fit, which also prevents "
@@ -705,6 +880,12 @@ def main():
         fitfc_opts["rl"] = args.fitfc_rl
     if args.fitfc_escalate_ernn is not None:
         fitfc_opts["escalate_ernn"] = args.fitfc_escalate_ernn
+    if args.fitfc_ernn is not None:
+        fitfc_opts["ernn"] = args.fitfc_ernn
+    if args.fitfc_frnn is not None:
+        fitfc_opts["frnn"] = args.fitfc_frnn
+    if args.fitfc_dr is not None:
+        fitfc_opts["dr"] = args.fitfc_dr
 
     print(f"  Phonons     : {'skipped' if args.skip_phonon else 'fitfc'}"
           + ("" if args.skip_phonon else
@@ -732,10 +913,29 @@ def main():
         "magmom_init": vaspwrap.DEFAULT_MAGMOM_INIT
                        if vaspwrap.DEFAULT_SPIN else None,
         "convergence_scope": args.convergence_scope,
+        "phonon_scope": args.phonon_scope,
         "max_checkrelax": args.max_checkrelax,
         "phases": [],
     }
     manifest["sqs_levels"] = sqs_levels
+    run_preset: Optional[tuple] = None
+    if args.preset_encut is not None and args.preset_kppra is not None:
+        run_preset = (args.preset_encut, args.preset_kppra)
+        print(f"  Preset      : ENCUT={args.preset_encut} eV, "
+              f"KPPRA={args.preset_kppra} — convergence sweeps SKIPPED")
+    elif args.convergence_scope == "system":
+        probe = system_probe_convergence(
+            work_root, phases, [args.element1, args.element2],
+            potcar_paths, dlm, args.algo, args.tol_ev, sqs_levels,
+            args.env_bin, args.timeout, args.cmd_prefix,
+            seed=args.probe_seed)
+        if probe:
+            run_preset = (probe["encut"], probe["kppra"])
+            manifest["system_probe"] = probe
+        else:
+            print("  WARNING: probe protocol found no single-sublattice "
+                  "phase / rich-side SQS; falling back to first-SQS "
+                  "convergence reuse.")
     for phase in phases:
         res = process_phase(
             phase, work_root, potcar_paths, dlm, args.relax_method,
@@ -744,8 +944,15 @@ def main():
             cmd_prefix=args.cmd_prefix, relax_opts=args.relax_opts,
             fitfc_opts=fitfc_opts,
             convergence_scope=args.convergence_scope,
-            max_checkrelax=args.max_checkrelax)
+            max_checkrelax=args.max_checkrelax,
+            phonon_scope=args.phonon_scope,
+            preset=run_preset)
         manifest["phases"].append(res)
+        if args.convergence_scope == "system" and run_preset is None \
+                and res.get("preset_out"):
+            run_preset = tuple(res["preset_out"])
+            print(f"  [system scope] reusing ENCUT={run_preset[0]} eV, "
+                  f"KPPRA={run_preset[1]} for all remaining phases")
 
     out = Path(args.out) if args.out else work_root / "upstream_manifest.json"
     out.write_text(json.dumps(manifest, indent=2, default=str))

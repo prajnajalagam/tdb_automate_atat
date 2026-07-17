@@ -9,8 +9,12 @@ sweep is anchored on the *largest* ENMAX among the POTCARs involved.
 
 Sweep definitions (from the design spec)
 -----------------------------------------
-ENCUT sweep : 1.00 x MAX_ENMAX .. 1.25 x MAX_ENMAX, 5 points inclusive.
-KPPRA sweep : 4000 .. 10000, step 1000 (7 points).
+ENCUT sweep : starts 1.00 x .. 1.25 x MAX_ENMAX (5 points) and EXTENDS
+              upward in grid-sized steps until the successive-step
+              criterion is met (no convergence ceiling; runaway guard
+              at ENCUT_GUARD_FACTOR x ENMAX).
+KPPRA sweep : 4000 .. 10000, step 1000 (7 points), extends to 20000 if
+              needed.
 KPPRA sweep is run at a fixed ENCUT of 1.125 x MAX_ENMAX (mid-range, so
 the k-point convergence isn't contaminated by an under-converged basis).
 The converged KPPRA is then frozen while the ENCUT sweep is run.
@@ -25,9 +29,22 @@ from typing import Dict, List, Optional
 # "ENMAX  =  267.882; ENMIN  =  200.911 eV"
 _ENMAX_RE = re.compile(r"ENMAX\s*=\s*([0-9]+\.?[0-9]*)")
 
-# Fractions of MAX_ENMAX spanned by the ENCUT sweep.
+# Fractions of MAX_ENMAX spanned by the INITIAL ENCUT sweep grid. The
+# high factor is NOT a convergence ceiling (2026-07-16): converge.py
+# extends the sweep in grid-sized steps until the successive-difference
+# criterion is met, bounded only by the runaway guard below.
 ENCUT_LOW_FACTOR = 1.00
 ENCUT_HIGH_FACTOR = 1.25
+# Runaway guard for the unbounded ENCUT extension — not a physics
+# ceiling; 3 x ENMAX (~800 eV for Co/Cr) is far beyond any plausible
+# convergence point, so hitting it means something is wrong with the
+# calculations, not the basis.
+ENCUT_GUARD_FACTOR = 3.0
+
+# KPPRA extension guard: same successive-difference criterion; the
+# 4000..10000 base grid usually suffices (2026-07-16 e2e converged at
+# 7000). Step reuses KPPRA_STEP defined with the base grid below.
+KPPRA_EXTEND_MAX = 20000
 
 # ENCUT floor factor for ISIF=3 (variable-cell) relaxations. The
 # convergence sweep tests ENERGY convergence on static points; the

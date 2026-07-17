@@ -89,14 +89,14 @@ def test_wrap_relax_has_dostatic_full_dof():
 
 
 def test_wrap_phonon_matches_fvasp_conventions():
-    """Frozen force-run wrap = the user's fvasp.wrap: NSW=0/IBRION=-1/
+    """Frozen force-run wrap = the user's vaspf.wrap: NSW=0/IBRION=-1/
     ISIF=2, PREC=Accurate, ALGO=Fast, and NO ICHARG=1 (hard-errors when
     no CHGCAR exists — the first force run never has one)."""
     w = vaspwrap.build_vasp_wrap("phonon", encut=300, kppra=6000)
     assert "DOSTATIC" not in w
     assert "ICHARG" not in w
     assert "NSW = 0" in w and "IBRION = -1" in w and "ISIF = 2" in w
-    assert "PREC = Accurate" in w and "ALGO = Fast" in w
+    assert "PREC = Accurate" in w and "ALGO = All" in w
 
 
 def test_wrap_algo_override():
@@ -137,31 +137,53 @@ def test_wrap_dlm_subatom_and_magatom():
     assert "MAGMOM" not in w     # moments come from SUBATOM, not MAGMOM
 
 
-# ---- convergence selection (1 meV/atom) ------------------------------------
+# ---- convergence selection: successive-difference + confirmation ----------
+# (2026-07-16 user criterion: step from PREVIOUS < tol AND step to NEXT
+#  < tol; the next point is the deliberately "unneeded" confirmation.)
 
-def test_select_converged_picks_smallest_stable():
-    settings = [4000, 5000, 6000, 7000]
-    # energies drift then settle within 1 meV of the 7000 reference from 6000 on
-    e = [-5.010, -5.0035, -5.0006, -5.0000]
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
-    assert ref == 7000
-    assert chosen == 6000
+def test_select_converged_real_kppra_data_picks_7000():
+    """The user's actual 2026-07-16 KPPRA sweep: manual analysis says
+    7000 (|7000-6000| = 0.082 meV < 0.1, |8000-7000| = 0.000 confirms).
+    4000/5000 must NOT win despite their small mutual step, because the
+    5000->6000 step (0.176 meV) breaks the plateau."""
+    settings = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    e = [-6.2614504, -6.2615232, -6.2616992, -6.2616170,
+         -6.2616170, -6.2617104, -6.2615474]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
     assert conv is True
+    assert chosen == 7000
+    assert ref == 8000                      # the confirming point
 
 
-def test_select_converged_not_converged_falls_back():
-    settings = [4000, 5000, 6000]
-    e = [-5.10, -5.05, -5.00]               # 50 meV gaps, never within 1 meV
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
+def test_select_converged_real_encut_data_not_converged():
+    """The user's actual ENCUT sweep: successive steps still 0.4-1.4
+    meV/atom at the top of the grid — must report NOT converged (the
+    old compare-to-reference rule wrongly accepted this)."""
+    settings = [268, 285, 301, 318, 335]
+    e = [-6.2500555, -6.2579381, -6.2614504, -6.2610447, -6.2596040]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
     assert conv is False
-    assert chosen == 6000                   # reference / highest
+    assert chosen == 335                    # fall back to highest
+
+
+def test_select_converged_needs_confirming_point_above():
+    # plateau reached at the LAST point only -> no confirmation -> not
+    # converged (drives the adaptive extension to add one more run)
+    settings = [300, 320, 340]
+    e = [-5.010, -5.0002, -5.00015]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
+    assert conv is False and chosen == 340
 
 
 def test_select_converged_ignores_missing():
-    settings = [4000, 5000, 6000]
-    e = [None, -5.0005, -5.0000]
-    chosen, conv, ref = converge.select_converged(settings, e, tol_ev=0.001)
-    assert chosen == 5000 and conv is True
+    settings = [4000, 5000, 6000, 7000]
+    e = [None, -5.00005, -5.00002, -5.00001]
+    chosen, conv, ref = converge.select_converged(settings, e,
+                                                  tol_ev=0.0001)
+    assert chosen == 6000 and conv is True and ref == 7000
 
 
 # ---- str.out parsing + DLM fixup -------------------------------------------
@@ -708,8 +730,8 @@ def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
     assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
     polled = [c for k, c in calls if k == "polled"]
     assert len(polled) == 1, "only the force runs need pollmach"
-    assert polled[0][:4] == ["pollmach", "runstruct_vasp",
-                             "-w", "fvasp.wrap"]
+    assert polled[0][:5] == ["pollmach", "runstruct_vasp",
+                             "-lu", "-w", "vaspf.wrap"]
     assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
     # svib_ht promoted top-level for sqs2tdb -fit
     assert (sqs / "svib_ht").read_text() == "3.21\n"
@@ -771,10 +793,10 @@ def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
         "fitfc must be re-run with the SAME command-line options"
     assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
     # per-vol relax wraps removed; force runs use the separate top-level
-    # fvasp.wrap (selected with -w), never the relax-stage vasp.wrap
+    # vaspf.wrap (selected with -w), never the relax-stage vasp.wrap
     for vol in sqs.glob("vol_*"):
         assert not (vol / "vasp.wrap").is_file()
-    assert (sqs / "fvasp.wrap").is_file()
+    assert (sqs / "vaspf.wrap").is_file()
     assert (sqs / "svib_ht").read_text() == "3.3\n"
 
 
@@ -971,14 +993,14 @@ def test_run_fitfc_escalate_resolves(tmp_path, monkeypatch):
     phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate")
 
     assert len(gen_cmds) == 2, "one normal gen + one escalated gen"
-    assert "-ernn=2.0" in gen_cmds[0] and "-ernn=3.0" in gen_cmds[1]
+    assert "-ernn=4.0" in gen_cmds[0] and "-ernn=6.0" in gen_cmds[1]
     assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
     # the original pert kept its force.out; only the new dir was run
-    assert forced_pert.count("p+0.2_2.0_0") == 1
-    assert forced_pert.count("p+0.2_3.0_0") == 1
+    assert forced_pert.count("p+0.2_4.0_0") == 1
+    assert forced_pert.count("p+0.2_6.0_0") == 1
     assert (sqs / "svib_ht").read_text() == "4.4\n"
     marker = (sqs / "unstable_modes.log").read_text()
-    assert "RESOLVED" in marker and "-ernn=3.0" in marker
+    assert "RESOLVED" in marker and "-ernn=6.0" in marker
 
 
 def test_run_fitfc_escalate_persists_marks_energy_only(tmp_path, monkeypatch):
@@ -1188,13 +1210,13 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
     assert plan["T3_robustrelax"]["argv"][:4] == \
         ["robustrelax_vasp", "-id", "-c", "0.05"]
-    assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
-                                                 "fvasp.wrap"]
+    assert plan["T4_fitfc_wrap"]["argv"][:4] == ["runstruct_vasp", "-lu",
+                                                 "-w", "vaspf.wrap"]
     assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
     # inputs on disk: frozen wrap under the separate name, wait markers,
     # displaced structure for the force run
-    assert (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").is_file()
-    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").read_text()
+    assert (tmp_path / "T4_fitfc_wrap" / "vaspf.wrap").is_file()
+    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "vaspf.wrap").read_text()
     assert "0.52" in (tmp_path / "T4_fitfc_wrap" / "str.out").read_text()
     assert (tmp_path / "T5_pollmach" / "p_1" / "wait").is_file()
     assert (tmp_path / "T5_pollmach" / "vasp.wrap").is_file()
@@ -1359,7 +1381,7 @@ def _mk_e2e_endmember(root, name, good=True, svib=True):
         (d / "robustrelax_infdet.log").write_text(
             "$ robustrelax_vasp -id -c 0.05 mpiexec -n 32\n")
         (d / "checkrelax.out").write_text("0.012\n")
-        (d / "fvasp.wrap").write_text("[INCAR]\nNSW = 0\n")
+        (d / "vaspf.wrap").write_text("[INCAR]\nNSW = 0\n")
         pert = d / "vol_0" / "p+0.2_5.1_0"
         pert.mkdir(parents=True)
         (pert / "force.out").write_text("0 0 0\n")
@@ -1477,3 +1499,201 @@ def test_e2e_find_endmembers_skips_raw_db_dirs(tmp_path):
     (raw / "str.out").write_text("raw db\n")
     dirs = e2e.find_endmember_dirs(tmp_path)
     assert [d.name for d in dirs] == ["sqs_lev=0_a_Co=1"]
+
+
+
+# ---- vaspf.wrap sized for the perturbation supercell (2026-07-16) ----------
+
+def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
+    """VASP 6.6: MAGMOM must have exactly NIONS values. The force runs
+    execute in the perturbation SUPERCELL (8 atoms for a 1-atom FCC
+    endmember at -ernn=2), so vaspf.wrap must be sized from the p* dirs,
+    not the SQS cell — the e2e run died on "1 value(s) for MAGMOM ...
+    NIONS=8" when it was sized from the 1-atom cell."""
+    monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", True)
+    sqs = tmp_path / "sqs_lev=0_a_Co=1"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+    (sqs / "str_relax.out").write_text(
+        "1 0 0\n0 1 0\n0 0 1\n3.5 0 0\n0 3.5 0\n0 0 3.5\n0 0 0 Co\n")
+
+    def fake_run_logged(cmd, cwd, log, **kw):
+        if cmd[0] == "fitfc" and "-f" not in cmd:
+            pert = Path(cwd) / "vol_0" / "p+0.2_5.1_0"
+            pert.mkdir(parents=True, exist_ok=True)
+            rows = "2 0 0\n0 2 0\n0 0 2\n"     # 8-atom supercell
+            atoms = "\n".join(f"0 0 {i} Co" for i in range(8))
+            (pert / "str.out").write_text(
+                "1 0 0\n0 1 0\n0 0 1\n" + rows + atoms + "\n")
+            (pert / "wait").write_text("")
+            (Path(cwd) / "vol_0" / "str_relax.out").write_text("s\n")
+        if "-f" in cmd:
+            (Path(cwd) / "vol_0" / "svib_ht").write_text("1.0\n")
+        return 0
+
+    def fake_run_polled(cmd, cwd, log, done_when, **kw):
+        # the wrap must ALREADY be sized for the supercell when the
+        # force runs launch
+        wrap = (Path(cwd) / "vaspf.wrap").read_text()
+        assert "MAGMOM = 8*3" in wrap, wrap
+        assert "MAGMOM = 1*3" not in wrap
+        for d in Path(cwd).glob("vol_*/p*"):
+            (d / "force.out").write_text("0\n")
+            (d / "str_relax.out").write_text("s\n")
+        return 0
+
+    monkeypatch.setattr(phonon.runner, "run_logged", fake_run_logged)
+    monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
+
+    phonon.run_fitfc(sqs, encut=400, kppra=6000)
+    wrap = (sqs / "vaspf.wrap").read_text()
+    assert "MAGMOM = 8*3" in wrap and "ISPIN = 2" in wrap
+
+
+
+# ---- adaptive ENCUT extension (no convergence ceiling) ----------------------
+
+def test_run_sweep_extends_until_converged(tmp_path, monkeypatch):
+    """ENCUT sweep must climb past the initial grid until the
+    successive-difference + confirmation criterion is met."""
+    # plateau only reached at 400: initial grid [300..335] can't satisfy
+    energies = {300: -5.020, 317: -5.010, 335: -5.004,
+                352: -5.001, 369: -5.00030, 386: -5.00025, 403: -5.00022}
+
+    def fake_point(src, dst, encut, kppra, **kw):
+        return energies[encut]
+
+    monkeypatch.setattr(converge, "run_static_point", fake_point)
+    res = converge.run_sweep(
+        "ENCUT", tmp_path / "sqs", tmp_path / "sweep",
+        settings=[300, 317, 335], fixed_other=7000,
+        tol_ev=0.0001, extend_step=17, extend_max=500)
+    assert res.converged is True
+    assert res.chosen == 386                # 369->386 and 386->403 < tol
+    assert res.reference == 403             # confirmation point
+    assert res.settings[-1] == 403          # extended past the old grid
+
+
+def test_run_sweep_extension_hits_guard_and_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(converge, "run_static_point",
+                        lambda src, dst, encut, kppra, **kw:
+                        -5.0 - encut * 1e-4)   # never converges
+    res = converge.run_sweep(
+        "ENCUT", tmp_path / "sqs", tmp_path / "sweep",
+        settings=[300, 320], fixed_other=7000,
+        tol_ev=0.0001, extend_step=20, extend_max=400)
+    assert res.converged is False
+    assert res.settings[-1] <= 400          # guard respected
+    assert res.chosen == res.settings[-1]   # falls back to highest
+
+
+
+# ---- ALGO modes + convergence-probe protocol (2026-07-17) -------------------
+
+def test_normalize_algo_modes():
+    assert vaspwrap.normalize_algo("all") == "All"
+    assert vaspwrap.normalize_algo("NORMAL") == "Normal"
+    assert vaspwrap.normalize_algo("VeryFast") == "VeryFast"
+    for bad in ("Fast", "damped", ""):
+        with pytest.raises(ValueError):
+            vaspwrap.normalize_algo(bad)
+
+
+def test_site_fractions_and_rich_side_picks(tmp_path):
+    import random
+    names = ["sqs_lev=0_a_Co=1", "sqs_lev=0_a_Cr=1",
+             "sqs_lev=1_a_Co=0.5,a_Cr=0.5",
+             "sqs_lev=2_a_Co=0.75,a_Cr=0.25",
+             "sqs_lev=2_a_Co=0.25,a_Cr=0.75"]
+    dirs = []
+    for n in names:
+        d = tmp_path / n
+        d.mkdir()
+        dirs.append(d)
+    fr = run_upstream.site_fractions("sqs_lev=2_a_Co=0.75,a_Cr=0.25")
+    assert fr["Co"] == pytest.approx(0.75) and fr["Cr"] == pytest.approx(0.25)
+
+    picks = run_upstream.pick_probe_dirs(dirs, ["Co", "Cr"],
+                                         random.Random(0))
+    # rich = strictly > 0.5: endmember or 0.75 side; NEVER the midpoint
+    assert set(picks) == {"Co", "Cr"}
+    assert run_upstream.site_fractions(picks["Co"].name)["Co"] > 0.5
+    assert run_upstream.site_fractions(picks["Cr"].name)["Cr"] > 0.5
+    assert "0.5,a_Cr=0.5" not in picks["Co"].name
+    # deterministic under a fixed seed
+    again = run_upstream.pick_probe_dirs(dirs, ["Co", "Cr"],
+                                         random.Random(0))
+    assert picks == again
+
+
+def test_system_probe_takes_max_and_pulay_floor(tmp_path, monkeypatch):
+    """Probe protocol: sweep one rich-side SQS per element, take the
+    elementwise MAX, fold in the Pulay floor -> ONE global (ENCUT,
+    KPPRA) for every energy/relax/infdet/phonon run."""
+    import types
+    root = tmp_path
+
+    def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
+                 env_bin=None, **kw):
+        pr = Path(work_root) / f"{phase}_small"
+        for n in ("sqs_lev=0_a_Co=1", "sqs_lev=0_a_Cr=1",
+                  "sqs_lev=1_a_Co=0.5,a_Cr=0.5"):
+            d = pr / n
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "str.out").write_text("s\n")
+        return pr
+
+    res = types.SimpleNamespace(table=lambda: "", converged=True)
+    sweeps = {}
+
+    def fake_converge(src, sweep_root, pots, **kw):
+        # Cr probe demands more than Co probe
+        if "Cr=1" in Path(src).name:
+            sweeps["cr"] = True
+            return 420, 8000, res, res
+        sweeps["co"] = True
+        return 360, 7000, res, res
+
+    monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs", fake_converge)
+    monkeypatch.setattr(run_upstream.potcar, "max_enmax", lambda p: 268.0)
+
+    probe = run_upstream.system_probe_convergence(
+        root, ["FCC_A1", "SIGMA_D8B"], ["Co", "Cr"],
+        potcar_paths=["x"], dlm=DLMConfig(enabled=False, subatom={}),
+        algo="All", tol_ev=1e-4, sqs_levels=[2], env_bin=None,
+        timeout=60, cmd_prefix="", seed=0)
+
+    assert sweeps == {"co": True, "cr": True}, "one sweep per rich side"
+    assert probe["kppra"] == 8000                    # max over probes
+    # max encut 420 already exceeds the 1.3 x 268 = 350 Pulay floor
+    assert probe["encut"] == 420
+    assert probe["phase"] == "FCC_A1"                # only 1-sublattice pick
+    assert set(probe["probes"]) == {"Co", "Cr"}
+
+
+def test_system_probe_none_without_single_sublattice(tmp_path):
+    out = run_upstream.system_probe_convergence(
+        tmp_path, ["SIGMA_D8B"], ["Co", "Cr"], potcar_paths=[],
+        dlm=DLMConfig(enabled=False, subatom={}), algo="All",
+        tol_ev=1e-4, sqs_levels=[0], env_bin=None, timeout=60,
+        cmd_prefix="", seed=0)
+    assert out is None
+
+
+def test_e2e_probe_check_reads_manifest(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import json as _json
+    import run_endmember_e2e as e2e
+    r = e2e.verify_probe(tmp_path)
+    assert not r["pass"] and "missing" in r["detail"]
+    (tmp_path / "upstream_manifest.json").write_text(_json.dumps({
+        "system_probe": {"phase": "FCC_A1", "seed": 0,
+                         "encut": 420, "kppra": 8000,
+                         "probes": {"Co": {"dir": "x", "encut": 360,
+                                           "kppra": 7000},
+                                    "Cr": {"dir": "y", "encut": 420,
+                                           "kppra": 8000}}}}))
+    r = e2e.verify_probe(tmp_path)
+    assert r["pass"]
+    assert "GLOBAL ENCUT=420" in r["detail"] and "KPPRA=8000" in r["detail"]

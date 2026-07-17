@@ -73,6 +73,23 @@ from phases import DLMConfig
 # this pipeline combined (the convergence tolerance is 1 meV/atom).
 MAGNETIC_3D = {"Cr", "Mn", "Fe", "Co", "Ni"}
 
+# Supported ALGO modes (2026-07-17 user decision): All (default, most
+# robust diagonalization), Normal (blocked Davidson, = IALGO 38 in the
+# production INCARs), VeryFast (RMM-DIIS only, cheapest and least
+# robust — use only on well-behaved systems). One global choice applies
+# to EVERY wrap the pipeline writes (static, relax, phonon).
+ALGO_MODES = ("All", "Normal", "VeryFast")
+
+
+def normalize_algo(algo: str) -> str:
+    """Case-insensitive ALGO normalization restricted to ALGO_MODES."""
+    canon = {m.lower(): m for m in ALGO_MODES}
+    key = str(algo).strip().lower()
+    if key not in canon:
+        raise ValueError(
+            f"ALGO {algo!r} not in supported modes {ALGO_MODES}")
+    return canon[key]
+
 # Module default for the `spin` argument of build_vasp_wrap. run_upstream
 # sets this once (auto-on when any element is in MAGNETIC_3D and the run
 # is not DLM) so every wrap written by converge/relax/phonon inherits it
@@ -149,15 +166,15 @@ _MODE_INCAR: Dict[str, List[Tuple[str, object]]] = {
         ("_dostatic", True),
     ],
     "phonon": [
-        # The user's fvasp.wrap: frozen ions (NSW=0/IBRION=-1/ISIF=2),
-        # PREC=Accurate for clean forces, ALGO=Fast (fine for a static
-        # point on a good geometry). No ICHARG=1 — it hard-errors when
-        # no CHGCAR exists, and the first force run never has one.
+        # Frozen ions (NSW=0/IBRION=-1/ISIF=2), PREC=Accurate for clean
+        # forces. ALGO comes from the global --algo choice (2026-07-17:
+        # one ALGO mode for all wraps; default All). No ICHARG=1 — it
+        # hard-errors when no CHGCAR exists, and the first force run
+        # never has one.
         ("NSW", 0),
         ("IBRION", -1),
         ("ISIF", 2),
         ("PREC", "Accurate"),
-        ("ALGO", "Fast"),
         ("_dostatic", False),
     ],
 }

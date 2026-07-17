@@ -12,7 +12,7 @@ drives the actual production entry point —
 scope: sqs2tdb -cp generation, the ENCUT/KPPRA convergence sweeps, the
 infdet relaxation (robustrelax_vasp -id -c 0.05), result validation,
 checkrelax, energy/energy_end bookkeeping, and the full fitfc phonon
-workflow (fvasp.wrap force runs, svib_ht promotion or unstable-mode
+workflow (vaspf.wrap force runs, svib_ht promotion or unstable-mode
 disposition). The lev=0 endmembers are 1-atom cells — precisely the
 cells that died in the 2026-07-14 run — so this doubles as the
 regression test for every fix that came out of that diagnosis.
@@ -27,7 +27,7 @@ against an explicit checklist and writes e2e_report.{txt,json}:
   - infdet actually invoked with its strain cutoff (-id ... -c 0.05)
   - checkrelax.out written (value reported)
   [phonon criteria — svib_ht OR a documented unstable disposition]
-  - fvasp.wrap present; vol_0/p* force runs attempted
+  - vaspf.wrap present; vol_0/p* force runs attempted
   - svib_ht promoted to the top level, OR unstable_modes.log explains
     why the SQS is energy-only (both are correct machinery behavior;
     FCC Cr may legitimately be dynamically unstable)
@@ -157,7 +157,7 @@ def verify_endmember_dir(d: Path) -> Dict:
           else "checkrelax.out missing/unparseable")
 
     # ── phonon machinery (soft: unstable disposition is also a PASS) ──
-    check("fvasp_wrap_written", (d / "fvasp.wrap").is_file(),
+    check("vaspf_wrap_written", (d / "vaspf.wrap").is_file(),
           "separate frozen wrap for force runs", hard=False)
     pert = sorted((d / "vol_0").glob("p*")) if (d / "vol_0").is_dir() else []
     forces = sum(1 for p in pert if (p / "force.out").is_file())
@@ -192,6 +192,31 @@ def find_endmember_dirs(work_root: Path) -> List[Path]:
     return out
 
 
+def verify_probe(work_root: Path) -> Dict:
+    """Tree-level check of the 2026-07-17 convergence-probe protocol:
+    the manifest must record ONE global (ENCUT, KPPRA) chosen from the
+    rich-side probes and used for every run. Soft (older trees predate
+    the protocol) but reported prominently."""
+    mf = work_root / "upstream_manifest.json"
+    try:
+        m = json.loads(mf.read_text())
+    except (OSError, ValueError):
+        return {"pass": False, "detail": "upstream_manifest.json "
+                "missing/unreadable — cannot confirm global settings"}
+    probe = m.get("system_probe")
+    if not probe:
+        return {"pass": False,
+                "detail": "no system_probe in manifest (pre-protocol "
+                          "tree, or probe fell back to first-SQS reuse)"}
+    per_el = ", ".join(f"{el}: ENCUT={v['encut']}/KPPRA={v['kppra']}"
+                       for el, v in sorted(probe["probes"].items()))
+    return {"pass": True,
+            "detail": f"GLOBAL ENCUT={probe['encut']} eV, "
+                      f"KPPRA={probe['kppra']} from {probe['phase']} "
+                      f"rich-side probes ({per_el}; seed "
+                      f"{probe.get('seed')})"}
+
+
 def verify_tree(work_root: Path) -> Tuple[List[Dict], bool]:
     dirs = find_endmember_dirs(work_root)
     results = [verify_endmember_dir(d) for d in dirs]
@@ -202,8 +227,10 @@ def verify_tree(work_root: Path) -> Tuple[List[Dict], bool]:
 
 def write_report(work_root: Path, results: List[Dict], ok: bool,
                  meta: Dict) -> None:
+    probe = verify_probe(work_root)
     (work_root / "e2e_report.json").write_text(json.dumps(
-        {"meta": meta, "suite_pass": ok, "endmembers": results},
+        {"meta": meta, "suite_pass": ok, "global_settings": probe,
+         "endmembers": results},
         indent=2, default=str))
     lines = ["=" * 70,
              f"FCC endmember end-to-end test — {meta.get('timestamp')}",
@@ -211,6 +238,8 @@ def write_report(work_root: Path, results: List[Dict], ok: bool,
              f"SUITE: {'PASS' if ok else 'FAIL'} "
              f"({len(results)} endmember dirs found; need >= 2 with all "
              f"hard criteria green)",
+             f"[{'ok' if probe['pass'] else '!!'}] global settings: "
+             f"{probe['detail']}",
              "=" * 70]
     for r in results:
         flag = "PASS" if r["hard_pass"] else "FAIL"
@@ -247,7 +276,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "perturbation supercells exactly; the 1-atom "
                          "endmembers get the adaptive NCORE=1/KPAR=1.")
     ap.add_argument("--env-bin", default=None)
-    ap.add_argument("--tol-ev", default="0.001")
+    ap.add_argument("--tol-ev", default="0.0001",
+                    help="Successive-step convergence tolerance in "
+                         "eV/atom (default 0.1 meV/atom).")
     ap.add_argument("--fitfc-on-unstable", default="mark",
                     choices=("mark", "escalate", "force"))
     ap.add_argument("--timeout", type=int, default=5400)

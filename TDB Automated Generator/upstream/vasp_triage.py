@@ -77,6 +77,15 @@ CATALOG: List[Signature] = [
               "step error (often MPI decomposition: NCORE/KPAR too "
               "large for a small cell, or rank oversubscription); any "
               "error VASP prints after this line is a red herring."),
+    Signature("magmom_count", "cell_basis",
+              r"value\(s\) for MAGMOM; however",
+              "both",
+              "MAGMOM length != NIONS (VASP 6.6 hard-errors). The wrap "
+              "was sized for the wrong cell — e.g. a force-run wrap "
+              "sized from the 1-atom SQS instead of the perturbation "
+              "supercell. Fixed 2026-07-16: fvasp.wrap is now written "
+              "after fitfc generation from the p* supercell atom "
+              "count; regenerate wraps if this fires on old trees."),
     Signature("sick_job", "cell_basis",
               r"REFUSE TO CONTINUE WITH THIS SICK JOB",
               "both",

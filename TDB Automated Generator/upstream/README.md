@@ -38,15 +38,31 @@ For each SQS (and each SIGMA endmember):
 
 1. **Static runs**, starting at `lev=1` for each binary single-sublattice
    phase.
-2. **Convergence testing** — `MAX_ENMAX` is the largest `ENMAX` across the
-   POTCARs.
-   - **KPPRA** swept `4000 … 10000` (step 1000) at a fixed
-     `ENCUT = 1.125 × MAX_ENMAX`; the converged KPPRA is frozen.
-   - **ENCUT** swept `1.00 × … 1.25 × MAX_ENMAX` (5 points) at the converged
-     KPPRA.
-   - *Converged* = the smallest setting whose energy/atom — and every larger
-     setting's — is within `--tol-ev` (default **1 meV/atom**) of the
-     highest-setting reference.
+2. **Convergence testing** — the probe protocol (2026-07-17 default,
+   `--convergence-scope system`): randomly pick ONE single-sublattice
+   phase (seeded, `--probe-seed`), sweep one randomly chosen SQS on
+   **each element-rich side** (>50% of that element; endmembers count;
+   lev irrelevant), take the elementwise **max** over the probes, fold
+   in the Pulay floor — and use that **single (ENCUT, KPPRA) for every
+   energy, relaxation, inflection-detection and phonon run** in the
+   job. Rich-side sampling matters because basis demand is
+   element-dependent (Cr_pv ≫ Co); the max is conservative for the
+   other side. Picks + per-probe results land in the manifest.
+   `MAX_ENMAX` is the largest `ENMAX` across the POTCARs.
+   - **KPPRA** swept `4000 … 10000` (step 1000, extends to 20000 if
+     needed) at a fixed `ENCUT = 1.125 × MAX_ENMAX`; the converged
+     KPPRA is frozen.
+   - **ENCUT** starts at `1.00 × … 1.25 × MAX_ENMAX` (5 points) at the
+     converged KPPRA and **extends upward with no convergence ceiling**
+     (runaway guard at 3 × ENMAX) until the criterion is met — the
+     2026-07-16 e2e sweep was still moving 0.4–1.4 meV/atom at the old
+     1.25× ceiling.
+   - *Converged* (successive-difference + confirmation, 2026-07-16): the
+     smallest setting whose energy changed by less than `--tol-ev`
+     (default **0.1 meV/atom**) from the PREVIOUS point AND whose NEXT
+     point — the deliberately "unneeded" confirmation run — also agrees
+     to within tolerance. Energy *differences* converge faster than
+     totals (VASP wiki), so this is conservative for mixing energies.
    - `ALGO = All` by default.
 3. **Relaxation** — `--relax-method infdet` is the DEFAULT (user
    decision 2026-07-15): `robustrelax_vasp -mk` then
@@ -63,13 +79,24 @@ For each SQS (and each SIGMA endmember):
    vibrational (harmonic) one:
 
    ```
-   fitfc -si=str_relax.out -ernn=2 -ns=1 -nrr    # vol_0 + p* dirs, ONE call
-   pollmach runstruct_vasp <launcher>            # force.out per p* dir
+   fitfc -si=str_relax.out -ernn=4 -ns=1 -dr=0.04 -nrr   # ONE call
+   pollmach runstruct_vasp -lu -w vaspf.wrap <launcher>  # force.out per p*
    [DLM fixup]
-   fitfc -f -frnn=1.5 -si=str_relax.out          # → vol_0/svib_ht
-   cp vol_0/svib_ht .                            # automated: sqs2tdb -fit
-                                                 # only reads <sqs>/svib_ht
+   fitfc -f -frnn=2 -si=str_relax.out                    # → vol_0/svib_ht
+   robustrelax_vasp -vib                                 # paper step (iv):
+                                                         # svib_ht where
+                                                         # sqs2tdb reads it
+                                                         # (cp fallback kept)
    ```
+
+   These are the PUBLISHED values (van de Walle et al., Calphad 58
+   (2017) 70, §3.3; "-ernn/-frnn may need to be adjusted depending on
+   the alloy system" — override with `--fitfc-ernn/--fitfc-frnn/`
+   `--fitfc-dr`). `vaspf.wrap` (the `-mk` name) is REwritten by the
+   pipeline after generation so its MAGMOM/NCORE/KPAR match the
+   perturbation SUPERCELL. **Scope: endmembers only by default**
+   (`--phonon-scope`, per the paper) — sqs2tdb -fit fits svib linearly
+   across composition; use `all` for nonideal vibrational entropy.
 
    With `-nrr` (default at `ns=1`) the volume dir is the already-relaxed
    input, so generation is a single invocation. A quasiharmonic strain
