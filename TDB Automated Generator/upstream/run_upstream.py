@@ -154,6 +154,114 @@ def discover_sqs_dirs(phase_root: Path) -> List[Path]:
     return out
 
 
+# Composition tokens in a decorated calc-dir name: site_El=frac
+_COMP_TOKEN_RE = re.compile(r"[a-z]+_([A-Z][a-z]?)[+-]?\d*=([0-9.]+)")
+
+
+def site_fractions(dirname: str) -> Dict[str, float]:
+    """Element -> overall fraction parsed from a decorated dir name
+    (site multiplicities ignored — adequate for single-sublattice
+    phases, which is all the probe protocol samples)."""
+    fr: Dict[str, float] = {}
+    for el, v in _COMP_TOKEN_RE.findall(dirname):
+        fr[el] = fr.get(el, 0.0) + float(v)
+    tot = sum(fr.values())
+    return {el: v / tot for el, v in fr.items()} if tot > 0 else {}
+
+
+def pick_probe_dirs(dirs: List[Path], elements: List[str],
+                    rng) -> Dict[str, Path]:
+    """One randomly chosen SQS per element from that element's RICH
+    side (fraction > 0.5; pure endmembers qualify; lev irrelevant) —
+    the 2026-07-17 convergence-probe protocol."""
+    picks: Dict[str, Path] = {}
+    for el in elements:
+        key = el.capitalize()
+        rich = [d for d in sorted(dirs)
+                if site_fractions(d.name).get(key, 0.0) > 0.5]
+        if rich:
+            picks[el] = rng.choice(rich)
+    return picks
+
+
+def system_probe_convergence(work_root: Path,
+                             requested_phases: List[str],
+                             elements: List[str],
+                             potcar_paths: List[Path],
+                             dlm: DLMConfig,
+                             algo: str,
+                             tol_ev: float,
+                             sqs_levels: List[int],
+                             env_bin: Optional[str],
+                             timeout: int,
+                             cmd_prefix: str,
+                             seed: int) -> Optional[Dict]:
+    """The one-sweep-for-everything protocol (2026-07-17 user decision):
+
+    1. Randomly pick ONE single-sublattice phase among those requested.
+    2. From its generated SQS, randomly pick one structure on EACH
+       element-rich side (>50% of that element; endmembers count; lev
+       irrelevant).
+    3. ENCUT/KPPRA sweep each probe (successive-difference criterion,
+       unbounded ENCUT).
+    4. Global settings = elementwise MAX over the probes, with the
+       Pulay floor (1.3 x max ENMAX) folded in so relaxations, statics
+       and phonon force runs all share literally ONE (ENCUT, KPPRA).
+
+    Rich-side sampling matters because basis-completeness demand is
+    element-dependent (e.g. Cr_pv is harder than Co); taking the max is
+    conservative for the other side. Returns a manifest-able dict with
+    the picks, per-probe results and the final settings, or None if no
+    single-sublattice phase / probes are available (caller falls back
+    to first-SQS reuse).
+    """
+    import random
+    rng = random.Random(seed)
+    candidates = sorted(p for p in requested_phases
+                        if p in SINGLE_SUBLATTICE_PHASES)
+    if not candidates:
+        return None
+    phase = rng.choice(candidates)
+    gen_level = max(sqs_levels)
+    stamp(f"[probe] convergence-probe phase: {phase} (seed {seed}), "
+          f"generating at -lv={gen_level}")
+    phase_root = sqsgen.generate_phase_sqs(
+        work_root, phase, elements=elements,
+        level=gen_level, dlm=dlm.enabled, env_bin=env_bin)
+    dirs = discover_sqs_dirs(phase_root)
+    picks = pick_probe_dirs(dirs, elements, rng)
+    if not picks:
+        return None
+
+    probes = {}
+    encuts: List[int] = []
+    kppras: List[int] = []
+    for el, d in sorted(picks.items()):
+        stamp(f"[probe] {el}-rich probe: {d.name} — ENCUT/KPPRA sweep")
+        e_c, k_c, kres, eres = converge.converge_sqs(
+            d, d / "convergence", potcar_paths,
+            dlm=dlm, algo=algo, tol_ev=tol_ev,
+            env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
+        print(kres.table())
+        print(eres.table())
+        probes[el] = {"dir": str(d), "encut": e_c, "kppra": k_c,
+                      "encut_converged": eres.converged,
+                      "kppra_converged": kres.converged}
+        encuts.append(e_c)
+        kppras.append(k_c)
+
+    max_e = potcar.max_enmax(potcar_paths)
+    final_encut = potcar.pulay_safe_encut(max(encuts), max_e)
+    final_kppra = max(kppras)
+    stamp(f"[probe] GLOBAL settings: ENCUT={final_encut} eV "
+          f"(max over probes {encuts}, Pulay floor "
+          f"{potcar.PULAY_ENCUT_FACTOR} x ENMAX folded in), "
+          f"KPPRA={final_kppra} (max over {kppras}) — used for ALL "
+          f"energy, relaxation, inflection-detection and phonon runs")
+    return {"phase": phase, "seed": seed, "probes": probes,
+            "encut": final_encut, "kppra": final_kppra}
+
+
 def process_one_sqs(sqs_dir: Path,
                     potcar_paths: List[Path],
                     dlm: DLMConfig,
@@ -543,8 +651,13 @@ def main():
                          "('Co' == 'Co=Co:2.0'). Drives the s/EL+2/POT+m/g "
                          "and s/EL-2/POT-m/g SUBATOM lines in vasp.wrap.")
     ap.add_argument("--algo", default="All",
-                    help="VASP ALGO (default 'All' per spec; use 'Fast' to "
-                         "match the reference vasp.wrap).")
+                    type=vaspwrap.normalize_algo,
+                    help="VASP electronic algorithm, applied to EVERY "
+                         "wrap the pipeline writes: All (default, most "
+                         "robust), Normal (blocked Davidson, = the "
+                         "production INCARs' IALGO=38), VeryFast "
+                         "(RMM-DIIS, cheapest/least robust). "
+                         "Case-insensitive.")
     ap.add_argument("--relax-method",
                     choices=["infdet", "normal", "runstruct"],
                     default="infdet",
@@ -649,6 +762,12 @@ def main():
                          "converged on a previous run of the same "
                          "elements (e.g. take max over the binaries when "
                          "moving to a ternary).")
+    ap.add_argument("--probe-seed", type=int, default=0,
+                    help="Seed for the random probe-phase/probe-SQS "
+                         "selection of the system convergence protocol "
+                         "(deterministic by default so runs are "
+                         "reproducible; picks are recorded in the "
+                         "manifest).")
     ap.add_argument("--preset-kppra", type=int, default=None,
                     help="Skip the KPPRA sweep entirely and use this "
                          "value. See --preset-encut.")
@@ -804,6 +923,19 @@ def main():
         run_preset = (args.preset_encut, args.preset_kppra)
         print(f"  Preset      : ENCUT={args.preset_encut} eV, "
               f"KPPRA={args.preset_kppra} — convergence sweeps SKIPPED")
+    elif args.convergence_scope == "system":
+        probe = system_probe_convergence(
+            work_root, phases, [args.element1, args.element2],
+            potcar_paths, dlm, args.algo, args.tol_ev, sqs_levels,
+            args.env_bin, args.timeout, args.cmd_prefix,
+            seed=args.probe_seed)
+        if probe:
+            run_preset = (probe["encut"], probe["kppra"])
+            manifest["system_probe"] = probe
+        else:
+            print("  WARNING: probe protocol found no single-sublattice "
+                  "phase / rich-side SQS; falling back to first-SQS "
+                  "convergence reuse.")
     for phase in phases:
         res = process_phase(
             phase, work_root, potcar_paths, dlm, args.relax_method,

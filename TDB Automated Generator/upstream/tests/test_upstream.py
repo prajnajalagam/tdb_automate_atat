@@ -96,7 +96,7 @@ def test_wrap_phonon_matches_fvasp_conventions():
     assert "DOSTATIC" not in w
     assert "ICHARG" not in w
     assert "NSW = 0" in w and "IBRION = -1" in w and "ISIF = 2" in w
-    assert "PREC = Accurate" in w and "ALGO = Fast" in w
+    assert "PREC = Accurate" in w and "ALGO = All" in w
 
 
 def test_wrap_algo_override():
@@ -1585,3 +1585,97 @@ def test_run_sweep_extension_hits_guard_and_warns(tmp_path, monkeypatch):
     assert res.converged is False
     assert res.settings[-1] <= 400          # guard respected
     assert res.chosen == res.settings[-1]   # falls back to highest
+
+
+
+# ---- ALGO modes + convergence-probe protocol (2026-07-17) -------------------
+
+def test_normalize_algo_modes():
+    assert vaspwrap.normalize_algo("all") == "All"
+    assert vaspwrap.normalize_algo("NORMAL") == "Normal"
+    assert vaspwrap.normalize_algo("VeryFast") == "VeryFast"
+    for bad in ("Fast", "damped", ""):
+        with pytest.raises(ValueError):
+            vaspwrap.normalize_algo(bad)
+
+
+def test_site_fractions_and_rich_side_picks(tmp_path):
+    import random
+    names = ["sqs_lev=0_a_Co=1", "sqs_lev=0_a_Cr=1",
+             "sqs_lev=1_a_Co=0.5,a_Cr=0.5",
+             "sqs_lev=2_a_Co=0.75,a_Cr=0.25",
+             "sqs_lev=2_a_Co=0.25,a_Cr=0.75"]
+    dirs = []
+    for n in names:
+        d = tmp_path / n
+        d.mkdir()
+        dirs.append(d)
+    fr = run_upstream.site_fractions("sqs_lev=2_a_Co=0.75,a_Cr=0.25")
+    assert fr["Co"] == pytest.approx(0.75) and fr["Cr"] == pytest.approx(0.25)
+
+    picks = run_upstream.pick_probe_dirs(dirs, ["Co", "Cr"],
+                                         random.Random(0))
+    # rich = strictly > 0.5: endmember or 0.75 side; NEVER the midpoint
+    assert set(picks) == {"Co", "Cr"}
+    assert run_upstream.site_fractions(picks["Co"].name)["Co"] > 0.5
+    assert run_upstream.site_fractions(picks["Cr"].name)["Cr"] > 0.5
+    assert "0.5,a_Cr=0.5" not in picks["Co"].name
+    # deterministic under a fixed seed
+    again = run_upstream.pick_probe_dirs(dirs, ["Co", "Cr"],
+                                         random.Random(0))
+    assert picks == again
+
+
+def test_system_probe_takes_max_and_pulay_floor(tmp_path, monkeypatch):
+    """Probe protocol: sweep one rich-side SQS per element, take the
+    elementwise MAX, fold in the Pulay floor -> ONE global (ENCUT,
+    KPPRA) for every energy/relax/infdet/phonon run."""
+    import types
+    root = tmp_path
+
+    def fake_gen(work_root, phase, elements=None, level=None, dlm=False,
+                 env_bin=None, **kw):
+        pr = Path(work_root) / f"{phase}_small"
+        for n in ("sqs_lev=0_a_Co=1", "sqs_lev=0_a_Cr=1",
+                  "sqs_lev=1_a_Co=0.5,a_Cr=0.5"):
+            d = pr / n
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "str.out").write_text("s\n")
+        return pr
+
+    res = types.SimpleNamespace(table=lambda: "", converged=True)
+    sweeps = {}
+
+    def fake_converge(src, sweep_root, pots, **kw):
+        # Cr probe demands more than Co probe
+        if "Cr=1" in Path(src).name:
+            sweeps["cr"] = True
+            return 420, 8000, res, res
+        sweeps["co"] = True
+        return 360, 7000, res, res
+
+    monkeypatch.setattr(run_upstream.sqsgen, "generate_phase_sqs", fake_gen)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs", fake_converge)
+    monkeypatch.setattr(run_upstream.potcar, "max_enmax", lambda p: 268.0)
+
+    probe = run_upstream.system_probe_convergence(
+        root, ["FCC_A1", "SIGMA_D8B"], ["Co", "Cr"],
+        potcar_paths=["x"], dlm=DLMConfig(enabled=False, subatom={}),
+        algo="All", tol_ev=1e-4, sqs_levels=[2], env_bin=None,
+        timeout=60, cmd_prefix="", seed=0)
+
+    assert sweeps == {"co": True, "cr": True}, "one sweep per rich side"
+    assert probe["kppra"] == 8000                    # max over probes
+    # max encut 420 already exceeds the 1.3 x 268 = 350 Pulay floor
+    assert probe["encut"] == 420
+    assert probe["phase"] == "FCC_A1"                # only 1-sublattice pick
+    assert set(probe["probes"]) == {"Co", "Cr"}
+
+
+def test_system_probe_none_without_single_sublattice(tmp_path):
+    out = run_upstream.system_probe_convergence(
+        tmp_path, ["SIGMA_D8B"], ["Co", "Cr"], potcar_paths=[],
+        dlm=DLMConfig(enabled=False, subatom={}), algo="All",
+        tol_ev=1e-4, sqs_levels=[0], env_bin=None, timeout=60,
+        cmd_prefix="", seed=0)
+    assert out is None

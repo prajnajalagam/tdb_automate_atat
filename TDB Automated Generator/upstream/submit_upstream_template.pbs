@@ -47,12 +47,19 @@ TOL_EV="0.0001"                  # successive-step tolerance, 0.1 meV/atom:
 # runs — NM energies for these metals are wrong by tens of meV/atom.
 # Set to "no" only for a deliberate non-magnetic control run.
 SPIN="auto"                      # auto | no
-# Convergence scope: "system" (default) runs ONE ENCUT/KPPRA sweep for
-# the whole job and reuses it everywhere — ENCUT tracks the POTCARs
-# (shared by all phases), KPPRA normalizes mesh density per atom, and
-# uniform settings make cross-phase lattice stabilities consistent at
-# ~1/4 the sweep compute. "phase" = per-phase sweeps; "sqs" = legacy.
+# Convergence scope. "system" (default) = the probe protocol
+# (2026-07-17): randomly pick ONE single-sublattice phase, sweep one
+# randomly chosen SQS on EACH element-rich side (>50%; endmembers
+# count; lev irrelevant), take the elementwise MAX and fold in the
+# Pulay floor — that single (ENCUT, KPPRA) is then used for ALL
+# energy, relaxation, inflection-detection and phonon runs (uniform
+# settings = consistent mixing energies AND cross-phase lattice
+# stabilities). Picks are seeded (--probe-seed, default 0) and
+# recorded in the manifest. "phase" = per-phase sweeps; "sqs" = legacy.
 CONVERGENCE_SCOPE="system"
+# VASP electronic algorithm for EVERY wrap: All (default, most
+# robust) | Normal (= production IALGO=38) | VeryFast (cheapest).
+ALGO="All"
 # Phonon scope: "endmembers" (default, the published sqs2tdb workflow —
 # Calphad 58 (2017) 70) runs fitfc only on endmem-marked dirs; sqs2tdb
 # -fit fits svib linearly across composition. "all" adds phonons on
@@ -160,6 +167,7 @@ EXTRA+=(--fitfc-on-unstable "${FITFC_ON_UNSTABLE:-mark}")
 [ -n "${FITFC_RL}" ]         && EXTRA+=(--fitfc-rl "${FITFC_RL}")
 [ "${SPIN}" = "no" ]         && EXTRA+=(--no-spin)
 EXTRA+=(--convergence-scope "${CONVERGENCE_SCOPE:-system}")
+EXTRA+=(--algo "${ALGO:-All}")
 EXTRA+=(--phonon-scope "${PHONON_SCOPE:-endmembers}")
 [ -n "${PRESET_ENCUT}" ] && [ -n "${PRESET_KPPRA}" ] && \
     EXTRA+=(--preset-encut "${PRESET_ENCUT}" --preset-kppra "${PRESET_KPPRA}")

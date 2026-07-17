@@ -38,8 +38,17 @@ For each SQS (and each SIGMA endmember):
 
 1. **Static runs**, starting at `lev=1` for each binary single-sublattice
    phase.
-2. **Convergence testing** — `MAX_ENMAX` is the largest `ENMAX` across the
-   POTCARs.
+2. **Convergence testing** — the probe protocol (2026-07-17 default,
+   `--convergence-scope system`): randomly pick ONE single-sublattice
+   phase (seeded, `--probe-seed`), sweep one randomly chosen SQS on
+   **each element-rich side** (>50% of that element; endmembers count;
+   lev irrelevant), take the elementwise **max** over the probes, fold
+   in the Pulay floor — and use that **single (ENCUT, KPPRA) for every
+   energy, relaxation, inflection-detection and phonon run** in the
+   job. Rich-side sampling matters because basis demand is
+   element-dependent (Cr_pv ≫ Co); the max is conservative for the
+   other side. Picks + per-probe results land in the manifest.
+   `MAX_ENMAX` is the largest `ENMAX` across the POTCARs.
    - **KPPRA** swept `4000 … 10000` (step 1000, extends to 20000 if
      needed) at a fixed `ENCUT = 1.125 × MAX_ENMAX`; the converged
      KPPRA is frozen.
