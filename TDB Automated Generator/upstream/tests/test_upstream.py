@@ -149,11 +149,12 @@ def test_select_converged_real_kppra_data_picks_7000():
     settings = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
     e = [-6.2614504, -6.2615232, -6.2616992, -6.2616170,
          -6.2616170, -6.2617104, -6.2615474]
-    chosen, conv, ref = converge.select_converged(settings, e,
-                                                  tol_ev=0.0001)
+    chosen, conv, ref, rule = converge.select_converged(settings, e,
+                                                         tol_ev=0.0001)
     assert conv is True
     assert chosen == 7000
     assert ref == 8000                      # the confirming point
+    assert rule == "successive"             # primary rule, not plateau
 
 
 def test_select_converged_real_encut_data_not_converged():
@@ -162,8 +163,8 @@ def test_select_converged_real_encut_data_not_converged():
     old compare-to-reference rule wrongly accepted this)."""
     settings = [268, 285, 301, 318, 335]
     e = [-6.2500555, -6.2579381, -6.2614504, -6.2610447, -6.2596040]
-    chosen, conv, ref = converge.select_converged(settings, e,
-                                                  tol_ev=0.0001)
+    chosen, conv, ref, rule = converge.select_converged(
+        settings, e, tol_ev=0.0001, plateau_band_ev=0)
     assert conv is False
     assert chosen == 335                    # fall back to highest
 
@@ -173,16 +174,16 @@ def test_select_converged_needs_confirming_point_above():
     # converged (drives the adaptive extension to add one more run)
     settings = [300, 320, 340]
     e = [-5.010, -5.0002, -5.00015]
-    chosen, conv, ref = converge.select_converged(settings, e,
-                                                  tol_ev=0.0001)
+    chosen, conv, ref, rule = converge.select_converged(
+        settings, e, tol_ev=0.0001, plateau_band_ev=0)
     assert conv is False and chosen == 340
 
 
 def test_select_converged_ignores_missing():
     settings = [4000, 5000, 6000, 7000]
     e = [None, -5.00005, -5.00002, -5.00001]
-    chosen, conv, ref = converge.select_converged(settings, e,
-                                                  tol_ev=0.0001)
+    chosen, conv, ref, rule = converge.select_converged(settings, e,
+                                                         tol_ev=0.0001)
     assert chosen == 6000 and conv is True and ref == 7000
 
 
@@ -1697,3 +1698,94 @@ def test_e2e_probe_check_reads_manifest(tmp_path):
     r = e2e.verify_probe(tmp_path)
     assert r["pass"]
     assert "GLOBAL ENCUT=420" in r["detail"] and "KPPRA=8000" in r["detail"]
+
+
+
+# ---- noise-floor plateau fallback (2026-07-17, real FCC-Co sweep) ----------
+
+_REAL_ENCUT_S = [268, 285, 301, 318, 335, 352, 369, 386, 403, 420, 437,
+                 454, 471, 488, 505, 522, 539, 556, 573, 590, 607, 624,
+                 641, 658, 675, 692, 709, 726, 743, 760, 777]
+_REAL_ENCUT_E = [-6.2498443, -6.2580797, -6.2616170, -6.2612131,
+                 -6.2597746, -6.2572824, -6.2552779, -6.2535186,
+                 -6.2540986, -6.2528565, -6.2520979, -6.2520142,
+                 -6.2516278, -6.2519271, -6.2514212, -6.2515857,
+                 -6.2515278, -6.2518319, -6.2523146, -6.2518121,
+                 -6.2514408, -6.2517460, -6.2513132, -6.2515541,
+                 -6.2511311, -6.2512216, -6.2515604, -6.2517727,
+                 -6.2515866, -6.2516322, -6.2517257]
+
+
+def test_run_sweep_real_noisy_data_stops_via_plateau(tmp_path, monkeypatch):
+    """The 2026-07-16 e2e run: past ~437 eV the energy only fluctuates
+    in a ~0.5 meV band (noise floor of PREC=Normal/LREAL=Auto statics);
+    the pointwise 0.1 meV rule only fired at 760 eV on a noise
+    coincidence. Incrementally, the plateau fallback must terminate the
+    sweep at 488 and choose 437."""
+    table = dict(zip(_REAL_ENCUT_S, _REAL_ENCUT_E))
+    monkeypatch.setattr(converge, "run_static_point",
+                        lambda src, dst, encut, kppra, **kw: table[encut])
+    res = converge.run_sweep(
+        "ENCUT", tmp_path / "sqs", tmp_path / "sweep",
+        settings=_REAL_ENCUT_S[:5], fixed_other=7000,
+        tol_ev=0.0001, extend_step=17, extend_max=804)
+    assert res.converged is True
+    assert res.rule == "plateau"
+    assert res.chosen == 437
+    assert res.reference == 488             # plateau window end
+    assert res.settings[-1] == 488, \
+        "sweep must STOP at the plateau, not wander to 760 on noise"
+
+
+def test_plateau_never_preempts_successive_rule():
+    """Plateau is a FALLBACK: on the KPPRA data the pointwise rule
+    fires (7000) and the plateau band must not undercut it to 4000."""
+    ks = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    ke = [-6.2614504, -6.2615232, -6.2616992, -6.2616170, -6.2616170,
+          -6.2617104, -6.2615474]
+    chosen, conv, ref, rule = converge.select_converged(ks, ke,
+                                                        tol_ev=0.0001)
+    assert (chosen, rule) == (7000, "successive")
+
+
+def test_sweep_statics_use_high_precision_wrap(tmp_path, monkeypatch):
+    """Sweep points must run PREC=Accurate + LREAL=.FALSE. — the noise
+    that defeated the pointwise rule came from PREC=Normal FFT-grid
+    jumps and LREAL=Auto projector re-optimization."""
+    seen = {}
+
+    def fake_wrap(mode, **kw):
+        seen.update(kw.get("extra") or {})
+        return "# wrap\n"
+
+    monkeypatch.setattr(converge, "build_vasp_wrap", fake_wrap)
+    monkeypatch.setattr(converge.runner, "run_logged",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr(converge, "energy_per_atom", lambda d: -5.0)
+    src = tmp_path / "sqs"
+    src.mkdir()
+    (src / "str.out").write_text("1 0 0\n0 1 0\n0 0 1\n3 0 0\n0 3 0\n"
+                                 "0 0 3\n0 0 0 Co\n")
+    converge.run_static_point(src, tmp_path / "pt", encut=300, kppra=7000)
+    assert seen.get("PREC") == "Accurate"
+    assert seen.get("LREAL") == ".FALSE."
+
+
+def test_cr_kppra_noise_band_stops_on_initial_grid():
+    """Cr-rich probe KPPRA data from the 2026-07-16 17:31 run (pre-fix
+    code extended toward 20000 and the job died mid-extension): the
+    whole 4000-10000 grid is a +-0.17 meV noise band with NO successive
+    triple. The plateau fallback must terminate on the INITIAL grid —
+    zero extension points — and the global max over probes still takes
+    KPPRA from the Co side (7000)."""
+    ks = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    ke = [-8.0796959, -8.0794469, -8.0796206, -8.0797775, -8.0797775,
+          -8.0795921, -8.0798591]
+    chosen, conv, ref, rule = converge.select_converged(ks, ke,
+                                                        tol_ev=0.0001)
+    assert conv is True and rule == "plateau"
+    assert chosen == 4000 and ref == 7000
+    # old behavior (plateau disabled): not converged -> endless extension
+    _c, conv_off, _r, _rule = converge.select_converged(
+        ks, ke, tol_ev=0.0001, plateau_band_ev=0)
+    assert conv_off is False
