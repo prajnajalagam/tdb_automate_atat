@@ -37,9 +37,11 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import converge
+import pbsjobs
 import phonon
 import potcar
 import relax
+import runner
 import sqsgen
 import vaspwrap
 from phases import (
@@ -184,6 +186,31 @@ def pick_probe_dirs(dirs: List[Path], elements: List[str],
     return picks
 
 
+def _probe_worker_argv() -> List[str]:
+    """This process's argv with orchestration-only flags removed, for
+    re-invoking run_upstream.py as a --probe-worker inside a job."""
+    argv = list(sys.argv[1:])
+    out: List[str] = []
+    skip_next = False
+    VALUED = {"--submit", "--job-env", "--job-model", "--job-queue",
+              "--job-group-list", "--job-max-inflight", "--job-retries",
+              "--probe-worker"}
+    FLAGS = {"--no-job-arrays", "--job-dry-run"}
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in VALUED:
+            skip_next = True
+            continue
+        if tok.split("=")[0] in VALUED:
+            continue
+        if tok in FLAGS:
+            continue
+        out.append(tok)
+    return out
+
+
 def system_probe_convergence(work_root: Path,
                              requested_phases: List[str],
                              elements: List[str],
@@ -195,7 +222,10 @@ def system_probe_convergence(work_root: Path,
                              env_bin: Optional[str],
                              timeout: int,
                              cmd_prefix: str,
-                             seed: int) -> Optional[Dict]:
+                             seed: int,
+                             broker=None,
+                             worker_argv: Optional[List[str]] = None
+                             ) -> Optional[Dict]:
     """The one-sweep-for-everything protocol (2026-07-17 user decision):
 
     1. Randomly pick ONE single-sublattice phase among those requested.
@@ -236,19 +266,51 @@ def system_probe_convergence(work_root: Path,
     probes = {}
     encuts: List[int] = []
     kppras: List[int] = []
-    for el, d in sorted(picks.items()):
-        stamp(f"[probe] {el}-rich probe: {d.name} — ENCUT/KPPRA sweep")
-        e_c, k_c, kres, eres = converge.converge_sqs(
-            d, d / "convergence", potcar_paths,
-            dlm=dlm, algo=algo, tol_ev=tol_ev,
-            env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
-        print(kres.table())
-        print(eres.table())
-        probes[el] = {"dir": str(d), "encut": e_c, "kppra": k_c,
-                      "encut_converged": eres.converged,
-                      "kppra_converged": kres.converged}
-        encuts.append(e_c)
-        kppras.append(k_c)
+    if broker is not None:
+        # PBS mode: each probe's adaptive sweep runs INSIDE its own job
+        # (--probe-worker), and the element-rich probes run in
+        # PARALLEL — the 2026-07-16 run did them serially and burned
+        # ~90 min each. The orchestrator only waits on the JSONs.
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(el_d):
+            el, d = el_d
+            stamp(f"[probe] {el}-rich probe job: {d.name}")
+            cmd = [sys.executable, "-u",
+                   str(Path(__file__).resolve())] \
+                + (worker_argv or []) + ["--probe-worker", str(d)]
+            rc = broker.run_as_job(
+                tag=f"probe_{el}", cwd=d, cmd=cmd,
+                done_when=lambda _c, _d=d:
+                    (_d / "probe_result.json").is_file(),
+                work_dirs=[d], kind="probe",
+                done_file="probe_result.json")
+            if rc != 0 or not (d / "probe_result.json").is_file():
+                raise RuntimeError(f"probe job for {d} failed")
+            return el, d, json.loads((d / "probe_result.json").read_text())
+
+        with ThreadPoolExecutor(max_workers=len(picks)) as pool:
+            for el, d, r in pool.map(_one, sorted(picks.items())):
+                probes[el] = {"dir": str(d), "encut": r["encut"],
+                              "kppra": r["kppra"],
+                              "encut_converged": r["encut_converged"],
+                              "kppra_converged": r["kppra_converged"]}
+                encuts.append(r["encut"])
+                kppras.append(r["kppra"])
+    else:
+        for el, d in sorted(picks.items()):
+            stamp(f"[probe] {el}-rich probe: {d.name} — ENCUT/KPPRA sweep")
+            e_c, k_c, kres, eres = converge.converge_sqs(
+                d, d / "convergence", potcar_paths,
+                dlm=dlm, algo=algo, tol_ev=tol_ev,
+                env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix)
+            print(kres.table())
+            print(eres.table())
+            probes[el] = {"dir": str(d), "encut": e_c, "kppra": k_c,
+                          "encut_converged": eres.converged,
+                          "kppra_converged": kres.converged}
+            encuts.append(e_c)
+            kppras.append(k_c)
 
     max_e = potcar.max_enmax(potcar_paths)
     final_encut = potcar.pulay_safe_encut(max(encuts), max_e)
@@ -460,7 +522,8 @@ def process_phase(phase: str,
                   convergence_scope: str = "system",
                   max_checkrelax: float = 0.1,
                   phonon_scope: str = "endmembers",
-                  preset: Optional[tuple] = None) -> Dict:
+                  preset: Optional[tuple] = None,
+                  parallel_sqs: bool = False) -> Dict:
     print(f"\n{'='*70}\n  PHASE {phase}\n{'='*70}")
 
     # Copy *_small template if provided (caveat 1).
@@ -492,7 +555,8 @@ def process_phase(phase: str,
                              convergence_scope=convergence_scope,
                              max_checkrelax=max_checkrelax,
                              phonon_scope=phonon_scope,
-                             preset=preset)
+                             preset=preset,
+                             parallel_sqs=parallel_sqs)
 
     # sqs2tdb -cp -lv=N has CUMULATIVE semantics (its copy loop tests
     # `level <= -lv`), so a single invocation at max(sqs_levels) copies
@@ -524,8 +588,7 @@ def process_phase(phase: str,
     #   sqs              legacy per-SQS sweeps (diagnostics only)
     # `preset` seeds from --preset-encut/--preset-kppra or, for
     # scope=system, from an earlier phase of this run.
-    results = []
-    for d in sqs_dirs:
+    def _one(d: Path) -> Dict:
         print(f"\n  -- SQS {d.name} --")
         # Paper (Calphad 58 (2017) 70): phonons are "typically done for
         # the end members only"; sqs2tdb -fit then represents svib
@@ -536,7 +599,7 @@ def process_phase(phase: str,
         if skip_ph and not skip_phonon:
             print(f"    (phonons: endmember-only scope — skipped for "
                   f"this mixing SQS)")
-        res = process_one_sqs(
+        return process_one_sqs(
             d, potcar_paths, dlm, relax_method, algo, tol_ev,
             env_bin, skip_ph, timeout,
             cmd_prefix=cmd_prefix, relax_opts=relax_opts,
@@ -544,9 +607,24 @@ def process_phase(phase: str,
             preset_encut=preset[0] if preset else None,
             preset_kppra=preset[1] if preset else None,
             max_checkrelax=max_checkrelax)
-        results.append(res)
-        if convergence_scope in ("phase", "system") and preset is None:
-            preset = (res["chosen_encut"], res["chosen_kppra"])
+
+    results = []
+    if parallel_sqs and preset is not None and len(sqs_dirs) > 1:
+        # PBS fan-out: every SQS advances through its
+        # relax -> validate -> phonon pipeline CONCURRENTLY; the long
+        # stages are broker jobs, so these threads spend their lives in
+        # time.sleep polling for files. The broker's max_inflight caps
+        # the actual queue load. Requires a preset (probe done) so no
+        # thread runs a convergence sweep.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(sqs_dirs)) as pool:
+            results = list(pool.map(_one, sqs_dirs))
+    else:
+        for d in sqs_dirs:
+            res = _one(d)
+            results.append(res)
+            if convergence_scope in ("phase", "system") and preset is None:
+                preset = (res["chosen_encut"], res["chosen_kppra"])
     return {"phase": phase, "sqs": results,
             "preset_out": list(preset) if preset else None}
 
@@ -569,7 +647,8 @@ def process_sigma(phase: str,
                   convergence_scope: str = "system",
                   max_checkrelax: float = 0.1,
                   phonon_scope: str = "endmembers",
-                  preset: Optional[tuple] = None) -> Dict:
+                  preset: Optional[tuple] = None,
+                  parallel_sqs: bool = False) -> Dict:
     """SIGMA_D8B: endmembers only. Under DLM, build each endmember from a
     lev=3 SQS via the lev=3 -> lev=0 +/-spin conversion (caveat 2)."""
     # For DLM SIGMA we must generate at lev=3 (randomises each site among 2
@@ -602,7 +681,8 @@ def process_sigma(phase: str,
 
     # Same uniform-convergence policy as process_phase. SIGMA dirs are
     # all endmembers, so the endmember-only phonon scope never skips
-    # them.
+    # them. (Kept serial per-dir here; SIGMA endmember counts are small
+    # and each one's long stages are broker jobs in pbs mode anyway.)
     results = []
     for d in endmember_dirs:
         print(f"\n  -- SIGMA endmember {d.name} --")
@@ -762,6 +842,42 @@ def main():
                          "converged on a previous run of the same "
                          "elements (e.g. take max over the binaries when "
                          "moving to a ternary).")
+    ap.add_argument("--submit", choices=("node", "pbs"), default="node",
+                    help="'node' (default): drive VASP inside THIS "
+                         "allocation (the monolithic mode). 'pbs': act "
+                         "as an ORCHESTRATOR — every relaxation gets "
+                         "its own right-sized qsub job, every SQS's "
+                         "phonon force runs become a PBS job array "
+                         "(one element per perturbation), and the two "
+                         "convergence probes run as parallel jobs. Run "
+                         "the orchestrator on a front end via nohup "
+                         "(see submit_orchestrator_template.sh); it "
+                         "only does bookkeeping + fitfc/sqs2tdb glue.")
+    ap.add_argument("--job-env", default=None,
+                    help="Shell file SOURCED at the top of every "
+                         "submitted job (modules, venv, PATH). "
+                         "Required with --submit pbs.")
+    ap.add_argument("--job-model", default="mil_ait",
+                    help="PBS node model for submitted jobs.")
+    ap.add_argument("--job-queue", default="normal",
+                    help="PBS queue for submitted jobs (devel's "
+                         "per-user job limit makes it unsuitable for "
+                         "fan-out).")
+    ap.add_argument("--job-group-list", default="a1485")
+    ap.add_argument("--job-max-inflight", type=int, default=16,
+                    help="Cap on simultaneously queued/running jobs — "
+                         "the compute-cost throttle.")
+    ap.add_argument("--job-retries", type=int, default=1,
+                    help="Resubmissions for a job that leaves the "
+                         "queue without producing its outputs.")
+    ap.add_argument("--no-job-arrays", action="store_true",
+                    help="Use one looping job per SQS for force runs "
+                         "instead of a PBS job array per perturbation.")
+    ap.add_argument("--job-dry-run", action="store_true",
+                    help="Render job scripts but do not qsub (CI/ "
+                         "inspection).")
+    ap.add_argument("--probe-worker", default=None, metavar="SQS_DIR",
+                    help=argparse.SUPPRESS)   # internal: runs ONE probe
     ap.add_argument("--plateau-band", type=float, default=None,
                     help="Noise-plateau fallback band in eV/atom "
                          "(default 0.0005 = 0.5 meV/atom): when the "
@@ -876,6 +992,61 @@ def main():
         converge.PLATEAU_BAND_EV = args.plateau_band
     if args.magmom_init is not None:
         vaspwrap.DEFAULT_MAGMOM_INIT = args.magmom_init
+
+    # ── internal: probe worker (runs INSIDE a submitted probe job) ────
+    # Executes the full adaptive ENCUT/KPPRA sweep for ONE probe SQS on
+    # its own allocation and records the result for the orchestrator.
+    if args.probe_worker:
+        d = Path(args.probe_worker).resolve()
+        stamp(f"[probe-worker] sweeping {d.name}")
+        e_c, k_c, kres, eres = converge.converge_sqs(
+            d, d / "convergence", potcar_paths,
+            dlm=dlm, algo=args.algo, tol_ev=args.tol_ev,
+            env_bin=args.env_bin, timeout=args.timeout,
+            cmd_prefix=args.cmd_prefix)
+        print(kres.table())
+        print(eres.table())
+        (d / "probe_result.json").write_text(json.dumps(
+            {"encut": e_c, "kppra": k_c,
+             "encut_converged": eres.converged,
+             "encut_rule": eres.rule,
+             "kppra_converged": kres.converged,
+             "kppra_rule": kres.rule}))
+        stamp(f"[probe-worker] done: ENCUT={e_c}, KPPRA={k_c}")
+        return
+
+    # ── PBS fan-out mode: install the job broker as the execution
+    #    backend for every long VASP command (runner.run_polled) ──────
+    broker = None
+    if args.submit == "pbs":
+        if args.convergence_scope != "system" and not (
+                args.preset_encut and args.preset_kppra):
+            raise SystemExit(
+                "--submit pbs requires --convergence-scope system (the "
+                "probe protocol, run as jobs) or explicit "
+                "--preset-encut/--preset-kppra: sweeps must never run "
+                "VASP in the orchestrator process (front end).")
+        if not args.job_env:
+            raise SystemExit(
+                "--submit pbs requires --job-env <file> — a shell "
+                "snippet sourced by every job (modules, venv, PATH); "
+                "see submit_orchestrator_template.sh, which writes it.")
+        broker = pbsjobs.Broker(
+            work_root=work_root,
+            group_list=args.job_group_list,
+            model=args.job_model,
+            queue=args.job_queue,
+            site_env=f"source {Path(args.job_env).resolve()}",
+            max_inflight=args.job_max_inflight,
+            max_retries=args.job_retries,
+            use_arrays=not args.no_job_arrays,
+            dry_run=args.job_dry_run)
+        runner.set_backend(broker)
+        stamp(f"[pbs mode] broker active: model={args.job_model} "
+              f"queue={args.job_queue} max_inflight="
+              f"{args.job_max_inflight} arrays="
+              f"{not args.no_job_arrays}"
+              + (" DRY-RUN" if args.job_dry_run else ""))
     print(f"  Spin        : "
           + ("DLM (SUBATOM moments)" if args.dlm else
              (f"ISPIN=2, MAGMOM={vaspwrap.DEFAULT_MAGMOM_INIT:g} muB/atom "
@@ -937,7 +1108,8 @@ def main():
             work_root, phases, [args.element1, args.element2],
             potcar_paths, dlm, args.algo, args.tol_ev, sqs_levels,
             args.env_bin, args.timeout, args.cmd_prefix,
-            seed=args.probe_seed)
+            seed=args.probe_seed,
+            broker=broker, worker_argv=_probe_worker_argv())
         if probe:
             run_preset = (probe["encut"], probe["kppra"])
             manifest["system_probe"] = probe
@@ -955,7 +1127,9 @@ def main():
             convergence_scope=args.convergence_scope,
             max_checkrelax=args.max_checkrelax,
             phonon_scope=args.phonon_scope,
-            preset=run_preset)
+            preset=run_preset,
+            parallel_sqs=(args.submit == "pbs"
+                          and run_preset is not None))
         manifest["phases"].append(res)
         if args.convergence_scope == "system" and run_preset is None \
                 and res.get("preset_out"):

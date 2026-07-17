@@ -357,7 +357,7 @@ class _RecCalls:
 
     def polled_fn(self, touch_str_relax=True):
         def f(cmd, cwd, log, done_when=None, stop_sentinel=None,
-              env_bin=None, timeout=None, check=True):
+              env_bin=None, timeout=None, check=True, **kw):
             self.polled.append(list(cmd))
             if touch_str_relax:
                 (Path(cwd) / "str_relax.out").write_text("stub\n")
@@ -1789,3 +1789,150 @@ def test_cr_kppra_noise_band_stops_on_initial_grid():
     _c, conv_off, _r, _rule = converge.select_converged(
         ks, ke, tol_ev=0.0001, plateau_band_ev=0)
     assert conv_off is False
+
+
+# ---- PBS fan-out broker (--submit pbs, 2026-07-17) --------------------------
+
+import pbsjobs
+
+
+def test_sizing_and_launcher_retarget():
+    assert pbsjobs.size_for(1, "relax")["ncpus"] == 8
+    assert pbsjobs.size_for(30, "relax")["ncpus"] == 32
+    assert pbsjobs.size_for(100, "force")["ncpus"] == 64
+    assert pbsjobs.size_for(None, "relax")["ncpus"] == 64  # unknown->big
+    cmd = ["robustrelax_vasp", "-id", "-c", "0.05", "mpiexec", "-n", "128"]
+    out = pbsjobs.retarget_launcher(cmd, 16)
+    assert out[-3:] == ["mpiexec", "-n", "16"]
+    assert out[:4] == cmd[:4]                 # options untouched
+
+
+def test_render_single_job_script(tmp_path):
+    b = pbsjobs.Broker(work_root=tmp_path, dry_run=True,
+                       site_env="source /x/job_env.sh", queue="normal",
+                       model="mil_ait")
+    d = tmp_path / "sqs"
+    d.mkdir()
+    script = b.render_single("relax", d,
+                             ["robustrelax_vasp", "-id", "-c", "0.05",
+                              "mpiexec", "-n", "999"], 8, "01:00:00")
+    t = script.read_text()
+    assert "#PBS -l select=1:ncpus=8:mpiprocs=8:model=mil_ait" in t
+    assert "#PBS -l walltime=01:00:00" in t
+    assert "#PBS -q normal" in t
+    assert "#PBS -W group_list=a1485" in t
+    assert "source /x/job_env.sh" in t
+    assert "mpiexec -n 8" in t                # retargeted to job ncpus
+    assert "-n 999" not in t
+    assert ".qrc_relax" in t
+
+
+def test_render_array_one_element_per_pert_dir(tmp_path):
+    b = pbsjobs.Broker(work_root=tmp_path, dry_run=True)
+    sqs = tmp_path / "sqs"
+    dirs = []
+    for i in range(28):
+        d = sqs / "vol_0" / f"p+0.2_9.9_{i}"
+        d.mkdir(parents=True)
+        dirs.append(d)
+    script = b.render_array("forces", sqs,
+                            ["runstruct_vasp", "-lu", "-w", "vaspf.wrap",
+                             "mpiexec", "-n", "1"], dirs, 32, "01:00:00")
+    t = script.read_text()
+    assert "#PBS -J 0-27" in t                # 28 wall-parallel elements
+    assert "PBS_ARRAY_INDEX" in t
+    manifest = (sqs / "qjob_forces.dirs").read_text().splitlines()
+    assert len(manifest) == 28 and manifest[0].endswith("p+0.2_9.9_0")
+    assert "mpiexec -n 32" in t
+
+
+def test_run_as_job_array_for_pollmach_force_runs(tmp_path):
+    """A pollmach force-run command with >=2 work dirs becomes a job
+    ARRAY with pollmach stripped (each element runs runstruct directly
+    in its own dir — no shared machine to poll inside a job)."""
+    b = pbsjobs.Broker(work_root=tmp_path, dry_run=True)
+    sqs = tmp_path / "sqs"
+    dirs = []
+    for i in range(3):
+        d = sqs / "vol_0" / f"p+0.2_9.9_{i}"
+        d.mkdir(parents=True)
+        (d / "force.out").write_text("0\n")   # already done -> rc 0
+        dirs.append(d)
+    rc = b.run_as_job(
+        "fitfc_force_runs", sqs,
+        ["pollmach", "runstruct_vasp", "-lu", "-w", "vaspf.wrap",
+         "mpiexec", "-n", "1"],
+        done_when=lambda _c: all((d / "force.out").is_file()
+                                 for d in dirs),
+        work_dirs=dirs, natoms=32, kind="force", done_file="force.out")
+    assert rc == 0
+    t = (sqs / "qjob_fitfc_force_runs.pbs").read_text()
+    assert "#PBS -J 0-2" in t
+    assert "pollmach" not in t                # stripped inside the job
+    assert "runstruct_vasp -lu -w vaspf.wrap" in t
+
+
+def test_run_as_job_retries_then_fails(tmp_path, monkeypatch):
+    """A job that leaves the queue without outputs is resubmitted up to
+    max_retries, then reported failed."""
+    b = pbsjobs.Broker(work_root=tmp_path, max_retries=1,
+                       poll_interval=0)
+    subs = []
+    monkeypatch.setattr(b, "qsub", lambda script: subs.append(str(script))
+                        or f"job{len(subs)}")
+    monkeypatch.setattr(b, "alive", lambda jid: False)   # dies instantly
+    monkeypatch.setattr(b, "n_inflight", lambda: 0)
+    monkeypatch.setattr(pbsjobs.time, "sleep", lambda s: None)
+    d = tmp_path / "sqs"
+    d.mkdir()
+    rc = b.run_as_job("relax", d, ["robustrelax_vasp", "-id"],
+                      done_when=lambda _c: False,
+                      work_dirs=[d], natoms=1, kind="relax")
+    assert rc == -1
+    assert len(subs) == 2                     # original + 1 retry
+    import json as _json
+    marker = _json.loads((d / ".qjob_relax").read_text())
+    assert marker["job_id"] == "job2"
+
+
+def test_runner_backend_routes_run_polled(tmp_path):
+    """With a broker installed, run_polled must delegate with the work
+    metadata instead of launching locally."""
+    calls = {}
+
+    class FakeBroker:
+        def run_as_job(self, tag, cwd, cmd, done_when, work_dirs=None,
+                       natoms=None, kind="generic", done_file="energy"):
+            calls.update(tag=tag, cmd=list(cmd), natoms=natoms,
+                         kind=kind, work_dirs=list(work_dirs or []))
+            return 0
+
+    import runner as _runner
+    _runner.set_backend(FakeBroker())
+    try:
+        rc = _runner.run_polled(
+            ["robustrelax_vasp", "-id", "-c", "0.05"],
+            cwd=tmp_path, log=tmp_path / "robustrelax_infdet.log",
+            done_when=lambda c: True,
+            work_dirs=[tmp_path], natoms=30, kind="relax",
+            done_file="str_relax.out")
+    finally:
+        _runner.set_backend(None)
+    assert rc == 0
+    assert calls["tag"] == "robustrelax_infdet"
+    assert calls["kind"] == "relax" and calls["natoms"] == 30
+
+
+def test_probe_worker_argv_strips_orchestration_flags(monkeypatch):
+    monkeypatch.setattr(sys, "argv",
+                        ["run_upstream.py", "--element1", "Co",
+                         "--element2", "Cr", "--submit", "pbs",
+                         "--job-env", "/x/env.sh", "--job-queue",
+                         "normal", "--no-job-arrays",
+                         "--potcars", "/p/Co,/p/Cr"])
+    argv = run_upstream._probe_worker_argv()
+    assert "--submit" not in argv and "pbs" not in argv
+    assert "--job-env" not in argv and "/x/env.sh" not in argv
+    assert "--no-job-arrays" not in argv
+    assert argv[:4] == ["--element1", "Co", "--element2", "Cr"]
+    assert "--potcars" in argv
