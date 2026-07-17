@@ -70,13 +70,24 @@ For each SQS (and each SIGMA endmember):
    vibrational (harmonic) one:
 
    ```
-   fitfc -si=str_relax.out -ernn=2 -ns=1 -nrr    # vol_0 + p* dirs, ONE call
-   pollmach runstruct_vasp <launcher>            # force.out per p* dir
+   fitfc -si=str_relax.out -ernn=4 -ns=1 -dr=0.04 -nrr   # ONE call
+   pollmach runstruct_vasp -lu -w vaspf.wrap <launcher>  # force.out per p*
    [DLM fixup]
-   fitfc -f -frnn=1.5 -si=str_relax.out          # → vol_0/svib_ht
-   cp vol_0/svib_ht .                            # automated: sqs2tdb -fit
-                                                 # only reads <sqs>/svib_ht
+   fitfc -f -frnn=2 -si=str_relax.out                    # → vol_0/svib_ht
+   robustrelax_vasp -vib                                 # paper step (iv):
+                                                         # svib_ht where
+                                                         # sqs2tdb reads it
+                                                         # (cp fallback kept)
    ```
+
+   These are the PUBLISHED values (van de Walle et al., Calphad 58
+   (2017) 70, §3.3; "-ernn/-frnn may need to be adjusted depending on
+   the alloy system" — override with `--fitfc-ernn/--fitfc-frnn/`
+   `--fitfc-dr`). `vaspf.wrap` (the `-mk` name) is REwritten by the
+   pipeline after generation so its MAGMOM/NCORE/KPAR match the
+   perturbation SUPERCELL. **Scope: endmembers only by default**
+   (`--phonon-scope`, per the paper) — sqs2tdb -fit fits svib linearly
+   across composition; use `all` for nonideal vibrational entropy.
 
    With `-nrr` (default at `ns=1`) the volume dir is the already-relaxed
    input, so generation is a single invocation. A quasiharmonic strain

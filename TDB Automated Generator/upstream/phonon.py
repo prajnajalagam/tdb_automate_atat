@@ -31,13 +31,21 @@ that shape this module:
   vol_0/svib_ht that fitfc produces must be copied up — the tutorial's
   ``cp vol_0/svib_ht .`` step, automated here.
 
-Default recipe (harmonic, matches the sqs2tdb vibrational workflow):
+Default recipe — the PUBLISHED sqs2tdb workflow (van de Walle et al.,
+Calphad 58 (2017) 70, Sec. 3.3), harmonic, endmembers by default:
 
-  1. fitfc -si=str_relax.out -ernn=2 -ns=1 -nrr   -> vol_0 + p* dirs, one shot
-  2. pollmach runstruct_vasp <launcher>            -> force.out in every p* dir
+  1. fitfc -si=str_relax.out -ernn=4 -ns=1 -dr=0.04 -nrr
+                                    -> vol_0 + p* dirs, one invocation
+  2. pollmach runstruct_vasp -lu -w vaspf.wrap <launcher>
+                                    -> force.out in every p* dir
+     (vaspf.wrap is REWRITTEN by us over the -mk-generated one so its
+      MAGMOM/NCORE/KPAR match the perturbation SUPERCELL, not the SQS)
   3. [DLM only] strip +2/-2 spin tags from str_relax.out / str_unpert.out
-  4. fitfc -f -frnn=1.5 -si=str_relax.out          -> vol_0/svib_ht etc.
-  5. cp vol_0/svib_ht .                            -> what sqs2tdb -fit reads
+  4. fitfc -f -frnn=2 -si=str_relax.out            -> vol_0/svib_ht etc.
+  5. robustrelax_vasp -vib                          -> svib_ht where
+     sqs2tdb -fit reads it (cp vol_0/svib_ht . as fallback)
+  -ernn/-frnn "may need to be adjusted depending on the alloy system"
+  (paper); override via --fitfc-ernn/--fitfc-frnn/--fitfc-dr.
 
 Quasiharmonic variant (ns > 1, nrr off): step 1 only writes vol_* dirs
 with ``wait``; we then relax them (ions-only, fixed strained cell — a
@@ -108,7 +116,7 @@ def _count_atoms(str_out: Path) -> Optional[int]:
 def _write_force_wrap(sqs_dir: Path, pert_dirs: List[Path],
                       encut: int, kppra: int,
                       dlm: Optional[DLMConfig], algo: str) -> None:
-    """Write fvasp.wrap sized for the PERTURBATION SUPERCELL.
+    """Write vaspf.wrap sized for the PERTURBATION SUPERCELL.
 
     The force runs execute in vol_*/p*/ on the enclosing supercell
     fitfc built (e.g. 8 atoms for a 1-atom FCC endmember at -ernn=2),
@@ -121,10 +129,10 @@ def _write_force_wrap(sqs_dir: Path, pert_dirs: List[Path],
     runs, whose regenerated supercells are larger again. All p* dirs
     of a batch share one supercell, so one wrap per batch is exact.
 
-    Separate wrap FILE (fvasp.wrap) so the frozen force-run settings
+    Separate wrap FILE (vaspf.wrap) so the frozen force-run settings
     never clobber (or get shadowed by) the relax-stage vasp.wrap in
     the same directory; the force runs select it with
-    `runstruct_vasp -w fvasp.wrap` (the fitfc convention).
+    `runstruct_vasp -w vaspf.wrap` (the fitfc convention).
     """
     natoms = None
     for d in pert_dirs:
@@ -136,7 +144,7 @@ def _write_force_wrap(sqs_dir: Path, pert_dirs: List[Path],
             break
     wrap = build_vasp_wrap("phonon", encut=encut, kppra=kppra,
                            dlm=dlm, algo=algo, natoms=natoms)
-    (Path(sqs_dir) / "fvasp.wrap").write_text(wrap)
+    (Path(sqs_dir) / "vaspf.wrap").write_text(wrap)
 
 
 def build_fitfc_gen_args(ernn: Optional[float], er: Optional[float],
@@ -269,13 +277,13 @@ def promote_svib_ht(sqs_dir: Path) -> Optional[Path]:
 def run_fitfc(sqs_dir: Path,
               encut: int,
               kppra: int,
-              ernn: Optional[float] = 2.0,
+              ernn: Optional[float] = 4.0,
               er: Optional[float] = None,
-              frnn: Optional[float] = 1.5,
+              frnn: Optional[float] = 2.0,
               fr: Optional[float] = None,
               ns: int = 1,
               ms: float = 0.02,
-              dr: Optional[float] = None,
+              dr: Optional[float] = 0.04,
               nrr: Optional[bool] = None,
               rl: Optional[float] = None,
               on_unstable: str = "mark",
@@ -350,7 +358,7 @@ def run_fitfc(sqs_dir: Path,
                                     dr=dr, nrr=nrr)
     vasp_launch = runner.split_prefix(cmd_prefix)
 
-    # NOTE: fvasp.wrap is written AFTER generation (see
+    # NOTE: vaspf.wrap is written AFTER generation (see
     # _write_force_wrap) — its MAGMOM must be sized for the
     # perturbation supercell, whose atom count only exists once fitfc
     # has built the p* dirs.
@@ -409,13 +417,13 @@ def run_fitfc(sqs_dir: Path,
                 if not (d / "energy").is_file():
                     shutil.copy2(top_energy, d / "energy")
 
-    # 3. force runs for the perturbations (frozen fvasp.wrap via -w,
+    # 3. force runs for the perturbations (frozen vaspf.wrap via -w,
     #    launcher LAST). Wrap sized for the perturbation supercell.
     pert_dirs = _pert_dirs(sqs_dir)
     if pert_dirs:
         _write_force_wrap(sqs_dir, pert_dirs, encut, kppra, dlm, algo)
         runner.run_polled(
-            ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
+            ["pollmach", "runstruct_vasp", "-lu", "-w", "vaspf.wrap"]
             + vasp_launch, cwd=sqs_dir,
             log=sqs_dir / "fitfc_force_runs.log",
             done_when=all_force_runs_done(pert_dirs),
@@ -482,7 +490,7 @@ def run_fitfc(sqs_dir: Path,
             # the wrap's MAGMOM/decomposition for the NEW batch.
             _write_force_wrap(sqs_dir, new_pert, encut, kppra, dlm, algo)
             runner.run_polled(
-                ["pollmach", "runstruct_vasp", "-w", "fvasp.wrap"]
+                ["pollmach", "runstruct_vasp", "-lu", "-w", "vaspf.wrap"]
                 + vasp_launch, cwd=sqs_dir,
                 log=sqs_dir / "fitfc_force_runs_escalated.log",
                 done_when=all_force_runs_done(new_pert),
@@ -538,13 +546,21 @@ def run_fitfc(sqs_dir: Path,
             + "\n  ".join(dict.fromkeys(unstable))
             + f"\nDisposition: {disposition}\n")
 
-    # 6. promote vol_0/svib_ht to the top level for sqs2tdb -fit.
-    if promote_svib_ht(sqs_dir) is None:
+    # 6. paper step (iv): `robustrelax_vasp -vib` copies the phonon
+    #    outputs where sqs2tdb -fit can read them (Calphad 58 (2017)
+    #    70, Sec. 3.3). Our promote_svib_ht stays as a fallback for
+    #    ATAT builds where -vib is absent/quiet.
+    runner.run_logged(["robustrelax_vasp", "-vib"], cwd=sqs_dir,
+                      log=sqs_dir / "robustrelax_vib.log",
+                      env_bin=env_bin, timeout=600, check=False)
+    if not (sqs_dir / "svib_ht").is_file() \
+            and promote_svib_ht(sqs_dir) is None:
         with open(fit_log, "a") as fh:
-            fh.write("\nWARNING: no vol_0/svib_ht produced — "
+            fh.write("\nWARNING: no svib_ht (neither robustrelax -vib "
+                     "nor vol_0/svib_ht) — "
                      + ("unstable modes (see unstable_modes.log)"
                         if unstable
                         else "fit failed or found no force.out")
-                     + "; svib_ht NOT promoted.\n")
+                     + "; svib_ht NOT available.\n")
 
     return sqs_dir / "fitfc.out"

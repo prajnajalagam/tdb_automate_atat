@@ -11,7 +11,7 @@
 # ============================================================================
 #  Mini end-to-end test: REAL pipeline, FCC Co-Cr endmembers only, with
 #  phonons. Exercises generation -> convergence -> infdet relax
-#  (-id -c 0.05) -> validation/checkrelax -> fitfc force runs (fvasp.wrap)
+#  (-id -c 0.05) -> validation/checkrelax -> fitfc force runs (vaspf.wrap)
 #  -> svib_ht promotion, then grades every step (e2e_report.txt).
 #
 #  Scope: 2 one-atom endmembers + one ~32-atom perturbation supercell

@@ -12,7 +12,7 @@ drives the actual production entry point —
 scope: sqs2tdb -cp generation, the ENCUT/KPPRA convergence sweeps, the
 infdet relaxation (robustrelax_vasp -id -c 0.05), result validation,
 checkrelax, energy/energy_end bookkeeping, and the full fitfc phonon
-workflow (fvasp.wrap force runs, svib_ht promotion or unstable-mode
+workflow (vaspf.wrap force runs, svib_ht promotion or unstable-mode
 disposition). The lev=0 endmembers are 1-atom cells — precisely the
 cells that died in the 2026-07-14 run — so this doubles as the
 regression test for every fix that came out of that diagnosis.
@@ -27,7 +27,7 @@ against an explicit checklist and writes e2e_report.{txt,json}:
   - infdet actually invoked with its strain cutoff (-id ... -c 0.05)
   - checkrelax.out written (value reported)
   [phonon criteria — svib_ht OR a documented unstable disposition]
-  - fvasp.wrap present; vol_0/p* force runs attempted
+  - vaspf.wrap present; vol_0/p* force runs attempted
   - svib_ht promoted to the top level, OR unstable_modes.log explains
     why the SQS is energy-only (both are correct machinery behavior;
     FCC Cr may legitimately be dynamically unstable)
@@ -157,7 +157,7 @@ def verify_endmember_dir(d: Path) -> Dict:
           else "checkrelax.out missing/unparseable")
 
     # ── phonon machinery (soft: unstable disposition is also a PASS) ──
-    check("fvasp_wrap_written", (d / "fvasp.wrap").is_file(),
+    check("vaspf_wrap_written", (d / "vaspf.wrap").is_file(),
           "separate frozen wrap for force runs", hard=False)
     pert = sorted((d / "vol_0").glob("p*")) if (d / "vol_0").is_dir() else []
     forces = sum(1 for p in pert if (p / "force.out").is_file())

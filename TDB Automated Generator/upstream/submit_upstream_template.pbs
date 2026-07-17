@@ -47,10 +47,22 @@ TOL_EV="0.0001"                  # successive-step tolerance, 0.1 meV/atom:
 # runs — NM energies for these metals are wrong by tens of meV/atom.
 # Set to "no" only for a deliberate non-magnetic control run.
 SPIN="auto"                      # auto | no
-# Convergence scope: "phase" converges ENCUT/KPPRA on the first SQS of
-# each phase and reuses it for all siblings (uniform settings = clean
-# mixing energies + ~N x less sweep compute). "sqs" = old per-SQS mode.
-CONVERGENCE_SCOPE="phase"
+# Convergence scope: "system" (default) runs ONE ENCUT/KPPRA sweep for
+# the whole job and reuses it everywhere — ENCUT tracks the POTCARs
+# (shared by all phases), KPPRA normalizes mesh density per atom, and
+# uniform settings make cross-phase lattice stabilities consistent at
+# ~1/4 the sweep compute. "phase" = per-phase sweeps; "sqs" = legacy.
+CONVERGENCE_SCOPE="system"
+# Phonon scope: "endmembers" (default, the published sqs2tdb workflow —
+# Calphad 58 (2017) 70) runs fitfc only on endmem-marked dirs; sqs2tdb
+# -fit fits svib linearly across composition. "all" adds phonons on
+# every mixing SQS (several x the phonon compute).
+PHONON_SCOPE="endmembers"
+# Reuse converged settings from a PREVIOUS run (skips all sweeps):
+# e.g. moving binaries -> ternary, set these to the max over the
+# constituent binaries' converged values. Leave empty to sweep.
+PRESET_ENCUT=""
+PRESET_KPPRA=""
 # Lattice-drift threshold (ATAT checkrelax analogue). Every SQS gets
 # checkrelax.out; above this it is flagged relaxaway (left its parent
 # lattice) and downstream fitting drops it.
@@ -147,7 +159,10 @@ EXTRA=()
 EXTRA+=(--fitfc-on-unstable "${FITFC_ON_UNSTABLE:-mark}")
 [ -n "${FITFC_RL}" ]         && EXTRA+=(--fitfc-rl "${FITFC_RL}")
 [ "${SPIN}" = "no" ]         && EXTRA+=(--no-spin)
-EXTRA+=(--convergence-scope "${CONVERGENCE_SCOPE:-phase}")
+EXTRA+=(--convergence-scope "${CONVERGENCE_SCOPE:-system}")
+EXTRA+=(--phonon-scope "${PHONON_SCOPE:-endmembers}")
+[ -n "${PRESET_ENCUT}" ] && [ -n "${PRESET_KPPRA}" ] && \
+    EXTRA+=(--preset-encut "${PRESET_ENCUT}" --preset-kppra "${PRESET_KPPRA}")
 EXTRA+=(--max-checkrelax "${MAX_CHECKRELAX:-0.1}")
 
 # Live log in the submit dir (PBS -o only arrives after the job ends).

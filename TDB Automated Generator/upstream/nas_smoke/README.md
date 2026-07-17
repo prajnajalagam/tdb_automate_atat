@@ -10,7 +10,7 @@ ATAT→VASP chain is broken, instead of a 72-hour job dying at hour 3.
 | `T1_static` | `runstruct_vasp <launcher>` + static `vasp.wrap` | `converge.run_static_point` — every ENCUT/KPPRA sweep point (the historical "unable to open OSZICAR" site) | `energy`, `str_relax.out` |
 | `T2_runstruct` | `runstruct_vasp <launcher>` + relax wrap (NSW=5) | `--relax-method runstruct` relaxation + extraction | `str_relax.out`, `energy`, `force.out` |
 | `T3_robustrelax` | `robustrelax_vasp -mk` then `robustrelax_vasp -id -c 0.05 <launcher>` | `--relax-method infdet` (the default: inflection detection with its required strain cutoff); early-stopped via the `stop` sentinel once `str_relax.out` exists | `str_relax.out` |
-| `T4_fitfc_wrap` | `runstruct_vasp -w fvasp.wrap <launcher>` on a displaced frozen cell | fitfc perturbation force runs (separate wrap file, NSW=0, forces → `force.out`) | `force.out`, `str_relax.out` |
+| `T4_fitfc_wrap` | `runstruct_vasp -lu -w vaspf.wrap <launcher>` on a displaced frozen cell | fitfc perturbation force runs (separate wrap file, NSW=0, forces → `force.out`) | `force.out`, `str_relax.out` |
 | `T5_pollmach` | `pollmach runstruct_vasp <launcher>` over two `wait`-marked subdirs | the dispatcher every stage routes through (wait consumption, walk-up `vasp.wrap`, `stoppoll` shutdown) | `p_1/energy`, `p_2/energy` |
 
 All tests use one 2-atom cell, ENCUT=300, KPPRA=1000, NELM≤25, NSW≤5,
@@ -63,7 +63,7 @@ Typical failure signatures:
 | preflight `missing_binaries` | ATAT not on PATH | check `ATAT_BIN`, modules |
 | every test: `unable to open OSZICAR` in log tail | VASP launched bare (MPI build) | set `CMD_PREFIX="mpiexec -n 8"`, check `mpi-intel` module (see `environment.txt` MPI sanity line) |
 | T1 fails, others too, `POTCAR` errors in log | POTCAR mechanism broken | pass `--potcar`, or fix `POTDIR` in `~/.ezvasp.rc` |
-| T4 alone fails | `-w` wrap-name path broken / frozen-run extraction | check `fvasp.wrap` was read (grep `T4_fitfc_wrap/INCAR` for `NSW = 0`) |
+| T4 alone fails | `-w` wrap-name path broken / frozen-run extraction | check `vaspf.wrap` was read (grep `T4_fitfc_wrap/INCAR` for `NSW = 0`) |
 | T5 alone fails | pollmach dispatch (wait files, walk-up wrap) | check `T5_pollmach/pollmach.log`; ensure `stoppoll` isn't pre-existing |
 | PASS but slow / timeout kills | node/queue contention or NELM too low to converge SCF | raise `--timeout`; NELM non-convergence still writes outputs (rc recorded) |
 
@@ -87,7 +87,7 @@ Hard criteria (any failure fails the suite): valid `str_relax.out`,
 parseable `energy` (adopted `energy_end` counts), `ISPIN=2` + explicit
 `MAGMOM` in the wrap, `robustrelax_vasp -id -c 0.05` actually invoked,
 `checkrelax.out` recorded. Phonon criteria are graded but soft:
-`fvasp.wrap`, force runs in `vol_0/p*`, and **either** a promoted
+`vaspf.wrap`, force runs in `vol_0/p*`, and **either** a promoted
 `svib_ht` **or** an `unstable_modes.log` disposition — FCC Cr may be
 genuinely dynamically unstable, and "energy-only by policy" is correct
 machinery behavior, not a failure.

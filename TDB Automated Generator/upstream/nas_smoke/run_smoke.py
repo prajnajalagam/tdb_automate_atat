@@ -19,7 +19,7 @@ own modules, it does not re-implement them):
                  with the launcher trailing — the --relax-method infdet
                  path (the production default), early-stopped via the
                  'stop' sentinel as soon as str_relax.out appears.
-  T4_fitfc_wrap  runstruct_vasp -w fvasp.wrap on a frozen, displaced
+  T4_fitfc_wrap  runstruct_vasp -lu -w vaspf.wrap on a frozen, displaced
                  cell — the fitfc force-run convention (separate wrap
                  file, NSW=0, forces extracted to force.out).
   T5_pollmach    pollmach runstruct_vasp over two wait-marked subdirs —
@@ -182,12 +182,12 @@ def build_cases(workdir: Path, element: str,
                   "early-exit)"})
 
     # T4: fitfc force-run convention — frozen wrap under a SEPARATE
-    # file name, selected with runstruct_vasp -w fvasp.wrap.
-    d4 = new_case("T4_fitfc_wrap", "phonon", wrap_name="fvasp.wrap",
+    # file name, selected with runstruct_vasp -w vaspf.wrap.
+    d4 = new_case("T4_fitfc_wrap", "phonon", wrap_name="vaspf.wrap",
                   displaced=True)
     cases.append({
         "test": "T4_fitfc_wrap", "dir": str(d4),
-        "argv": ["runstruct_vasp", "-w", "fvasp.wrap"] + launch,
+        "argv": ["runstruct_vasp", "-lu", "-w", "vaspf.wrap"] + launch,
         "expect": ["force.out", "str_relax.out"],
         "log": "runstruct.log",
         "covers": "fitfc perturbation force runs (frozen geometry, "

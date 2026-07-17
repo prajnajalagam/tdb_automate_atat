@@ -89,7 +89,7 @@ def test_wrap_relax_has_dostatic_full_dof():
 
 
 def test_wrap_phonon_matches_fvasp_conventions():
-    """Frozen force-run wrap = the user's fvasp.wrap: NSW=0/IBRION=-1/
+    """Frozen force-run wrap = the user's vaspf.wrap: NSW=0/IBRION=-1/
     ISIF=2, PREC=Accurate, ALGO=Fast, and NO ICHARG=1 (hard-errors when
     no CHGCAR exists — the first force run never has one)."""
     w = vaspwrap.build_vasp_wrap("phonon", encut=300, kppra=6000)
@@ -730,8 +730,8 @@ def test_run_fitfc_harmonic_single_gen_call(tmp_path, monkeypatch):
     assert "-nrr" in fitfc_calls[0] and "-f" in fitfc_calls[1]
     polled = [c for k, c in calls if k == "polled"]
     assert len(polled) == 1, "only the force runs need pollmach"
-    assert polled[0][:4] == ["pollmach", "runstruct_vasp",
-                             "-w", "fvasp.wrap"]
+    assert polled[0][:5] == ["pollmach", "runstruct_vasp",
+                             "-lu", "-w", "vaspf.wrap"]
     assert polled[0][-3:] == ["mpiexec", "-n", "128"], "launcher trails"
     # svib_ht promoted top-level for sqs2tdb -fit
     assert (sqs / "svib_ht").read_text() == "3.21\n"
@@ -793,10 +793,10 @@ def test_run_fitfc_quasiharmonic_two_gen_calls(tmp_path, monkeypatch):
         "fitfc must be re-run with the SAME command-line options"
     assert "-nrr" not in fitfc_gen_calls[0] and "-ns=3" in fitfc_gen_calls[0]
     # per-vol relax wraps removed; force runs use the separate top-level
-    # fvasp.wrap (selected with -w), never the relax-stage vasp.wrap
+    # vaspf.wrap (selected with -w), never the relax-stage vasp.wrap
     for vol in sqs.glob("vol_*"):
         assert not (vol / "vasp.wrap").is_file()
-    assert (sqs / "fvasp.wrap").is_file()
+    assert (sqs / "vaspf.wrap").is_file()
     assert (sqs / "svib_ht").read_text() == "3.3\n"
 
 
@@ -993,14 +993,14 @@ def test_run_fitfc_escalate_resolves(tmp_path, monkeypatch):
     phonon.run_fitfc(sqs, encut=400, kppra=6000, on_unstable="escalate")
 
     assert len(gen_cmds) == 2, "one normal gen + one escalated gen"
-    assert "-ernn=2.0" in gen_cmds[0] and "-ernn=3.0" in gen_cmds[1]
+    assert "-ernn=4.0" in gen_cmds[0] and "-ernn=6.0" in gen_cmds[1]
     assert len(fit_cmds) == 2 and all("-fn" not in c for c in fit_cmds)
     # the original pert kept its force.out; only the new dir was run
-    assert forced_pert.count("p+0.2_2.0_0") == 1
-    assert forced_pert.count("p+0.2_3.0_0") == 1
+    assert forced_pert.count("p+0.2_4.0_0") == 1
+    assert forced_pert.count("p+0.2_6.0_0") == 1
     assert (sqs / "svib_ht").read_text() == "4.4\n"
     marker = (sqs / "unstable_modes.log").read_text()
-    assert "RESOLVED" in marker and "-ernn=3.0" in marker
+    assert "RESOLVED" in marker and "-ernn=6.0" in marker
 
 
 def test_run_fitfc_escalate_persists_marks_energy_only(tmp_path, monkeypatch):
@@ -1210,13 +1210,13 @@ def test_nas_smoke_dry_run_builds_all_call_paths(tmp_path):
     assert plan["T3_robustrelax"]["pre_argv"] == ["robustrelax_vasp", "-mk"]
     assert plan["T3_robustrelax"]["argv"][:4] == \
         ["robustrelax_vasp", "-id", "-c", "0.05"]
-    assert plan["T4_fitfc_wrap"]["argv"][:3] == ["runstruct_vasp", "-w",
-                                                 "fvasp.wrap"]
+    assert plan["T4_fitfc_wrap"]["argv"][:4] == ["runstruct_vasp", "-lu",
+                                                 "-w", "vaspf.wrap"]
     assert plan["T5_pollmach"]["argv"][:2] == ["pollmach", "runstruct_vasp"]
     # inputs on disk: frozen wrap under the separate name, wait markers,
     # displaced structure for the force run
-    assert (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").is_file()
-    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "fvasp.wrap").read_text()
+    assert (tmp_path / "T4_fitfc_wrap" / "vaspf.wrap").is_file()
+    assert "NSW = 0" in (tmp_path / "T4_fitfc_wrap" / "vaspf.wrap").read_text()
     assert "0.52" in (tmp_path / "T4_fitfc_wrap" / "str.out").read_text()
     assert (tmp_path / "T5_pollmach" / "p_1" / "wait").is_file()
     assert (tmp_path / "T5_pollmach" / "vasp.wrap").is_file()
@@ -1381,7 +1381,7 @@ def _mk_e2e_endmember(root, name, good=True, svib=True):
         (d / "robustrelax_infdet.log").write_text(
             "$ robustrelax_vasp -id -c 0.05 mpiexec -n 32\n")
         (d / "checkrelax.out").write_text("0.012\n")
-        (d / "fvasp.wrap").write_text("[INCAR]\nNSW = 0\n")
+        (d / "vaspf.wrap").write_text("[INCAR]\nNSW = 0\n")
         pert = d / "vol_0" / "p+0.2_5.1_0"
         pert.mkdir(parents=True)
         (pert / "force.out").write_text("0 0 0\n")
@@ -1502,12 +1502,12 @@ def test_e2e_find_endmembers_skips_raw_db_dirs(tmp_path):
 
 
 
-# ---- fvasp.wrap sized for the perturbation supercell (2026-07-16) ----------
+# ---- vaspf.wrap sized for the perturbation supercell (2026-07-16) ----------
 
 def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
     """VASP 6.6: MAGMOM must have exactly NIONS values. The force runs
     execute in the perturbation SUPERCELL (8 atoms for a 1-atom FCC
-    endmember at -ernn=2), so fvasp.wrap must be sized from the p* dirs,
+    endmember at -ernn=2), so vaspf.wrap must be sized from the p* dirs,
     not the SQS cell — the e2e run died on "1 value(s) for MAGMOM ...
     NIONS=8" when it was sized from the 1-atom cell."""
     monkeypatch.setattr(vaspwrap, "DEFAULT_SPIN", True)
@@ -1534,7 +1534,7 @@ def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
     def fake_run_polled(cmd, cwd, log, done_when, **kw):
         # the wrap must ALREADY be sized for the supercell when the
         # force runs launch
-        wrap = (Path(cwd) / "fvasp.wrap").read_text()
+        wrap = (Path(cwd) / "vaspf.wrap").read_text()
         assert "MAGMOM = 8*3" in wrap, wrap
         assert "MAGMOM = 1*3" not in wrap
         for d in Path(cwd).glob("vol_*/p*"):
@@ -1546,7 +1546,7 @@ def test_force_wrap_magmom_matches_pert_supercell(tmp_path, monkeypatch):
     monkeypatch.setattr(phonon.runner, "run_polled", fake_run_polled)
 
     phonon.run_fitfc(sqs, encut=400, kppra=6000)
-    wrap = (sqs / "fvasp.wrap").read_text()
+    wrap = (sqs / "vaspf.wrap").read_text()
     assert "MAGMOM = 8*3" in wrap and "ISPIN = 2" in wrap
 
 
