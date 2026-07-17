@@ -1679,3 +1679,21 @@ def test_system_probe_none_without_single_sublattice(tmp_path):
         tol_ev=1e-4, sqs_levels=[0], env_bin=None, timeout=60,
         cmd_prefix="", seed=0)
     assert out is None
+
+
+def test_e2e_probe_check_reads_manifest(tmp_path):
+    sys.path.insert(0, str(PKG / "nas_smoke"))
+    import json as _json
+    import run_endmember_e2e as e2e
+    r = e2e.verify_probe(tmp_path)
+    assert not r["pass"] and "missing" in r["detail"]
+    (tmp_path / "upstream_manifest.json").write_text(_json.dumps({
+        "system_probe": {"phase": "FCC_A1", "seed": 0,
+                         "encut": 420, "kppra": 8000,
+                         "probes": {"Co": {"dir": "x", "encut": 360,
+                                           "kppra": 7000},
+                                    "Cr": {"dir": "y", "encut": 420,
+                                           "kppra": 8000}}}}))
+    r = e2e.verify_probe(tmp_path)
+    assert r["pass"]
+    assert "GLOBAL ENCUT=420" in r["detail"] and "KPPRA=8000" in r["detail"]

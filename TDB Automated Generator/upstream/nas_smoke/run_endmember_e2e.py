@@ -192,6 +192,31 @@ def find_endmember_dirs(work_root: Path) -> List[Path]:
     return out
 
 
+def verify_probe(work_root: Path) -> Dict:
+    """Tree-level check of the 2026-07-17 convergence-probe protocol:
+    the manifest must record ONE global (ENCUT, KPPRA) chosen from the
+    rich-side probes and used for every run. Soft (older trees predate
+    the protocol) but reported prominently."""
+    mf = work_root / "upstream_manifest.json"
+    try:
+        m = json.loads(mf.read_text())
+    except (OSError, ValueError):
+        return {"pass": False, "detail": "upstream_manifest.json "
+                "missing/unreadable — cannot confirm global settings"}
+    probe = m.get("system_probe")
+    if not probe:
+        return {"pass": False,
+                "detail": "no system_probe in manifest (pre-protocol "
+                          "tree, or probe fell back to first-SQS reuse)"}
+    per_el = ", ".join(f"{el}: ENCUT={v['encut']}/KPPRA={v['kppra']}"
+                       for el, v in sorted(probe["probes"].items()))
+    return {"pass": True,
+            "detail": f"GLOBAL ENCUT={probe['encut']} eV, "
+                      f"KPPRA={probe['kppra']} from {probe['phase']} "
+                      f"rich-side probes ({per_el}; seed "
+                      f"{probe.get('seed')})"}
+
+
 def verify_tree(work_root: Path) -> Tuple[List[Dict], bool]:
     dirs = find_endmember_dirs(work_root)
     results = [verify_endmember_dir(d) for d in dirs]
@@ -202,8 +227,10 @@ def verify_tree(work_root: Path) -> Tuple[List[Dict], bool]:
 
 def write_report(work_root: Path, results: List[Dict], ok: bool,
                  meta: Dict) -> None:
+    probe = verify_probe(work_root)
     (work_root / "e2e_report.json").write_text(json.dumps(
-        {"meta": meta, "suite_pass": ok, "endmembers": results},
+        {"meta": meta, "suite_pass": ok, "global_settings": probe,
+         "endmembers": results},
         indent=2, default=str))
     lines = ["=" * 70,
              f"FCC endmember end-to-end test — {meta.get('timestamp')}",
@@ -211,6 +238,8 @@ def write_report(work_root: Path, results: List[Dict], ok: bool,
              f"SUITE: {'PASS' if ok else 'FAIL'} "
              f"({len(results)} endmember dirs found; need >= 2 with all "
              f"hard criteria green)",
+             f"[{'ok' if probe['pass'] else '!!'}] global settings: "
+             f"{probe['detail']}",
              "=" * 70]
     for r in results:
         flag = "PASS" if r["hard_pass"] else "FAIL"
