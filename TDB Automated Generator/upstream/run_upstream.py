@@ -762,6 +762,13 @@ def main():
                          "converged on a previous run of the same "
                          "elements (e.g. take max over the binaries when "
                          "moving to a ternary).")
+    ap.add_argument("--plateau-band", type=float, default=None,
+                    help="Noise-plateau fallback band in eV/atom "
+                         "(default 0.0005 = 0.5 meV/atom): when the "
+                         "successive-step rule finds nothing, accept the "
+                         "first 4 consecutive sweep points whose total "
+                         "spread fits in this band (the sweep has hit "
+                         "the calculation's noise floor). 0 disables.")
     ap.add_argument("--probe-seed", type=int, default=0,
                     help="Seed for the random probe-phase/probe-SQS "
                          "selection of the system convergence protocol "
@@ -865,6 +872,8 @@ def main():
         spin_on = args.spin or vaspwrap.wants_spin(
             [args.element1, args.element2])
     vaspwrap.DEFAULT_SPIN = spin_on and not args.dlm
+    if args.plateau_band is not None:
+        converge.PLATEAU_BAND_EV = args.plateau_band
     if args.magmom_init is not None:
         vaspwrap.DEFAULT_MAGMOM_INIT = args.magmom_init
     print(f"  Spin        : "

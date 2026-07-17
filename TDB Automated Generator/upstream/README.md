@@ -63,6 +63,15 @@ For each SQS (and each SIGMA endmember):
      point — the deliberately "unneeded" confirmation run — also agrees
      to within tolerance. Energy *differences* converge faster than
      totals (VASP wiki), so this is conservative for mixing energies.
+   - *Noise-floor fallback* (2026-07-17, from the real 31-point FCC-Co
+     sweep): sweep statics run **PREC=Accurate + LREAL=.FALSE.** so the
+     point-to-point noise (~0.3–0.5 meV/atom at PREC=Normal) stays
+     below the tolerance; if the pointwise rule still finds nothing,
+     the first **4 consecutive points spanning < 0.5 meV/atom**
+     terminate the sweep (`--plateau-band`; the table reports which
+     rule fired). Without this, that sweep wandered to 760 eV and
+     "converged" on a noise coincidence; the plateau rule stops it at
+     488 eV and picks 437.
    - `ALGO = All` by default.
 3. **Relaxation** — `--relax-method infdet` is the DEFAULT (user
    decision 2026-07-15): `robustrelax_vasp -mk` then

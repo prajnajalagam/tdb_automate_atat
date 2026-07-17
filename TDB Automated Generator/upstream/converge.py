@@ -50,6 +50,19 @@ from phases import DLMConfig
 # energies subtract totals.
 DEFAULT_TOL_EV = 0.0001
 
+# Plateau fallback (2026-07-17, from the real 31-point ENCUT sweep on
+# FCC Co): past ~437 eV the energy only FLUCTUATES in a ~0.5 meV/atom
+# band — numerical noise (FFT-grid jumps with ENCUT, LREAL projector
+# re-optimization), not basis convergence — so a 0.1 meV/atom
+# successive-step test sits below the noise floor and only terminates
+# when two fluctuations coincide (that run "converged" at 760 eV =
+# 2.8 x ENMAX). Fallback rule: if the successive rule finds nothing,
+# accept the FIRST window of PLATEAU_WINDOW consecutive points whose
+# total spread is <= PLATEAU_BAND_EV — statistically robust to noise
+# the pointwise rule cannot beat. 0 disables (--plateau-band).
+PLATEAU_BAND_EV = 0.0005
+PLATEAU_WINDOW = 4
+
 
 # ---------------------------------------------------------------------------
 # Pure logic (testable without VASP)
@@ -87,30 +100,35 @@ class ConvergenceResult:
     chosen: int
     converged: bool
     tol_ev: float
-    reference: int                 # the setting used as the converged target
+    reference: int                 # confirming point / plateau end
+    rule: str = ""                 # "successive" | "plateau" | ""
 
     def table(self) -> str:
-        ref_e = None
-        for s, e in zip(self.settings, self.energy_per_atom):
-            if s == self.reference:
-                ref_e = e
-        lines = [f"  {self.parameter} convergence "
-                 f"(tol {self.tol_ev*1e3:.1f} meV/atom, "
-                 f"{'CONVERGED' if self.converged else 'NOT CONVERGED'}):"]
+        head = (f"  {self.parameter} convergence "
+                f"(successive-step tol {self.tol_ev*1e3:.2f} meV/atom, ")
+        head += (f"CONVERGED via {self.rule} rule):" if self.converged
+                 else "NOT CONVERGED):")
+        lines = [head]
+        prev_e = None
         for s, e in zip(self.settings, self.energy_per_atom):
             if e is None:
                 lines.append(f"    {s:>7}  <missing energy>")
                 continue
-            d = "" if ref_e is None else f"  d={1e3*(e-ref_e):+7.2f} meV/atom"
-            mark = "  <-- chosen" if s == self.chosen else ""
+            d = "" if prev_e is None \
+                else f"  step={1e3*(e-prev_e):+7.3f} meV/atom"
+            mark = "  <-- chosen" if s == self.chosen else (
+                   "  (confirmation)" if self.converged
+                   and s == self.reference else "")
             lines.append(f"    {s:>7}  {e:12.5f} eV/atom{d}{mark}")
+            prev_e = e
         return "\n".join(lines)
 
 
 def select_converged(settings: List[int],
                      e_per_atom: List[Optional[float]],
-                     tol_ev: float = DEFAULT_TOL_EV
-                     ) -> Tuple[int, bool, int]:
+                     tol_ev: float = DEFAULT_TOL_EV,
+                     plateau_band_ev: Optional[float] = None
+                     ) -> Tuple[int, bool, int, str]:
     """Successive-difference criterion with a confirming point above.
 
     Chosen = the smallest setting S_i (ascending order) such that BOTH
@@ -125,24 +143,39 @@ def select_converged(settings: List[int],
     the reference rule couldn't see it. (Old rule on the same KPPRA
     data picked 4000; this rule picks 7000, matching manual analysis.)
 
-    Returns (chosen_setting, converged_flag, reference_setting) where
-    reference is the confirming point S_{i+1} when converged, else the
-    highest usable setting. Falls back to the highest setting (flag
-    False) when no triple satisfies the criterion.
+    Fallback (noise robustness, see PLATEAU_BAND_EV): when no triple
+    satisfies the pointwise rule, accept the first window of
+    PLATEAU_WINDOW consecutive points whose total spread is within
+    plateau_band_ev — the correct terminator once the curve has hit
+    the calculation's noise floor.
+
+    Returns (chosen, converged, reference, rule) where rule is
+    "successive" or "plateau" ("" when not converged); reference is
+    the confirming point (successive) or the window end (plateau).
     """
+    if plateau_band_ev is None:
+        plateau_band_ev = PLATEAU_BAND_EV
     pairs = [(s, e) for s, e in zip(settings, e_per_atom) if e is not None]
     if not pairs:
         ref = max(settings) if settings else 0
-        return ref, False, ref
+        return ref, False, ref, ""
     pairs.sort(key=lambda p: p[0])  # ascending by setting
 
     for i in range(1, len(pairs) - 1):
         d_prev = abs(pairs[i][1] - pairs[i - 1][1])
         d_next = abs(pairs[i + 1][1] - pairs[i][1])
         if d_prev < tol_ev and d_next < tol_ev:
-            return pairs[i][0], True, pairs[i + 1][0]
+            return pairs[i][0], True, pairs[i + 1][0], "successive"
+
+    if plateau_band_ev > 0:
+        w = PLATEAU_WINDOW
+        for i in range(len(pairs) - w + 1):
+            es = [e for _s, e in pairs[i:i + w]]
+            if max(es) - min(es) <= plateau_band_ev:
+                return pairs[i][0], True, pairs[i + w - 1][0], "plateau"
+
     ref_setting = pairs[-1][0]
-    return ref_setting, False, ref_setting
+    return ref_setting, False, ref_setting, ""
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +212,17 @@ def run_static_point(src_sqs: Path,
             shutil.copy2(s, dst / fn)
 
     natoms = _count_atoms(dst / "str.out")
+    # High-precision statics for SWEEP points (2026-07-17): at
+    # PREC=Normal + LREAL=Auto the point-to-point noise is ~0.3-0.5
+    # meV/atom (FFT grid changes with ENCUT; real-space projectors
+    # re-optimized per point), which swamps a 0.1 meV/atom criterion —
+    # the 31-point FCC-Co sweep wandered to 760 eV on noise. Sweep
+    # cells are small, so the accurate settings cost little here and
+    # do NOT apply to production relax/phonon runs.
     wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo, natoms=natoms)
+                           dlm=dlm, algo=algo, natoms=natoms,
+                           extra={"PREC": "Accurate",
+                                  "LREAL": ".FALSE."})
     (dst / "vasp.wrap").write_text(wrap)
 
     runner.run_logged(["runstruct_vasp"] + runner.split_prefix(cmd_prefix),
@@ -227,7 +269,8 @@ def run_sweep(parameter: str,
             cmd_prefix=cmd_prefix)
 
     e_pa: List[Optional[float]] = [_point(v) for v in settings]
-    chosen, converged, reference = select_converged(settings, e_pa, tol_ev)
+    chosen, converged, reference, rule = select_converged(settings, e_pa,
+                                                          tol_ev)
 
     # Adaptive extension (2026-07-16 user decision: NO ceiling on the
     # sweep — keep adding points until the successive-difference
@@ -239,8 +282,8 @@ def run_sweep(parameter: str,
         nxt = settings[-1] + extend_step
         settings.append(nxt)
         e_pa.append(_point(nxt))
-        chosen, converged, reference = select_converged(settings, e_pa,
-                                                        tol_ev)
+        chosen, converged, reference, rule = select_converged(
+            settings, e_pa, tol_ev)
     if not converged and extend_step > 0:
         print(f"    WARNING: {parameter} not converged to "
               f"{tol_ev*1e3:.2f} meV/atom even at {settings[-1]} "
@@ -249,7 +292,8 @@ def run_sweep(parameter: str,
 
     return ConvergenceResult(
         parameter=parameter, settings=list(settings), energy_per_atom=e_pa,
-        chosen=chosen, converged=converged, tol_ev=tol_ev, reference=reference)
+        chosen=chosen, converged=converged, tol_ev=tol_ev,
+        reference=reference, rule=rule)
 
 
 def converge_sqs(src_sqs: Path,
