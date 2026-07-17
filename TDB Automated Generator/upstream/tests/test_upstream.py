@@ -1769,3 +1769,23 @@ def test_sweep_statics_use_high_precision_wrap(tmp_path, monkeypatch):
     converge.run_static_point(src, tmp_path / "pt", encut=300, kppra=7000)
     assert seen.get("PREC") == "Accurate"
     assert seen.get("LREAL") == ".FALSE."
+
+
+def test_cr_kppra_noise_band_stops_on_initial_grid():
+    """Cr-rich probe KPPRA data from the 2026-07-16 17:31 run (pre-fix
+    code extended toward 20000 and the job died mid-extension): the
+    whole 4000-10000 grid is a +-0.17 meV noise band with NO successive
+    triple. The plateau fallback must terminate on the INITIAL grid —
+    zero extension points — and the global max over probes still takes
+    KPPRA from the Co side (7000)."""
+    ks = [4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    ke = [-8.0796959, -8.0794469, -8.0796206, -8.0797775, -8.0797775,
+          -8.0795921, -8.0798591]
+    chosen, conv, ref, rule = converge.select_converged(ks, ke,
+                                                        tol_ev=0.0001)
+    assert conv is True and rule == "plateau"
+    assert chosen == 4000 and ref == 7000
+    # old behavior (plateau disabled): not converged -> endless extension
+    _c, conv_off, _r, _rule = converge.select_converged(
+        ks, ke, tol_ev=0.0001, plateau_band_ev=0)
+    assert conv_off is False
