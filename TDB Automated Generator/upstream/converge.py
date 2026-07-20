@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import potcar
 import runner
 from strfile import read_structure
-from vaspwrap import build_vasp_wrap
+from vaspwrap import build_vasp_wrap, ranks_from_prefix
 
 
 def _count_atoms(str_out) -> "int | None":
@@ -205,6 +205,15 @@ def run_static_point(src_sqs: Path,
     import shutil
     src_sqs = Path(src_sqs)
     dst = Path(dst)
+    # Restart safety: a point that already produced its energy (from a
+    # previous, possibly walltime-killed submission) is NOT rerun — the
+    # cached value is returned so a resubmitted job fast-forwards
+    # through completed sweep work. runstruct_vasp itself has no such
+    # check when invoked directly (outside pollmach/wait discovery).
+    if dst.is_dir():
+        cached = energy_per_atom(dst)
+        if cached is not None:
+            return cached
     dst.mkdir(parents=True, exist_ok=True)
     for fn in ("str.out", "POTCAR", "species.in", "mult.in"):
         s = src_sqs / fn
@@ -221,6 +230,7 @@ def run_static_point(src_sqs: Path,
     # do NOT apply to production relax/phonon runs.
     wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
                            dlm=dlm, algo=algo, natoms=natoms,
+                           ranks=ranks_from_prefix(cmd_prefix),
                            extra={"PREC": "Accurate",
                                   "LREAL": ".FALSE."})
     (dst / "vasp.wrap").write_text(wrap)
@@ -268,9 +278,28 @@ def run_sweep(parameter: str,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
             cmd_prefix=cmd_prefix)
 
-    e_pa: List[Optional[float]] = [_point(v) for v in settings]
-    chosen, converged, reference, rule = select_converged(settings, e_pa,
-                                                          tol_ev)
+    # Incremental evaluation with EARLY TERMINATION (2026-07-20): points
+    # run one at a time, cheapest first, and the sweep STOPS the moment
+    # the successive-difference rule fires — the chosen setting and its
+    # confirming point are computed by then, so the remaining grid
+    # points cannot change the answer (the rule picks the FIRST
+    # qualifying triple) and are skipped. The plateau fallback is
+    # deliberately NOT allowed to stop the sweep early: it may only
+    # engage once the full base grid has failed the pointwise rule,
+    # otherwise it could preempt a later, stricter successive hit
+    # (e.g. the 2026-07-17 Co KPPRA data plateaus over 4000-7000 but
+    # the successive rule correctly lands on 7000).
+    e_pa: List[Optional[float]] = []
+    ran: List[int] = []
+    chosen, converged, reference, rule = 0, False, 0, ""
+    for v in settings:
+        ran.append(v)
+        e_pa.append(_point(v))
+        chosen, converged, reference, rule = select_converged(
+            ran, e_pa, tol_ev)
+        if converged and rule == "successive":
+            break
+    settings = ran   # only the points actually run appear in the table
 
     # Adaptive extension (2026-07-16 user decision: NO ceiling on the
     # sweep — keep adding points until the successive-difference

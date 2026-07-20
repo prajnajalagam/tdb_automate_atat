@@ -45,7 +45,8 @@ def write_relax_wrap(calc_dir: Path,
                      encut: int,
                      kppra: int,
                      dlm: Optional[DLMConfig] = None,
-                     algo: str = "All") -> Path:
+                     algo: str = "All",
+                     ranks: Optional[int] = None) -> Path:
     """Write a 'relax' vasp.wrap (all DOF) into calc_dir."""
     calc_dir = Path(calc_dir)
     try:
@@ -54,7 +55,7 @@ def write_relax_wrap(calc_dir: Path,
     except OSError:
         natoms = None
     wrap = build_vasp_wrap("relax", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo, natoms=natoms)
+                           dlm=dlm, algo=algo, natoms=natoms, ranks=ranks)
     path = calc_dir / "vasp.wrap"
     path.write_text(wrap)
     return path
@@ -96,7 +97,9 @@ def relax_structure(calc_dir: Path,
     caller should verify existence).
     """
     calc_dir = Path(calc_dir)
-    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo)
+    from vaspwrap import ranks_from_prefix
+    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                     ranks=ranks_from_prefix(cmd_prefix))
     try:
         from strfile import read_structure
         _natoms = len(read_structure(calc_dir / "str.out").atoms) or None
