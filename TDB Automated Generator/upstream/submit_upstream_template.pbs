@@ -48,6 +48,10 @@ TOL_EV="0.0001"                  # successive-step tolerance, 0.1 meV/atom:
                                  # terminate it (--plateau-band to change).
                                  # Sweep statics run PREC=Accurate +
                                  # LREAL=.FALSE. to keep noise ~< tol.
+                                 # Points run ONE AT A TIME and the sweep
+                                 # stops as soon as chosen+confirmation
+                                 # exist — trailing grid points are
+                                 # skipped, not computed (2026-07-20).
 
 # Spin polarization is AUTO-ON (ISPIN=2) for Cr/Mn/Fe/Co/Ni non-DLM
 # runs — NM energies for these metals are wrong by tens of meV/atom.

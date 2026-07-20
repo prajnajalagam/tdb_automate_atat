@@ -1242,6 +1242,101 @@ def test_parallel_overrides_small_cells():
     assert "NCORE = 8" in w and "KPAR = 4" in w
 
 
+def test_parallel_overrides_rank_aware_kpar():
+    """Small cells are k-point dominated (1 atom @ KPPRA 10000 = hundreds
+    of IBZ k-points). With the rank count known, the idle band
+    parallelism is recovered as KPAR — each k-group's band split stays
+    at or below the hardware-validated single-group layout."""
+    # 32 ranks, 1-atom probe cell: KPAR=8 -> 4 ranks/group, NCORE=1
+    assert vaspwrap.parallel_overrides(1, ranks=32) == \
+        {"NCORE": 1, "KPAR": 8}
+    # KPAR must divide the rank count (VASP aborts otherwise)
+    assert vaspwrap.parallel_overrides(1, ranks=2) == \
+        {"NCORE": 1, "KPAR": 2}
+    assert vaspwrap.parallel_overrides(1, ranks=6) == \
+        {"NCORE": 1, "KPAR": 6}
+    assert vaspwrap.parallel_overrides(1, ranks=1) == \
+        {"NCORE": 1, "KPAR": 1}
+    # mid tier caps at 4
+    assert vaspwrap.parallel_overrides(8, ranks=32) == \
+        {"NCORE": 2, "KPAR": 4}
+    # big cells keep the reference NCORE=8/KPAR=4 regardless of ranks
+    assert vaspwrap.parallel_overrides(30, ranks=32) == {}
+    w = vaspwrap.build_vasp_wrap("static", encut=300, kppra=10000,
+                                 natoms=1, ranks=32)
+    assert "NCORE = 1" in w and "KPAR = 8" in w
+
+
+def test_ranks_from_prefix():
+    assert vaspwrap.ranks_from_prefix("mpiexec -n 32") == 32
+    assert vaspwrap.ranks_from_prefix("mpirun -np 128") == 128
+    assert vaspwrap.ranks_from_prefix("") is None
+    assert vaspwrap.ranks_from_prefix("mpiexec") is None
+    assert vaspwrap.ranks_from_prefix("mpiexec -n lots") is None
+
+
+def test_static_point_returns_cached_energy(tmp_path, monkeypatch):
+    """A sweep point with an energy already on disk (from a killed
+    submission) must be read back, not rerun — resubmission after the
+    2026-07-20 early-termination fix relies on this fast-forward."""
+    def boom(*a, **k):
+        raise AssertionError("VASP must not be launched for cached point")
+    monkeypatch.setattr(converge.runner, "run_logged", boom)
+
+    dst = tmp_path / "encut_301"
+    dst.mkdir()
+    (dst / "energy").write_text("-12.4\n")
+    (dst / "str.out").write_text(
+        "1 0 0\n0 1 0\n0 0 1\n1 0 0\n0 1 0\n0 0 1\n"
+        "0 0 0 Co\n0.5 0.5 0.5 Co\n")
+    e = converge.run_static_point(tmp_path / "sqs", dst,
+                                  encut=301, kppra=7000)
+    assert e == -6.2                      # -12.4 eV / 2 atoms, cached
+
+
+def test_sweep_early_terminates_on_successive_rule(tmp_path, monkeypatch):
+    """Once chosen + confirmation satisfy the successive rule, trailing
+    grid points cannot change the answer (the rule takes the FIRST
+    qualifying triple) — they must be SKIPPED, not computed."""
+    energies = {4000: -6.0000, 5000: -6.0010, 6000: -6.00105,
+                7000: -6.00104, 8000: -6.5, 9000: -6.6, 10000: -6.7}
+    ran = []
+
+    def fake_point(src, dst, encut, kppra, **kw):
+        ran.append(kppra)
+        return energies[kppra]
+
+    monkeypatch.setattr(converge, "run_static_point", fake_point)
+    res = converge.run_sweep("KPPRA", tmp_path, tmp_path / "sw",
+                             settings=sorted(energies), fixed_other=300)
+    assert ran == [4000, 5000, 6000, 7000]     # 8000+ never run
+    assert res.converged and res.rule == "successive"
+    assert res.chosen == 6000 and res.reference == 7000
+    assert res.settings == [4000, 5000, 6000, 7000]
+
+
+def test_sweep_noise_floor_still_runs_full_grid(tmp_path, monkeypatch):
+    """The plateau fallback must NOT terminate the sweep early — it only
+    engages after the whole base grid has failed the pointwise rule
+    (otherwise it could preempt a later, stricter successive hit)."""
+    vals = [-6.00000, -6.00015, -6.00000, -6.00015,
+            -6.00000, -6.00015, -6.00000]        # +-0.15 meV noise
+    grid = [4000 + 1000 * i for i in range(7)]
+    energies = dict(zip(grid, vals))
+    ran = []
+
+    def fake_point(src, dst, encut, kppra, **kw):
+        ran.append(kppra)
+        return energies[kppra]
+
+    monkeypatch.setattr(converge, "run_static_point", fake_point)
+    res = converge.run_sweep("KPPRA", tmp_path, tmp_path / "sw",
+                             settings=grid, fixed_other=300)
+    assert ran == grid                           # every point computed
+    assert res.converged and res.rule == "plateau"
+    assert res.chosen == 4000
+
+
 def test_validate_structure_file_catches_degenerate_stub(tmp_path):
     """Exact stub robustrelax/infdet left behind in the real Co-Cr run
     after its inner VASP crashed."""

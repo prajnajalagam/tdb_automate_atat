@@ -112,7 +112,34 @@ def wants_spin(elements) -> bool:
     return any(str(e).capitalize() in MAGNETIC_3D for e in elements)
 
 
-def parallel_overrides(natoms: Optional[int]) -> Dict[str, int]:
+def ranks_from_prefix(cmd_prefix: str) -> Optional[int]:
+    """Parse the MPI rank count out of a launch prefix.
+
+    "mpiexec -n 32" / "mpirun -np 128" -> 32 / 128; None when the
+    prefix is empty or carries no recognizable -n/-np <int>.
+    """
+    toks = (cmd_prefix or "").split()
+    for i, t in enumerate(toks[:-1]):
+        if t in ("-n", "-np"):
+            try:
+                return int(toks[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _kpar_dividing(ranks: Optional[int], want: int) -> int:
+    """Largest KPAR <= want that divides ranks (VASP requires it)."""
+    if not ranks or ranks < 2:
+        return 1
+    k = min(want, ranks)
+    while k > 1 and ranks % k:
+        k -= 1
+    return k
+
+
+def parallel_overrides(natoms: Optional[int],
+                       ranks: Optional[int] = None) -> Dict[str, int]:
     """NCORE/KPAR safe for the cell size.
 
     The reference wrap's NCORE=8 + KPAR=4 assumes production-size SQS.
@@ -124,13 +151,25 @@ def parallel_overrides(natoms: Optional[int]) -> Dict[str, int]:
     Small cells get a conservative decomposition; production cells keep
     the wrap defaults. Safe beats optimal here — a 1-atom cell is fast
     on any layout.
+
+    ranks: total MPI ranks the job launches (ranks_from_prefix). Small
+    cells are K-POINT dominated (a 1-atom cell at KPPRA 10000 has
+    hundreds of irreducible k-points), so with ranks known the saved
+    band-parallelism is spent on KPAR instead of left idle: KPAR only
+    splits the k-list across independent groups — each group's
+    band-splitting stays at or below the validated single-group layout,
+    so this is strictly gentler per group AND up to 8x faster. Without
+    ranks (None) the old conservative KPAR survives unchanged, since
+    VASP aborts when KPAR does not divide the rank count.
     """
     if natoms is None:
         return {}
     if natoms <= 4:
-        return {"NCORE": 1, "KPAR": 1}
+        return {"NCORE": 1,
+                "KPAR": _kpar_dividing(ranks, 8) if ranks else 1}
     if natoms <= 12:
-        return {"NCORE": 2, "KPAR": 2}
+        return {"NCORE": 2,
+                "KPAR": _kpar_dividing(ranks, 4) if ranks else 2}
     return {}
 
 
@@ -228,6 +267,7 @@ def build_vasp_wrap(mode: str,
                     spin: Optional[bool] = None,
                     natoms: Optional[int] = None,
                     magmom_init: Optional[float] = None,
+                    ranks: Optional[int] = None,
                     extra: Optional[Dict[str, object]] = None) -> str:
     """Return the text of a vasp.wrap file.
 
@@ -241,6 +281,9 @@ def build_vasp_wrap(mode: str,
     natoms  atom count of the cell this wrap will run; small cells get
             conservative NCORE/KPAR (see parallel_overrides) — the
             reference NCORE=8/KPAR=4 crashes VASP on 1-atom endmembers.
+    ranks   total MPI ranks of the launcher (ranks_from_prefix on the
+            cmd prefix); lets small k-point-dominated cells recover the
+            parallelism as KPAR. Omitted -> old conservative layout.
     spin    ISPIN=2 collinear spin polarization. None (default) falls back
             to the module-level DEFAULT_SPIN, which run_upstream turns on
             automatically for MAGNETIC_3D elements. When natoms is known
@@ -286,7 +329,7 @@ def build_vasp_wrap(mode: str,
             continue
         put(k, v)
 
-    for k, v in parallel_overrides(natoms).items():
+    for k, v in parallel_overrides(natoms, ranks).items():
         put(k, v)
 
     if kppra is not None:
