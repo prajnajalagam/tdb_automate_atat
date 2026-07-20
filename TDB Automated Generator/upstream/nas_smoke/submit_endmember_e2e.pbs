@@ -27,11 +27,7 @@ set -euo pipefail
 ELEMENT_A="Co"
 ELEMENT_B="Cr"
 POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_B}/POTCAR"
-# Home directory on purpose (nobackup currently unavailable). Fine at
-# this scale: 2 endmembers + one ~32-atom supercell each, LWAVE/LCHARG
-# off — well under the NAS home quota. Move back to /nobackupp27 for
-# full production runs.
-WORK_ROOT="$HOME/e2e_fcc_endmembers_$(date +%Y%m%d_%H%M%S)"
+WORK_ROOT="/nobackupp27/pjalagam/e2e_fcc_endmembers_$(date +%Y%m%d_%H%M%S)"
 CMD_PREFIX="mpiexec -n ${NCPUS:-32}"
 FITFC_ON_UNSTABLE="mark"         # "escalate" also fine; costs a 2nd force set
 TIMEOUT_S="4800"                 # per-poll cap inside the pipeline

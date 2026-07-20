@@ -394,7 +394,10 @@ def run_fitfc(sqs_dir: Path,
                 log=sqs_dir / "fitfc_strain_runs.log",
                 done_when=runner.all_energy_present(pending),
                 stop_sentinel="stoppoll",
-                env_bin=env_bin, timeout=timeout)
+                env_bin=env_bin, timeout=timeout,
+                work_dirs=list(pending),
+                natoms=_count_atoms(sqs_dir / "str.out"),
+                kind="relax", done_file="energy")
             for d in pending:
                 wrap = d / "vasp.wrap"
                 if wrap.is_file():
@@ -428,7 +431,10 @@ def run_fitfc(sqs_dir: Path,
             log=sqs_dir / "fitfc_force_runs.log",
             done_when=all_force_runs_done(pert_dirs),
             stop_sentinel="stoppoll",
-            env_bin=env_bin, timeout=timeout)
+            env_bin=env_bin, timeout=timeout,
+            work_dirs=list(pert_dirs),
+            natoms=_count_atoms(pert_dirs[0] / "str.out"),
+            kind="force", done_file="force.out")
 
     # 4. DLM fixup BEFORE the fit — fitfc -f parses str_relax.out and
     #    str_unpert.out (top level, vol_* and p* alike) and can't match
@@ -495,7 +501,10 @@ def run_fitfc(sqs_dir: Path,
                 log=sqs_dir / "fitfc_force_runs_escalated.log",
                 done_when=all_force_runs_done(new_pert),
                 stop_sentinel="stoppoll",
-                env_bin=env_bin, timeout=timeout)
+                env_bin=env_bin, timeout=timeout,
+                work_dirs=list(new_pert),
+                natoms=_count_atoms(new_pert[0] / "str.out"),
+                kind="force", done_file="force.out")
         # The regenerated str_unpert.out / str_relax.out carry spin
         # tags again on a DLM run — re-strip before refitting.
         if dlm is not None and dlm.enabled:

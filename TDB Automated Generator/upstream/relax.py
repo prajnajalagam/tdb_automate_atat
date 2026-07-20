@@ -97,6 +97,11 @@ def relax_structure(calc_dir: Path,
     """
     calc_dir = Path(calc_dir)
     write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo)
+    try:
+        from strfile import read_structure
+        _natoms = len(read_structure(calc_dir / "str.out").atoms) or None
+    except OSError:
+        _natoms = None
 
     if method not in RELAX_METHODS:
         raise ValueError(
@@ -116,7 +121,9 @@ def relax_structure(calc_dir: Path,
             log=calc_dir / "runstruct.log",
             done_when=runner.all_have_file([calc_dir], "str_relax.out"),
             stop_sentinel="stopcar",
-            env_bin=env_bin, timeout=timeout)
+            env_bin=env_bin, timeout=timeout,
+            work_dirs=[calc_dir], natoms=_natoms, kind="relax",
+            done_file="str_relax.out")
         return calc_dir / "str_relax.out"
 
     # ── Both robustrelax modes need `robustrelax_vasp -mk` first to
@@ -150,6 +157,8 @@ def relax_structure(calc_dir: Path,
         log=calc_dir / f"robustrelax_{method}.log",
         done_when=runner.all_have_file([calc_dir], "str_relax.out"),
         stop_sentinel="stop",
-        env_bin=env_bin, timeout=timeout)
+        env_bin=env_bin, timeout=timeout,
+        work_dirs=[calc_dir], natoms=_natoms, kind="relax",
+        done_file="str_relax.out")
 
     return calc_dir / "str_relax.out"

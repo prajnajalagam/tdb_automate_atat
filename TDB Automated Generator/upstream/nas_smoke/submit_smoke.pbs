@@ -32,9 +32,7 @@ set -euo pipefail
 ELEMENT="Co"
 # POTCAR for ELEMENT (leave empty to rely on ~/.ezvasp.rc POTDIR):
 POTCAR="/home1/zwu6/vasp/POTPAW_PBE.64/Co/POTCAR"
-# Home directory on purpose (nobackup currently unavailable); tiny
-# footprint (2-atom cells). Move to /nobackupp27 when it returns.
-WORKDIR="$HOME/vasp_smoke_$(date +%Y%m%d_%H%M%S)"
+WORKDIR="/nobackupp27/pjalagam/vasp_smoke_$(date +%Y%m%d_%H%M%S)"
 CMD_PREFIX="mpiexec -n 8"        # small on purpose
 TIMEOUT_S="900"                  # per-test cap; suite ~5 tests
 

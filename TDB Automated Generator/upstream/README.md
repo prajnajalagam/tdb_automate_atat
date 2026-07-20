@@ -204,6 +204,56 @@ python3 ../sqs2tdb_pipeline.py --endmembers-yaml endmembers.yaml \
   --data-roots /scratch/CoCr_upstream ...
 ```
 
+## PBS fan-out mode (`--submit pbs`)
+
+By default (`--submit node`) the whole pipeline runs inside ONE PBS job and
+every VASP execution shares that job's allocation serially. `--submit pbs`
+inverts this: the orchestrator runs on a **front end** (pfe) doing only
+bookkeeping + light ATAT glue (sqs2tdb, fitfc, checkrelax), and every long
+VASP execution is submitted as its **own right-sized qsub job** via
+`pbsjobs.Broker`. This is the paper's own cluster pattern
+(`foreachfile wait sbatch jobfile.in`, Calphad 58 (2017) 70 §3.2) plus
+sizing, throttling, retries and restart-safety.
+
+Job shapes produced:
+
+| Work | Shape | Parallelism |
+|---|---|---|
+| convergence probes (system scope) | 1 job per probe SQS (`--probe-worker` submode) | 2 rich-side probes run simultaneously |
+| relaxation (runstruct / robustrelax `-id`) | 1 single job per SQS | all SQS of a phase concurrently (needs `--preset-*`) |
+| fitfc force runs | **1 PBS job array per SQS** — one array element per perturbation dir | all perturbation statics wall-parallel for the same SBUs |
+| fitfc strain runs (`ns>1`) | loop job over `vol_*` dirs | per SQS |
+
+Resource sizing lives in `pbsjobs.SIZING` (ncpus/walltime per atom-count
+tier and job kind), and the trailing `mpiexec -n K` of every command is
+**rewritten to the job's ncpus**, so the select-line/rank-count mismatch
+class of failure cannot occur in this mode. In-flight jobs are capped by
+`--job-max-inflight` (default 16); jobs that leave the queue without their
+output files are resubmitted up to `--job-retries` times. State is kept in
+`.qjob_<tag>` markers + the work tree itself, so killing and rerunning the
+orchestrator **adopts** still-running jobs instead of resubmitting.
+
+Launch with the template (edit the USER CONFIG block first):
+
+```bash
+# on pfe, NOT inside a job:
+bash submit_orchestrator_template.sh
+tail -f <WORK_ROOT>/upstream_live.log     # pipeline progress
+qstat -u $USER                            # the job fan-out
+```
+
+The template generates `<WORK_ROOT>/job_env.sh` (modules/venv/PATH) that
+every submitted job sources — pass your own with `--job-env` if launching
+`run_upstream.py --submit pbs` by hand. Requirements enforced at startup:
+`--job-env` is mandatory, and either `--convergence-scope system` (default)
+or explicit `--preset-encut/--preset-kppra`, because per-SQS parallelism is
+only unlocked once a single global (ENCUT, KPPRA) exists. Sanity-check the
+rendered scripts without submitting via `--job-dry-run`; disable arrays on
+queues that reject `#PBS -J` with `--no-job-arrays` (falls back to a loop
+job). **This mode has not yet been exercised on real NAS hardware** — do a
+`--job-dry-run` inspection of the `qjob_*.pbs` scripts first, and keep the
+single-job `--submit node` path as the fallback.
+
 ## What is and isn't tested
 
 The pure logic — ENMAX parsing, ENCUT/KPPRA grids, `vasp.wrap` generation,

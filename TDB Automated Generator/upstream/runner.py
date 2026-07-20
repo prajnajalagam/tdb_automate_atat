@@ -89,6 +89,18 @@ def run_logged(cmd: Sequence[str],
     return rc
 
 
+# Pluggable execution backend for LONG commands (relaxations, force
+# runs). None -> run locally (default). A pbsjobs.Broker instance ->
+# each run_polled command becomes its own right-sized PBS job while
+# the calling control flow stays identical (--submit pbs mode).
+_BACKEND = None
+
+
+def set_backend(broker) -> None:
+    global _BACKEND
+    _BACKEND = broker
+
+
 def run_polled(cmd: Sequence[str],
                cwd: Path,
                log: Path,
@@ -96,7 +108,11 @@ def run_polled(cmd: Sequence[str],
                stop_sentinel: str = "stoppoll",
                env_bin: Optional[str] = None,
                poll_interval: float = 30.0,
-               timeout: float = 86400.0) -> int:
+               timeout: float = 86400.0,
+               work_dirs: Optional[Sequence[Path]] = None,
+               natoms: Optional[int] = None,
+               kind: str = "generic",
+               done_file: str = "energy") -> int:
     """Launch a `pollmach ...` job manager in the background and wait until
     `done_when(cwd)` returns True (all expected outputs present), then drop the
     stop sentinel and join.
@@ -104,7 +120,17 @@ def run_polled(cmd: Sequence[str],
     done_when   callable(cwd: Path) -> bool, polled every poll_interval s.
     stop_sentinel  filename created in cwd to ask pollmach to stop cleanly
                    ('stoppoll' for fitfc strain runs, 'stop' for robustrelax).
+    work_dirs/natoms/kind/done_file  metadata for the PBS backend
+                   (which dirs the work happens in, cell size for
+                   resource sizing, job kind, per-dir completion file).
+                   Ignored by the local backend.
     """
+    if _BACKEND is not None:
+        tag = Path(log).stem
+        return _BACKEND.run_as_job(
+            tag=tag, cwd=Path(cwd), cmd=list(cmd), done_when=done_when,
+            work_dirs=work_dirs, natoms=natoms, kind=kind,
+            done_file=done_file)
     cwd = Path(cwd)
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
