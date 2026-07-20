@@ -2,7 +2,7 @@
 #PBS -S /bin/bash
 #PBS -N CoCr_UPSTREAM
 #PBS -q long
-#PBS -l select=1:ncpus=32:mpiprocs=32:model=mil_ait
+#PBS -l select=1:ncpus=128:mpiprocs=128:model=mil_ait
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -o upstream_pbs.log
@@ -93,6 +93,11 @@ MAX_CHECKRELAX="0.1"
 # taken from $NCPUS (set by PBS to the ncpus in the select line) so the
 # two can never disagree again — the 2026-07-14 CoCr run oversubscribed
 # 128 ranks onto 32 cores because they were edited independently.
+# ncpus=128 = the full Milan node (charged whole regardless): big-cell
+# runs decompose NCORE=8 x KPAR=4 = 32/k-group (the historical -n 128
+# production layout) and SMALL cells are safe because the wrap builder
+# is rank-aware (2026-07-20): a 1-atom cell gets NCORE=1 + KPAR=8 ->
+# 16 ranks/k-group, gentler per group than the validated 32-in-one.
 CMD_PREFIX="mpiexec -n ${NCPUS:-32}"
 
 # Direct robustrelax_vasp options for RELAX_METHOD normal|infdet.
