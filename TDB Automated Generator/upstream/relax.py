@@ -61,6 +61,44 @@ def write_relax_wrap(calc_dir: Path,
     return path
 
 
+def write_robustrelax_wraps(calc_dir: Path,
+                            encut: int,
+                            kppra: int,
+                            dlm: Optional[DLMConfig] = None,
+                            algo: str = "All",
+                            ranks: Optional[int] = None) -> None:
+    """Write the tuned wrap TRIO that robustrelax_vasp consumes.
+
+    robustrelax_vasp drives up to three kinds of VASP runs:
+      vasp.wrap      full relaxation (the top-level runstruct pass)
+      vaspvol.wrap   volume-only relaxation (ISIF=7) — the inflection-
+                     detection path origin / constrained step
+      vaspstat.wrap  the final static whose energy robustrelax reports
+
+    ``robustrelax_vasp -mk`` generates DEFAULT templates for these,
+    intended for hand-editing; left unedited they carry none of the
+    pipeline's settings — no ISPIN/MAGMOM (nonmagnetic energies for
+    Co/Cr, wrong by tens of meV/atom), untuned ENCUT/KPPRA, no
+    small-cell NCORE/KPAR safety. Observed in the 2026-07-20 production
+    run: robustrelax echoed ``runstruct_vasp -w vaspvol.wrap`` — a step
+    the pipeline had never parameterized. All three wraps are therefore
+    rewritten AFTER -mk so every step robustrelax takes is consistent
+    with the converged sweep settings.
+    """
+    calc_dir = Path(calc_dir)
+    try:
+        from strfile import read_structure
+        natoms = len(read_structure(calc_dir / "str.out").atoms) or None
+    except OSError:
+        natoms = None
+    for fname, mode in (("vasp.wrap", "relax"),
+                        ("vaspvol.wrap", "volrelax"),
+                        ("vaspstat.wrap", "static")):
+        wrap = build_vasp_wrap(mode, encut=encut, kppra=kppra, dlm=dlm,
+                               algo=algo, natoms=natoms, ranks=ranks)
+        (calc_dir / fname).write_text(wrap)
+
+
 def relax_structure(calc_dir: Path,
                     encut: int,
                     kppra: int,
@@ -98,8 +136,7 @@ def relax_structure(calc_dir: Path,
     """
     calc_dir = Path(calc_dir)
     from vaspwrap import ranks_from_prefix
-    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
-                     ranks=ranks_from_prefix(cmd_prefix))
+    _ranks = ranks_from_prefix(cmd_prefix)
     try:
         from strfile import read_structure
         _natoms = len(read_structure(calc_dir / "str.out").atoms) or None
@@ -119,6 +156,8 @@ def relax_structure(calc_dir: Path,
         # step needed here -- runstruct_vasp reads vasp.wrap directly.
         # Trailing tokens ride through pollmach to runstruct_vasp, which
         # uses them as the VASP launch command.
+        write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                         ranks=_ranks)
         runner.run_polled(
             ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=calc_dir,
             log=calc_dir / "runstruct.log",
@@ -132,11 +171,17 @@ def relax_structure(calc_dir: Path,
     # ── Both robustrelax modes need `robustrelax_vasp -mk` first to
     # generate the input files that the subsequent -id / plain
     # invocations expect. Skipping this was the cause of "VASP won't
-    # start" in the user's job. Idempotent: -mk overwrites cleanly.
+    # start" in the user's job. -mk runs FIRST, then the whole wrap
+    # trio (vasp/vaspvol/vaspstat) is overwritten with tuned settings —
+    # writing before -mk risks the templates clobbering ours, and the
+    # vol/static steps must never run on -mk defaults (no spin, untuned
+    # ENCUT/KPPRA — see write_robustrelax_wraps).
     runner.run_logged(
         ["robustrelax_vasp", "-mk"], cwd=calc_dir,
         log=calc_dir / "robustrelax_mk.log",
         env_bin=env_bin, timeout=timeout)
+    write_robustrelax_wraps(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                            ranks=_ranks)
 
     if method == "infdet":
         cmd = ["robustrelax_vasp", "-id"]

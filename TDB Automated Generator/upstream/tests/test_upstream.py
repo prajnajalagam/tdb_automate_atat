@@ -388,6 +388,42 @@ def test_infdet_is_now_the_default(tmp_path, monkeypatch):
         rec.polled
 
 
+_STR_OUT_2ATOM = ("1 0 0\n0 1 0\n0 0 1\n"
+                  "1 0 0\n0 1 0\n0 0 1\n"
+                  "0 0 0 Co\n0.5 0.5 0.5 Cr\n")
+
+
+def test_robustrelax_wrap_trio_overwrites_mk_defaults(tmp_path, monkeypatch):
+    """robustrelax_vasp drives THREE wrap files (vasp/vaspvol/vaspstat);
+    -mk generates default templates for them (no spin, untuned ENCUT).
+    The pipeline previously only wrote vasp.wrap — the -id path steps
+    (vaspvol) and the final static (vaspstat) ran on -mk defaults,
+    observed live in the 2026-07-20 run ('runstruct_vasp -w
+    vaspvol.wrap' with settings the pipeline never wrote). The whole
+    trio must be rewritten with tuned settings AFTER -mk runs."""
+    (tmp_path / "str.out").write_text(_STR_OUT_2ATOM)
+
+    def fake_mk(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        if "-mk" in cmd:            # simulate ATAT dropping its templates
+            for f in ("vasp.wrap", "vaspvol.wrap", "vaspstat.wrap"):
+                (Path(cwd) / f).write_text("[INCAR]\nENCUT = 520\n")
+        return 0
+
+    rec = _RecCalls()
+    monkeypatch.setattr(relax.runner, "run_logged", fake_mk)
+    monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
+    relax.relax_structure(tmp_path, encut=454, kppra=7000, method="infdet",
+                          cmd_prefix="mpiexec -n 128")
+
+    for fname, marker in (("vasp.wrap", "ISIF = 3"),
+                          ("vaspvol.wrap", "ISIF = 7"),
+                          ("vaspstat.wrap", "NSW = 0")):
+        txt = (tmp_path / fname).read_text()
+        assert "ENCUT = 454" in txt, f"{fname} kept the -mk default wrap"
+        assert "KPPRA = 7000" in txt, fname
+        assert marker in txt, f"{fname} missing {marker}"
+
+
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
     """method='normal' must be preceded by robustrelax_vasp -mk."""
     rec = _RecCalls()

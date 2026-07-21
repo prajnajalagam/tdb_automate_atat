@@ -204,6 +204,17 @@ _MODE_INCAR: Dict[str, List[Tuple[str, object]]] = {
         ("EDIFFG", -0.01),
         ("_dostatic", True),
     ],
+    "volrelax": [
+        # Volume-only relaxation (ISIF=7: volume moves, cell shape and
+        # ions fixed) — robustrelax_vasp's vaspvol.wrap step: the path
+        # origin for inflection detection and the constrained fallback
+        # for cells that stray off their lattice.
+        ("NSW", 100),
+        ("IBRION", 2),
+        ("ISIF", 7),
+        ("EDIFFG", -0.01),
+        ("_dostatic", True),
+    ],
     "phonon": [
         # Frozen ions (NSW=0/IBRION=-1/ISIF=2), PREC=Accurate for clean
         # forces. ALGO comes from the global --algo choice (2026-07-17:
