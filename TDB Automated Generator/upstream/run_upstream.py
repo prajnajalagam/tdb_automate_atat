@@ -409,10 +409,6 @@ def process_one_sqs(sqs_dir: Path,
               f"str_relax.out unusable; phonons will be SKIPPED. "
               f"Triage the VASP logs (python3 vasp_triage.py {sqs_dir})")
 
-    # robustrelax -id (infdet) reports its result in energy_end (the
-    # inflection-detection energy); the plain `energy` file is often
-    # left EMPTY even on success. Downstream reads `energy`, so adopt
-    # energy_end when energy is missing/unparseable.
     def _parseable(pth: Path) -> bool:
         try:
             float(pth.read_text().split()[0])
@@ -420,12 +416,40 @@ def process_one_sqs(sqs_dir: Path,
         except (OSError, ValueError, IndexError):
             return False
 
-    energy_f = sqs_dir / "energy"
-    energy_end_f = sqs_dir / "energy_end"
-    if relax_ok and not _parseable(energy_f) and _parseable(energy_end_f):
-        energy_f.write_text(energy_end_f.read_text())
-        stamp(f"[{sqs_dir.name}] energy adopted from infdet energy_end "
-              f"({energy_end_f.read_text().strip()})")
+    # Inflection-detection bookkeeping (semantics from the
+    # robustrelax_vasp source, verified 2026-07-20): when the -id
+    # branch engages, `energy_end` holds the FULLY-RELAXED energy —
+    # the structure the phase DECAYED INTO, which is exactly what
+    # infdet exists to avoid reporting — so it is NEVER adopted as the
+    # result. On success robustrelax itself writes the inflection-point
+    # energy to `energy` (scaled from 01/energy). Success marker (per
+    # the method's author): 01/infdet.log's LAST line is
+    # 'infdet terminated normally', plus `energy` present.
+    infdet_engaged = infdet_ok = False
+    if relax_method == "infdet":
+        infdet_engaged, infdet_ok, infdet_msg = relax.infdet_status(sqs_dir)
+        if infdet_engaged:
+            stamp(f"[{sqs_dir.name}] inflection detection engaged: "
+                  f"{infdet_msg}")
+            if infdet_ok:
+                # Marker for the downstream drift gate: this SQS's
+                # large checkrelax (if any) is the inflection-point
+                # geometry, not decay — do not reject on drift.
+                (sqs_dir / "infdet_ok.flag").write_text(
+                    "inflection detection terminated normally; "
+                    "energy = inflection point; drift gate waived\n")
+                stale = sqs_dir / "relaxaway.flag"
+                if stale.is_file():
+                    stale.unlink()
+            if not infdet_ok and relax_ok:
+                relax_ok = False
+                relax_msg = f"infdet incomplete: {infdet_msg}"
+                stamp(f"[{sqs_dir.name}] INFDET FAILED — {infdet_msg}; "
+                      f"energy_end (the decayed structure's energy) is "
+                      f"NOT adopted; str_relax.out may be the fully-"
+                      f"relaxed geometry, not the inflection point — "
+                      f"rerun with `robustrelax_vasp -id -cip` or "
+                      f"triage 01/ before trusting this SQS")
 
     # Clear the ATAT 'wait' queue marker once the relax has produced its
     # result — sqs2tdb -cp drops a `wait` file in every to-be-computed
@@ -449,7 +473,18 @@ def process_one_sqs(sqs_dir: Path,
                                            sqs_dir / "str_relax.out")
             (sqs_dir / "checkrelax.out").write_text(
                 f"{checkrelax_val:.6f}\n")
-            if checkrelax_val > max_checkrelax:
+            if checkrelax_val > max_checkrelax and infdet_ok:
+                # A successful infdet run legitimately reports large
+                # drift: the whole point of the method is that the
+                # phase is mechanically unstable and str_relax.out is
+                # the inflection point on a large-deformation path.
+                # Success is judged by infdet's own termination marker,
+                # NOT by drift (user directive 2026-07-20).
+                stamp(f"[{sqs_dir.name}] checkrelax = "
+                      f"{checkrelax_val:.4f} > {max_checkrelax} — "
+                      f"INFORMATIONAL only: inflection detection "
+                      f"terminated normally; no relaxaway flag")
+            elif checkrelax_val > max_checkrelax:
                 (sqs_dir / "relaxaway.flag").write_text(
                     f"lattice drift {checkrelax_val:.4f} > "
                     f"{max_checkrelax} — structure left its parent "
@@ -495,6 +530,8 @@ def process_one_sqs(sqs_dir: Path,
         "relax_ok": relax_ok,
         "relax_msg": relax_msg,
         "energy_present": _parseable(sqs_dir / "energy"),
+        "infdet_engaged": infdet_engaged,
+        "infdet_ok": infdet_ok,
         "checkrelax": checkrelax_val,
         "relaxed_away": (sqs_dir / "relaxaway.flag").is_file(),
         "phonon_out": phonon_out,

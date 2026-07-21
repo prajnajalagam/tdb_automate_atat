@@ -61,42 +61,51 @@ def write_relax_wrap(calc_dir: Path,
     return path
 
 
-def write_robustrelax_wraps(calc_dir: Path,
-                            encut: int,
-                            kppra: int,
-                            dlm: Optional[DLMConfig] = None,
-                            algo: str = "All",
-                            ranks: Optional[int] = None) -> None:
-    """Write the tuned wrap TRIO that robustrelax_vasp consumes.
+# The author-documented success marker of an infdet run: ALWAYS the
+# last line of 01/infdet.log when inflection detection completed.
+INFDET_NORMAL_TERMINATION = "infdet terminated normally"
 
-    robustrelax_vasp drives up to three kinds of VASP runs:
-      vasp.wrap      full relaxation (the top-level runstruct pass)
-      vaspvol.wrap   volume-only relaxation (ISIF=7) — the inflection-
-                     detection path origin / constrained step
-      vaspstat.wrap  the final static whose energy robustrelax reports
 
-    ``robustrelax_vasp -mk`` generates DEFAULT templates for these,
-    intended for hand-editing; left unedited they carry none of the
-    pipeline's settings — no ISPIN/MAGMOM (nonmagnetic energies for
-    Co/Cr, wrong by tens of meV/atom), untuned ENCUT/KPPRA, no
-    small-cell NCORE/KPAR safety. Observed in the 2026-07-20 production
-    run: robustrelax echoed ``runstruct_vasp -w vaspvol.wrap`` — a step
-    the pipeline had never parameterized. All three wraps are therefore
-    rewritten AFTER -mk so every step robustrelax takes is consistent
-    with the converged sweep settings.
+def infdet_status(calc_dir: Path) -> "tuple[bool, bool, str]":
+    """(engaged, ok, detail) for a ``robustrelax_vasp -id`` run.
+
+    Semantics from the robustrelax_vasp source (verified 2026-07-20):
+    when the full relaxation strays beyond the -c cutoff, robustrelax
+    takes the inflection-detection branch — the FULLY-RELAXED energy
+    goes to ``energy_end`` (the decayed structure: NOT the result),
+    infdet runs in ``01/``, and on success the INFLECTION-POINT energy
+    is written to ``energy`` (scaled from 01/energy) with
+    ``str_relax.out`` = the inflection geometry.
+
+    engaged: the -id branch was taken (01/ exists or energy_end was
+             written). A large checkrelax value on an engaged run is
+             EXPECTED, not a failure — the path deliberately spans a
+             large deformation.
+    ok:      01/infdet.log ends with "infdet terminated normally" AND
+             the inflection-point energy landed in <calc_dir>/energy.
     """
     calc_dir = Path(calc_dir)
+    engaged = (calc_dir / "01").is_dir() or \
+        (calc_dir / "energy_end").is_file()
+    if not engaged:
+        return False, False, "not engaged (relaxation within -c cutoff)"
+    log = calc_dir / "01" / "infdet.log"
+    if not log.is_file():
+        return True, False, "01/infdet.log missing (failed before infdet)"
     try:
-        from strfile import read_structure
-        natoms = len(read_structure(calc_dir / "str.out").atoms) or None
-    except OSError:
-        natoms = None
-    for fname, mode in (("vasp.wrap", "relax"),
-                        ("vaspvol.wrap", "volrelax"),
-                        ("vaspstat.wrap", "static")):
-        wrap = build_vasp_wrap(mode, encut=encut, kppra=kppra, dlm=dlm,
-                               algo=algo, natoms=natoms, ranks=ranks)
-        (calc_dir / fname).write_text(wrap)
+        lines = [ln.strip() for ln in log.read_text().splitlines()
+                 if ln.strip()]
+    except OSError as exc:
+        return True, False, f"01/infdet.log unreadable: {exc}"
+    if not lines or INFDET_NORMAL_TERMINATION not in lines[-1]:
+        last = lines[-1] if lines else "(empty)"
+        return True, False, f"infdet did not terminate normally " \
+                            f"(last log line: {last!r})"
+    if not (calc_dir / "energy").is_file():
+        return True, False, ("infdet terminated normally but the "
+                             "inflection-point energy was not written "
+                             "to `energy` (static in 01/ failed?)")
+    return True, True, "infdet terminated normally"
 
 
 def relax_structure(calc_dir: Path,
@@ -168,20 +177,23 @@ def relax_structure(calc_dir: Path,
             done_file="str_relax.out")
         return calc_dir / "str_relax.out"
 
-    # ── Both robustrelax modes need `robustrelax_vasp -mk` first to
-    # generate the input files that the subsequent -id / plain
-    # invocations expect. Skipping this was the cause of "VASP won't
-    # start" in the user's job. -mk runs FIRST, then the whole wrap
-    # trio (vasp/vaspvol/vaspstat) is overwritten with tuned settings —
-    # writing before -mk risks the templates clobbering ours, and the
-    # vol/static steps must never run on -mk defaults (no spin, untuned
-    # ENCUT/KPPRA — see write_robustrelax_wraps).
+    # ── Both robustrelax modes: write the TUNED vasp.wrap FIRST, then
+    # run `robustrelax_vasp -mk`. Order matters (verified against the
+    # robustrelax_vasp source, 2026-07-20): -mk does NOT create
+    # vasp.wrap — it REQUIRES it, and derives every auxiliary wrap the
+    # workflow uses (vaspvol.wrap ISIF=7, vaspstatic.wrap ISMEAR=-5,
+    # vaspid.wrap for the infdet statics, vaspf.wrap, vaspneb.wrap) by
+    # grep-transforming vasp.wrap. Writing ours first is therefore what
+    # propagates the converged ENCUT/KPPRA, spin/MAGMOM and NCORE/KPAR
+    # into EVERY step robustrelax takes (volume relax, infdet statics,
+    # final static). With vasp.wrap absent, -mk exits having written
+    # nothing and the -id stage later dies on missing vaspid.wrap.
+    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                     ranks=_ranks)
     runner.run_logged(
         ["robustrelax_vasp", "-mk"], cwd=calc_dir,
         log=calc_dir / "robustrelax_mk.log",
         env_bin=env_bin, timeout=timeout)
-    write_robustrelax_wraps(calc_dir, encut, kppra, dlm=dlm, algo=algo,
-                            ranks=_ranks)
 
     if method == "infdet":
         cmd = ["robustrelax_vasp", "-id"]

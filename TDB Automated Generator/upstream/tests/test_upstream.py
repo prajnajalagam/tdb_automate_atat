@@ -393,35 +393,65 @@ _STR_OUT_2ATOM = ("1 0 0\n0 1 0\n0 0 1\n"
                   "0 0 0 Co\n0.5 0.5 0.5 Cr\n")
 
 
-def test_robustrelax_wrap_trio_overwrites_mk_defaults(tmp_path, monkeypatch):
-    """robustrelax_vasp drives THREE wrap files (vasp/vaspvol/vaspstat);
-    -mk generates default templates for them (no spin, untuned ENCUT).
-    The pipeline previously only wrote vasp.wrap — the -id path steps
-    (vaspvol) and the final static (vaspstat) ran on -mk defaults,
-    observed live in the 2026-07-20 run ('runstruct_vasp -w
-    vaspvol.wrap' with settings the pipeline never wrote). The whole
-    trio must be rewritten with tuned settings AFTER -mk runs."""
+def test_robustrelax_tuned_wrap_exists_before_mk(tmp_path, monkeypatch):
+    """Order verified against the robustrelax_vasp SOURCE (2026-07-20):
+    -mk does NOT create vasp.wrap — it requires it, and derives every
+    auxiliary wrap (vaspvol/vaspstatic/vaspid/vaspf) by grep-
+    transforming it. The TUNED vasp.wrap must therefore be on disk
+    BEFORE -mk runs, or every derived wrap loses the converged
+    ENCUT/KPPRA/spin settings (and -id later dies on missing
+    vaspid.wrap)."""
     (tmp_path / "str.out").write_text(_STR_OUT_2ATOM)
+    seen = {}
 
-    def fake_mk(cmd, cwd, log, env_bin=None, timeout=None, check=True):
-        if "-mk" in cmd:            # simulate ATAT dropping its templates
-            for f in ("vasp.wrap", "vaspvol.wrap", "vaspstat.wrap"):
-                (Path(cwd) / f).write_text("[INCAR]\nENCUT = 520\n")
+    def fake_logged(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        if "-mk" in cmd:
+            wrap = Path(cwd) / "vasp.wrap"
+            seen["wrap_present"] = wrap.is_file()
+            seen["wrap_text"] = wrap.read_text() if wrap.is_file() else ""
         return 0
 
     rec = _RecCalls()
-    monkeypatch.setattr(relax.runner, "run_logged", fake_mk)
+    monkeypatch.setattr(relax.runner, "run_logged", fake_logged)
     monkeypatch.setattr(relax.runner, "run_polled", rec.polled_fn())
     relax.relax_structure(tmp_path, encut=454, kppra=7000, method="infdet",
                           cmd_prefix="mpiexec -n 128")
+    assert seen.get("wrap_present"), "vasp.wrap must exist when -mk runs"
+    assert "ENCUT = 454" in seen["wrap_text"]
+    assert "KPPRA = 7000" in seen["wrap_text"]
 
-    for fname, marker in (("vasp.wrap", "ISIF = 3"),
-                          ("vaspvol.wrap", "ISIF = 7"),
-                          ("vaspstat.wrap", "NSW = 0")):
-        txt = (tmp_path / fname).read_text()
-        assert "ENCUT = 454" in txt, f"{fname} kept the -mk default wrap"
-        assert "KPPRA = 7000" in txt, fname
-        assert marker in txt, f"{fname} missing {marker}"
+
+def test_infdet_status_reads_termination_marker(tmp_path):
+    """Success criterion per the method's author (2026-07-20): the LAST
+    line of 01/infdet.log is 'infdet terminated normally', plus the
+    inflection-point energy propagated to <dir>/energy. checkrelax
+    magnitude is NOT part of the criterion."""
+    # not engaged: no 01/, no energy_end
+    assert relax.infdet_status(tmp_path) == (
+        False, False, "not engaged (relaxation within -c cutoff)")
+
+    # engaged via energy_end but infdet never ran -> failed
+    (tmp_path / "energy_end").write_text("-130.2\n")
+    eng, ok, msg = relax.infdet_status(tmp_path)
+    assert eng and not ok and "infdet.log missing" in msg
+
+    # infdet ran but aborted mid-flight
+    d01 = tmp_path / "01"
+    d01.mkdir()
+    (d01 / "infdet.log").write_text("step 1\nstep 2\nvasp\n")
+    eng, ok, msg = relax.infdet_status(tmp_path)
+    assert eng and not ok and "did not terminate normally" in msg
+
+    # normal termination but energy never propagated
+    (d01 / "infdet.log").write_text(
+        "step 1\nstep 2\ninfdet terminated normally\n")
+    eng, ok, msg = relax.infdet_status(tmp_path)
+    assert eng and not ok and "energy" in msg
+
+    # the real success shape
+    (tmp_path / "energy").write_text("-129.8\n")
+    assert relax.infdet_status(tmp_path) == (
+        True, True, "infdet terminated normally")
 
 
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
@@ -1422,9 +1452,13 @@ def test_process_one_sqs_failed_relax_skips_phonons(tmp_path, monkeypatch):
     assert (sqs / "wait").exists(), "wait must NOT be cleared on failure"
 
 
-def test_process_one_sqs_adopts_infdet_energy_end(tmp_path, monkeypatch):
-    """robustrelax -id writes energy_end and often leaves `energy` empty
-    even on success (seen in the real run); the pipeline must adopt it."""
+def test_process_one_sqs_infdet_failure_never_adopts_energy_end(
+        tmp_path, monkeypatch):
+    """Per the robustrelax_vasp source: energy_end is the FULLY-RELAXED
+    (decayed) structure's energy — adopting it as the result is exactly
+    the error inflection detection exists to prevent. An engaged-but-
+    incomplete infdet run (energy_end present, no normal termination)
+    is a FAILURE: no adoption, relax_ok False, phonons skipped."""
     import types
     sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
     sqs.mkdir()
@@ -1448,9 +1482,53 @@ def test_process_one_sqs_adopts_infdet_energy_end(tmp_path, monkeypatch):
         relax_method="infdet", algo="All", tol_ev=1e-3,
         env_bin=None, skip_phonon=True, timeout=60)
 
+    assert res["infdet_engaged"] is True and res["infdet_ok"] is False
+    assert res["relax_ok"] is False
+    assert res["energy_present"] is False        # energy_end NOT adopted
+    assert "infdet incomplete" in res["relax_msg"]
+
+
+def test_process_one_sqs_infdet_success_waives_drift_gate(
+        tmp_path, monkeypatch):
+    """User directive 2026-07-20: large checkrelax does NOT mean the
+    robustrelax workflow failed. Success = energy present + 01/
+    infdet.log ends with 'infdet terminated normally'. Such an SQS must
+    keep relax_ok, get infdet_ok.flag (downstream gate waiver) and NO
+    relaxaway.flag despite drift over the threshold."""
+    import types
+    sqs = tmp_path / "sqs_lev=1_a_Co=0.5,a_Cr=0.5"
+    sqs.mkdir()
+    _write_str(sqs / "str.out", [[3.5, 0, 0], [0, 3.5, 0], [0, 0, 3.5]])
+
+    fake_res = types.SimpleNamespace(table=lambda: "", converged=True)
+    monkeypatch.setattr(run_upstream.converge, "converge_sqs",
+                        lambda *a, **k: (400, 6000, fake_res, fake_res))
+
+    def infdet_relax(calc_dir, **kwargs):
+        # inflection geometry with LARGE drift vs str.out (> 0.1)
+        _write_str(Path(calc_dir) / "str_relax.out",
+                   [[4.4, 0, 0], [0, 3.5, 0], [0, 0, 3.2]])
+        (Path(calc_dir) / "energy").write_text("-129.8\n")
+        (Path(calc_dir) / "energy_end").write_text("-130.2\n")
+        d01 = Path(calc_dir) / "01"
+        d01.mkdir()
+        (d01 / "infdet.log").write_text(
+            "vasp\nwaiting\ninfdet terminated normally\n")
+        return Path(calc_dir) / "str_relax.out"
+
+    monkeypatch.setattr(run_upstream.relax, "relax_structure", infdet_relax)
+
+    res = run_upstream.process_one_sqs(
+        sqs, potcar_paths=[], dlm=DLMConfig(enabled=False, subatom={}),
+        relax_method="infdet", algo="All", tol_ev=1e-3,
+        env_bin=None, skip_phonon=True, timeout=60)
+
+    assert res["infdet_engaged"] and res["infdet_ok"]
     assert res["relax_ok"] is True and res["energy_present"] is True
-    assert float((sqs / "energy").read_text().split()[0]) == \
-        pytest.approx(-130.17812)
+    assert res["checkrelax"] is not None and res["checkrelax"] > 0.1
+    assert not (sqs / "relaxaway.flag").exists()
+    assert (sqs / "infdet_ok.flag").is_file()
+    assert res["relaxed_away"] is False
 
 
 def test_vasp_triage_reads_gz_and_suffixed_logs(tmp_path):
