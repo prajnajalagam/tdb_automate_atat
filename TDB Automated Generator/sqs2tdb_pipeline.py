@@ -443,6 +443,13 @@ def discover_sqs(data_roots: List[Path], phase: str,
             # mixing-energy fit. Uses the checkrelax.out / relaxaway.flag
             # records written by upstream run_upstream.py; unflagged
             # trees (no file) pass through un-gated.
+            # refine_skip (upstream refine.py): generated for mesh
+            # refinement but not selected — never had energies, never
+            # part of the fit.
+            if (p / "refine_skip").is_file():
+                skip("refine_skip", path=p)
+                continue
+
             # infdet_ok.flag (upstream, 2026-07-20): inflection
             # detection terminated normally on this SQS — large drift
             # is the METHOD WORKING (the energy is the inflection
