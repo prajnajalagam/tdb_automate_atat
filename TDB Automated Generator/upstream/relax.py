@@ -61,6 +61,53 @@ def write_relax_wrap(calc_dir: Path,
     return path
 
 
+# The author-documented success marker of an infdet run: ALWAYS the
+# last line of 01/infdet.log when inflection detection completed.
+INFDET_NORMAL_TERMINATION = "infdet terminated normally"
+
+
+def infdet_status(calc_dir: Path) -> "tuple[bool, bool, str]":
+    """(engaged, ok, detail) for a ``robustrelax_vasp -id`` run.
+
+    Semantics from the robustrelax_vasp source (verified 2026-07-20):
+    when the full relaxation strays beyond the -c cutoff, robustrelax
+    takes the inflection-detection branch — the FULLY-RELAXED energy
+    goes to ``energy_end`` (the decayed structure: NOT the result),
+    infdet runs in ``01/``, and on success the INFLECTION-POINT energy
+    is written to ``energy`` (scaled from 01/energy) with
+    ``str_relax.out`` = the inflection geometry.
+
+    engaged: the -id branch was taken (01/ exists or energy_end was
+             written). A large checkrelax value on an engaged run is
+             EXPECTED, not a failure — the path deliberately spans a
+             large deformation.
+    ok:      01/infdet.log ends with "infdet terminated normally" AND
+             the inflection-point energy landed in <calc_dir>/energy.
+    """
+    calc_dir = Path(calc_dir)
+    engaged = (calc_dir / "01").is_dir() or \
+        (calc_dir / "energy_end").is_file()
+    if not engaged:
+        return False, False, "not engaged (relaxation within -c cutoff)"
+    log = calc_dir / "01" / "infdet.log"
+    if not log.is_file():
+        return True, False, "01/infdet.log missing (failed before infdet)"
+    try:
+        lines = [ln.strip() for ln in log.read_text().splitlines()
+                 if ln.strip()]
+    except OSError as exc:
+        return True, False, f"01/infdet.log unreadable: {exc}"
+    if not lines or INFDET_NORMAL_TERMINATION not in lines[-1]:
+        last = lines[-1] if lines else "(empty)"
+        return True, False, f"infdet did not terminate normally " \
+                            f"(last log line: {last!r})"
+    if not (calc_dir / "energy").is_file():
+        return True, False, ("infdet terminated normally but the "
+                             "inflection-point energy was not written "
+                             "to `energy` (static in 01/ failed?)")
+    return True, True, "infdet terminated normally"
+
+
 def relax_structure(calc_dir: Path,
                     encut: int,
                     kppra: int,
@@ -98,8 +145,7 @@ def relax_structure(calc_dir: Path,
     """
     calc_dir = Path(calc_dir)
     from vaspwrap import ranks_from_prefix
-    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
-                     ranks=ranks_from_prefix(cmd_prefix))
+    _ranks = ranks_from_prefix(cmd_prefix)
     try:
         from strfile import read_structure
         _natoms = len(read_structure(calc_dir / "str.out").atoms) or None
@@ -119,6 +165,8 @@ def relax_structure(calc_dir: Path,
         # step needed here -- runstruct_vasp reads vasp.wrap directly.
         # Trailing tokens ride through pollmach to runstruct_vasp, which
         # uses them as the VASP launch command.
+        write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                         ranks=_ranks)
         runner.run_polled(
             ["pollmach", "runstruct_vasp"] + vasp_launch, cwd=calc_dir,
             log=calc_dir / "runstruct.log",
@@ -129,10 +177,19 @@ def relax_structure(calc_dir: Path,
             done_file="str_relax.out")
         return calc_dir / "str_relax.out"
 
-    # ── Both robustrelax modes need `robustrelax_vasp -mk` first to
-    # generate the input files that the subsequent -id / plain
-    # invocations expect. Skipping this was the cause of "VASP won't
-    # start" in the user's job. Idempotent: -mk overwrites cleanly.
+    # ── Both robustrelax modes: write the TUNED vasp.wrap FIRST, then
+    # run `robustrelax_vasp -mk`. Order matters (verified against the
+    # robustrelax_vasp source, 2026-07-20): -mk does NOT create
+    # vasp.wrap — it REQUIRES it, and derives every auxiliary wrap the
+    # workflow uses (vaspvol.wrap ISIF=7, vaspstatic.wrap ISMEAR=-5,
+    # vaspid.wrap for the infdet statics, vaspf.wrap, vaspneb.wrap) by
+    # grep-transforming vasp.wrap. Writing ours first is therefore what
+    # propagates the converged ENCUT/KPPRA, spin/MAGMOM and NCORE/KPAR
+    # into EVERY step robustrelax takes (volume relax, infdet statics,
+    # final static). With vasp.wrap absent, -mk exits having written
+    # nothing and the -id stage later dies on missing vaspid.wrap.
+    write_relax_wrap(calc_dir, encut, kppra, dlm=dlm, algo=algo,
+                     ranks=_ranks)
     runner.run_logged(
         ["robustrelax_vasp", "-mk"], cwd=calc_dir,
         log=calc_dir / "robustrelax_mk.log",

@@ -443,7 +443,13 @@ def discover_sqs(data_roots: List[Path], phase: str,
             # mixing-energy fit. Uses the checkrelax.out / relaxaway.flag
             # records written by upstream run_upstream.py; unflagged
             # trees (no file) pass through un-gated.
-            if max_checkrelax > 0.0:
+            # infdet_ok.flag (upstream, 2026-07-20): inflection
+            # detection terminated normally on this SQS — large drift
+            # is the METHOD WORKING (the energy is the inflection
+            # point of a deliberately large deformation path, not a
+            # decayed minimum), so the drift gate must not fire.
+            if max_checkrelax > 0.0 and \
+                    not (p / "infdet_ok.flag").is_file():
                 if (p / "relaxaway.flag").is_file():
                     if verbose:
                         print(f"      SKIP {p.name}: relaxaway.flag "
