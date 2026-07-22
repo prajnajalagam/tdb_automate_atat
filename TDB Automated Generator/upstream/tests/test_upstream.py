@@ -2440,3 +2440,23 @@ def test_adaptive_svib_falls_back_to_other_side(tmp_path):
     assert out["tried"][1]["quad4_rmse"] < out["tried"][0]["quad4_rmse"]
     assert out["model"]["rmse"] == pytest.approx(
         out["tried"][1]["quad4_rmse"])
+
+
+def test_generate_phase_sqs_quarantines_stray_root_species_in(
+        tmp_path, monkeypatch):
+    """A work-root species.in stalls the sqs2tdb two-pass handshake
+    (both passes prompt, nothing generated — the 2026-07-22 HCP
+    failure). With -sp given it is never needed: quarantined."""
+    (tmp_path / "species.in").write_text("c=Co,Cr\n")
+
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        d = Path(cwd) / "HCP_A3_small" / "sqs_lev=0_c_Co=1"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "str.out").write_text("s\n")
+        Path(log).write_text("Copied SQSs\n")
+        return 0
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    sqsgen.generate_phase_sqs(tmp_path, "HCP_A3", elements=["Co", "Cr"])
+    assert not (tmp_path / "species.in").exists()
+    assert (tmp_path / "species.in.stray").is_file()

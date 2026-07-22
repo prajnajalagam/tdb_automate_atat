@@ -96,6 +96,19 @@ def generate_phase_sqs(work_root: Path,
         cmd.append(f"-lv={level}")
     if elements:
         cmd.append(f"-sp={','.join(elements)}")
+        # A WORK-ROOT-level species.in (as opposed to the per-lattice
+        # <target>/species.in the two-pass protocol manages) breaks
+        # the handshake: sqs2tdb keeps prompting on every pass and
+        # never copies (2026-07-22: HCP_A3_small generated fine from a
+        # clean cwd but failed in the work root, which carried a stray
+        # 'c=Co,Cr' species.in from an earlier attempt). With -sp
+        # given explicitly the file is never needed — quarantine it.
+        stray = work_root / "species.in"
+        if stray.is_file():
+            bak = work_root / "species.in.stray"
+            print(f"    WARNING: work-root {stray} interferes with the "
+                  f"sqs2tdb -cp two-pass protocol; renaming to {bak.name}")
+            stray.replace(bak)
     elif not (work_root / "species.in").is_file():
         raise RuntimeError(
             f"generate_phase_sqs({phase}): no elements given and no "
