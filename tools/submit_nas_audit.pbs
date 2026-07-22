@@ -1,0 +1,50 @@
+#PBS -S /bin/bash
+#PBS -N nas_audit
+#PBS -l select=1:ncpus=1:model=mil_ait
+#PBS -l walltime=2:00:00
+#PBS -q normal
+#PBS -W group_list=a1485
+#PBS -j oe
+#PBS -o nas_audit.log
+#PBS -m ae
+#PBS -M prajna_jalagam@brown.edu
+
+# ---------------------------------------------------------------
+# Read-only audit of /nobackup VASP/ATAT run directories.
+# Submit from the directory where you want the CSV reports written:
+#     qsub submit_audit.pbs
+#
+# EDIT BEFORE SUBMITTING:
+#   -W group_list=   your project GID (see `groups` or `acct_ytd`)
+#   -M               your email, or delete the -m/-M lines
+#   SCAN_ROOT        the tree to audit
+#   AUDIT            path to nas_audit.py
+# ---------------------------------------------------------------
+
+SCAN_ROOT=/nobackupp27/pjalagam
+AUDIT=$HOME/scripts/nas_audit.py
+OUTDIR=$HOME/backup_audit_$(date +%Y%m%d_%H%M)
+
+module load python3 2>/dev/null || true
+echo "python: $(which python3)  $(python3 --version 2>&1)"
+
+mkdir -p "$OUTDIR"
+cd "$OUTDIR" || exit 1
+
+echo "host      : $(hostname)"
+echo "started   : $(date)"
+echo "scanning  : $SCAN_ROOT"
+echo "output to : $OUTDIR"
+echo "---------------------------------------------"
+
+# --quick skips POSCAR/INCAR hashing (faster, no duplicate report).
+# Drop it if you want the duplicate detection.
+python3 "$AUDIT" "$SCAN_ROOT" --min-mb 100 --progress 5000
+
+echo "---------------------------------------------"
+echo "finished  : $(date)"
+
+# Quota snapshot for context, appended to the log.
+echo ""
+echo "=== lfs quota ==="
+lfs quota -hu "$USER" "$(echo "$SCAN_ROOT" | cut -d/ -f1-2)" 2>/dev/null
