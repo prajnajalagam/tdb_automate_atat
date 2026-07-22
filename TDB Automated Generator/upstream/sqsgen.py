@@ -112,14 +112,42 @@ def generate_phase_sqs(work_root: Path,
         species_edit(species_in)
 
     # Pass 2: actually copies the SQS structures.
+    pass2_log = work_root / f"sqs2tdb_cp_{target}.2.log"
     runner.run_logged(cmd, cwd=work_root,
-                      log=work_root / f"sqs2tdb_cp_{target}.2.log",
+                      log=pass2_log,
                       env_bin=env_bin, timeout=timeout)
+
+    # Pass 2 must NOT still be prompting: sqs2tdb prints "Edit the file
+    # ... and rerun" only when <target>/species.in is absent, i.e. pass
+    # 1 failed to plant it. Observed 2026-07-22 for HCP_A3_small (the
+    # lattice was missing from $atatdir/data/sqsdb): both passes
+    # prompted, nothing was generated, and the old work_root fallback
+    # below silently returned the WORK ROOT as the phase dir — the
+    # pipeline then "discovered" the OTHER phases' 10 SQS dirs and
+    # reprocessed FCC+BCC under the HCP banner (re-relaxing finished
+    # dirs, regenerating phonons). Fail loudly instead.
+    try:
+        pass2_text = pass2_log.read_text()
+    except OSError:
+        pass2_text = ""
+    if "Edit the file" in pass2_text:
+        raise RuntimeError(
+            f"sqs2tdb -cp -l={target}: SECOND pass is still prompting "
+            f"to edit {target}/species.in, i.e. pass 1 never created "
+            f"it. This almost always means the lattice '{target}' is "
+            f"missing from $atatdir/data/sqsdb (check with: ls "
+            f"$(dirname $(which sqs2tdb))/../data/sqsdb). Install the "
+            f"lattice there (or drop it from --phases); see {pass2_log}")
 
     target_dir = work_root / target
     if not target_dir.is_dir():
-        # Some sqs2tdb versions copy into the cwd rather than a named subdir.
-        target_dir = work_root
+        raise RuntimeError(
+            f"sqs2tdb -cp -l={target} exited cleanly but never created "
+            f"{target_dir}. The old fallback of treating the WORK ROOT "
+            f"as the phase dir is forbidden — it aliases this phase "
+            f"onto every other phase's SQS dirs (the 2026-07-22 "
+            f"missing-HCP_A3_small incident). Check that '{target}' "
+            f"exists in $atatdir/data/sqsdb; see {pass2_log}")
 
     # Verify the copy actually happened -- both passes exit 0 even when
     # nothing was copied, so rc alone proves nothing. Only element-

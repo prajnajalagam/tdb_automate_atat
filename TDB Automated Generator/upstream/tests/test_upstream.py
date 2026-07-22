@@ -23,6 +23,7 @@ import converge
 import sqsgen
 import phonon
 import relax
+import runner
 import run_upstream
 from strfile import read_structure, strip_spin_suffix_text
 from phases import DLMConfig, SigmaDLMSpec, DLM_SPIN_UP, DLM_SPIN_DOWN
@@ -454,6 +455,116 @@ def test_infdet_status_reads_termination_marker(tmp_path):
         True, True, "infdet terminated normally")
 
 
+def test_robustrelax_complete_predicate(tmp_path):
+    """2026-07-22 postmortem: str_relax.out appears after robustrelax
+    STEP 1, so it must NOT count as completion — the old predicate made
+    the poller kill robustrelax entering the 00/ volume relax, so 01/
+    inflection detection never ran anywhere."""
+    d = tmp_path
+    # step-1 transient: full relax done, branch not chosen yet
+    (d / "str_relax.out").write_text("x\n")
+    (d / "energy").write_text("-130.2\n")       # runstruct's own energy
+    assert relax.robustrelax_complete(d) is False
+    # unstable branch entered: energy moved to energy_end
+    (d / "energy").unlink()
+    (d / "energy_end").write_text("-130.2\n")
+    assert relax.robustrelax_complete(d) is False
+    # infdet finished but inflection energy not yet propagated
+    (d / "01").mkdir()
+    (d / "01" / "cstr_relax.out").write_text("x\n")
+    assert relax.robustrelax_complete(d) is False
+    # full unstable completion
+    (d / "energy").write_text("-129.8\n")
+    assert relax.robustrelax_complete(d) is True
+    # stable branch shape
+    for f in ("energy_end", "01/cstr_relax.out"):
+        (d / f).unlink()
+    (d / "01").rmdir()
+    assert relax.robustrelax_complete(d) is False
+    (d / "energy_sup").write_text("-130.0\n")
+    assert relax.robustrelax_complete(d) is True
+
+
+def test_relax_infdet_done_when_ignores_str_relax(tmp_path, monkeypatch):
+    """The done_when passed to run_polled for robustrelax modes must be
+    robustrelax_complete, not str_relax.out existence."""
+    captured = {}
+
+    def fake_polled(cmd, cwd, log, done_when=None, **kw):
+        captured["done_when"] = done_when
+        (Path(cwd) / "str_relax.out").write_text("stub\n")
+        return 0
+
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr(relax.runner, "run_polled", fake_polled)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet")
+
+    done_when = captured["done_when"]
+    assert not done_when(tmp_path)      # str_relax.out alone: NOT done
+    (tmp_path / "energy_sup").write_text("-1\n")
+    (tmp_path / "energy").write_text("-1\n")
+    assert done_when(tmp_path)          # stable-branch completion: done
+
+
+def test_relax_clears_stale_error_and_stop(tmp_path, monkeypatch):
+    """Stale error/stop litter from a killed run must be removed before
+    relaunching robustrelax (error makes it bail after step 1; stop
+    kills the 01/ infdet loop on sight)."""
+    (tmp_path / "error").write_text("old\n")
+    (tmp_path / "stop").write_text("")
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_polled(cmd, cwd, log, done_when=None, **kw):
+        seen["error"] = (Path(cwd) / "error").exists()
+        seen["stop"] = (Path(cwd) / "stop").exists()
+        (Path(cwd) / "str_relax.out").write_text("stub\n")
+        return 0
+
+    monkeypatch.setattr(relax.runner, "run_logged", lambda *a, **k: 0)
+    monkeypatch.setattr(relax.runner, "run_polled", fake_polled)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet")
+    assert seen == {"error": False, "stop": False}
+
+
+def test_run_polled_no_sentinel_litter_for_self_terminating(tmp_path):
+    """A command that exits on its own (robustrelax) must not leave the
+    stop sentinel behind — stale sentinels poisoned every rerun in the
+    2026-07-22 tree. Also: a PRE-existing stale sentinel is removed
+    before launch."""
+    (tmp_path / "stop").write_text("stale\n")
+    rc = runner.run_polled(
+        ["bash", "-c", "test ! -e stop && echo clean"],
+        cwd=tmp_path, log=tmp_path / "p.log",
+        done_when=lambda _d: False,     # never satisfied -> exit path
+        stop_sentinel="stop", poll_interval=0.05, timeout=10)
+    assert rc == 0
+    assert not (tmp_path / "stop").exists()
+    assert "clean" in (tmp_path / "p.log").read_text()  # stale removed
+
+
+def test_run_polled_kills_whole_process_group(tmp_path):
+    """Killing only the shell parent orphaned mpiexec children (the
+    UCX 'failed to create UD QP' node exhaustion of 2026-07-22). The
+    poller must take down the entire process group."""
+    import time as _t
+    # parent spawns a child that would outlive a parent-only terminate
+    marker = tmp_path / "child_alive"
+    cmd = ["bash", "-c",
+           f"(sleep 3 && touch {marker}) & sleep 30"]
+    t0 = _t.time()
+    runner.run_polled(cmd, cwd=tmp_path, log=tmp_path / "k.log",
+                      done_when=lambda _d: True,   # done immediately
+                      stop_sentinel="stop", poll_interval=0.05,
+                      timeout=10)
+    assert _t.time() - t0 < 20
+    _t.sleep(3.5)          # give the (killed) child time to NOT appear
+    assert not marker.exists(), \
+        "child survived the kill — process group not terminated"
+
+
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
     """method='normal' must be preceded by robustrelax_vasp -mk."""
     rec = _RecCalls()
@@ -648,6 +759,40 @@ def test_static_point_gets_launcher(tmp_path, monkeypatch):
     assert e == -5.0
     assert calls == [
         ["runstruct_vasp", "mpiexec", "-n", "128"]], calls
+
+
+def test_generate_phase_sqs_raises_when_pass2_still_prompts(
+        tmp_path, monkeypatch):
+    """The missing-HCP_A3_small incident (2026-07-22): both sqs2tdb -cp
+    passes printed the 'Edit the file ... and rerun' prompt (lattice
+    absent from $atatdir/data/sqsdb), nothing was generated, and the
+    old work_root fallback aliased the HCP phase onto the OTHER
+    phases' SQS dirs (log showed 'PHASE HCP_A3 ... 10 SQS directories'
+    all living in FCC/BCC). Must raise loudly instead."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        Path(log).write_text("Using species: Co,Cr\nEdit the file "
+                             "HCP_A3_small/species.in (if needed) and "
+                             "rerun the same command.\n")
+        return 0
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    with pytest.raises(RuntimeError, match="missing from .atatdir"):
+        sqsgen.generate_phase_sqs(tmp_path, "HCP_A3",
+                                  elements=["Co", "Cr"])
+
+
+def test_generate_phase_sqs_never_falls_back_to_work_root(
+        tmp_path, monkeypatch):
+    """Clean pass-2 log but no target dir: the work-root fallback is
+    forbidden (it made discovery reprocess every other phase)."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        Path(log).write_text("Using species: Co,Cr\nCopied SQSs\n")
+        return 0    # ...but never creates HCP_A3_small/
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    with pytest.raises(RuntimeError, match="never created"):
+        sqsgen.generate_phase_sqs(tmp_path, "HCP_A3",
+                                  elements=["Co", "Cr"])
 
 
 # ---- link-only dirs and wait-marker semantics (per sqs2tdb source) ----------

@@ -473,17 +473,23 @@ def process_one_sqs(sqs_dir: Path,
                                            sqs_dir / "str_relax.out")
             (sqs_dir / "checkrelax.out").write_text(
                 f"{checkrelax_val:.6f}\n")
-            if checkrelax_val > max_checkrelax and infdet_ok:
-                # A successful infdet run legitimately reports large
-                # drift: the whole point of the method is that the
-                # phase is mechanically unstable and str_relax.out is
-                # the inflection point on a large-deformation path.
-                # Success is judged by infdet's own termination marker,
-                # NOT by drift (user directive 2026-07-20).
+            if checkrelax_val > max_checkrelax \
+                    and relax_method != "runstruct":
+                # checkrelax is a valid keep/throw signal ONLY for
+                # plain runstruct full relaxations (user directive
+                # 2026-07-22). For robustrelax modes large drift is
+                # part of the method: the -id branch deliberately
+                # spans a large deformation and reports the inflection
+                # point; success is judged by robustrelax's own
+                # completion (energy_sup / 01 + energy) and the
+                # 'infdet terminated normally' marker — never drift.
+                note = ("inflection detection terminated normally"
+                        if infdet_ok else
+                        f"relax_method={relax_method} — drift is not "
+                        f"a failure signal for robustrelax")
                 stamp(f"[{sqs_dir.name}] checkrelax = "
                       f"{checkrelax_val:.4f} > {max_checkrelax} — "
-                      f"INFORMATIONAL only: inflection detection "
-                      f"terminated normally; no relaxaway flag")
+                      f"INFORMATIONAL only ({note}); no relaxaway flag")
             elif checkrelax_val > max_checkrelax:
                 (sqs_dir / "relaxaway.flag").write_text(
                     f"lattice drift {checkrelax_val:.4f} > "
