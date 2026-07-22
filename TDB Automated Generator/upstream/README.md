@@ -204,6 +204,30 @@ python3 ../sqs2tdb_pipeline.py --endmembers-yaml endmembers.yaml \
   --data-roots /scratch/CoCr_upstream ...
 ```
 
+## Adaptive refinement (2026-07-22)
+
+**Energy mesh** (`refine.py energy`): after a downstream `sqs2tdb -fit`,
+feed the phase's `fit_energy.out` back:
+
+```bash
+python3 refine.py energy --phase-root <WORK>/FCC_A1_small \
+    --fit-energy <fitdir>/fit_energy.out --level 3 --element Cr
+```
+
+It locates the composition where |E_dft − E_fit| peaks, generates the
+next SQS level, KEEPS only the two new compositions bracketing that
+point (markers `refine_pick`) and tags the rest `refine_skip` — which
+both upstream discovery and the downstream fit ignore. Rerun the
+upstream job: finished dirs fast-forward, only the picks compute.
+
+**Vibrational entropy** (`--phonon-scope adaptive`): phonons at
+endmembers + lev=1, then the linear-svib assumption is TESTED
+(`--svib-linear-tol`, k_B/atom, default 0.1). If refuted, lev=2
+phonons are bought on the more-stable side (lower mixing energy) and a
+quadratic is fitted; if its RMSE exceeds the tolerance the other side
+is bought and the lower-RMSE fit wins. Full decision trail in
+`<phase>/svib_adaptive.json`. svib values are compared PER ATOM.
+
 ## PBS fan-out mode (`--submit pbs`)
 
 By default (`--submit node`) the whole pipeline runs inside ONE PBS job and

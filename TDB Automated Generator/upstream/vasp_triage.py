@@ -93,6 +93,27 @@ CATALOG: List[Signature] = [
               "just above; if the same output shows 'POSCAR found : 0 "
               "types', the real cause is an earlier crashed step, not "
               "the tag it names."),
+    Signature("mpi_init_failure", "cell_basis",
+              r"failed to create UD QP|MPI_Init\(argc=|"
+              r"create_vni_context.*OFI endpoint open failed",
+              "both",
+              "MPI/UCX could not even initialize — the NODE ran out of "
+              "InfiniBand/memory resources, usually because orphaned "
+              "mpiexec ranks from previously killed drivers piled up "
+              "(2026-07-22 CoCr SIGMA phase: every endmember died here "
+              "after robustrelax parents were terminated without their "
+              "process groups). Check `ps -u $USER` for stray vasp_std/"
+              "mpiexec, kill them (or get a fresh node), and run with "
+              "the 2026-07-22 runner fix that kills whole process "
+              "groups. The VASP input files are NOT the problem."),
+    Signature("infdet_crash", "cell_basis",
+              r"malloc\(\): unaligned tcache chunk|"
+              r"Aborted.*core dumped.*infdet",
+              "both",
+              "The infdet binary aborted — almost always because its "
+              "VASP substep produced no stress.out/force.out (look for "
+              "an earlier MPI or VASP failure in the same dir); infdet "
+              "itself is rarely the root cause."),
     # ── electronic SCF / diagonalization ────────────────────────────
     Signature("edddav", "electronic_scf",
               r"Error EDDDAV: Call to ZHEGV failed",

@@ -23,6 +23,7 @@ import converge
 import sqsgen
 import phonon
 import relax
+import runner
 import run_upstream
 from strfile import read_structure, strip_spin_suffix_text
 from phases import DLMConfig, SigmaDLMSpec, DLM_SPIN_UP, DLM_SPIN_DOWN
@@ -454,6 +455,116 @@ def test_infdet_status_reads_termination_marker(tmp_path):
         True, True, "infdet terminated normally")
 
 
+def test_robustrelax_complete_predicate(tmp_path):
+    """2026-07-22 postmortem: str_relax.out appears after robustrelax
+    STEP 1, so it must NOT count as completion — the old predicate made
+    the poller kill robustrelax entering the 00/ volume relax, so 01/
+    inflection detection never ran anywhere."""
+    d = tmp_path
+    # step-1 transient: full relax done, branch not chosen yet
+    (d / "str_relax.out").write_text("x\n")
+    (d / "energy").write_text("-130.2\n")       # runstruct's own energy
+    assert relax.robustrelax_complete(d) is False
+    # unstable branch entered: energy moved to energy_end
+    (d / "energy").unlink()
+    (d / "energy_end").write_text("-130.2\n")
+    assert relax.robustrelax_complete(d) is False
+    # infdet finished but inflection energy not yet propagated
+    (d / "01").mkdir()
+    (d / "01" / "cstr_relax.out").write_text("x\n")
+    assert relax.robustrelax_complete(d) is False
+    # full unstable completion
+    (d / "energy").write_text("-129.8\n")
+    assert relax.robustrelax_complete(d) is True
+    # stable branch shape
+    for f in ("energy_end", "01/cstr_relax.out"):
+        (d / f).unlink()
+    (d / "01").rmdir()
+    assert relax.robustrelax_complete(d) is False
+    (d / "energy_sup").write_text("-130.0\n")
+    assert relax.robustrelax_complete(d) is True
+
+
+def test_relax_infdet_done_when_ignores_str_relax(tmp_path, monkeypatch):
+    """The done_when passed to run_polled for robustrelax modes must be
+    robustrelax_complete, not str_relax.out existence."""
+    captured = {}
+
+    def fake_polled(cmd, cwd, log, done_when=None, **kw):
+        captured["done_when"] = done_when
+        (Path(cwd) / "str_relax.out").write_text("stub\n")
+        return 0
+
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    monkeypatch.setattr(relax.runner, "run_logged",
+                        lambda *a, **k: 0)
+    monkeypatch.setattr(relax.runner, "run_polled", fake_polled)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet")
+
+    done_when = captured["done_when"]
+    assert not done_when(tmp_path)      # str_relax.out alone: NOT done
+    (tmp_path / "energy_sup").write_text("-1\n")
+    (tmp_path / "energy").write_text("-1\n")
+    assert done_when(tmp_path)          # stable-branch completion: done
+
+
+def test_relax_clears_stale_error_and_stop(tmp_path, monkeypatch):
+    """Stale error/stop litter from a killed run must be removed before
+    relaunching robustrelax (error makes it bail after step 1; stop
+    kills the 01/ infdet loop on sight)."""
+    (tmp_path / "error").write_text("old\n")
+    (tmp_path / "stop").write_text("")
+    _stub_encut_kppra(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_polled(cmd, cwd, log, done_when=None, **kw):
+        seen["error"] = (Path(cwd) / "error").exists()
+        seen["stop"] = (Path(cwd) / "stop").exists()
+        (Path(cwd) / "str_relax.out").write_text("stub\n")
+        return 0
+
+    monkeypatch.setattr(relax.runner, "run_logged", lambda *a, **k: 0)
+    monkeypatch.setattr(relax.runner, "run_polled", fake_polled)
+    relax.relax_structure(tmp_path, encut=400, kppra=8000, method="infdet")
+    assert seen == {"error": False, "stop": False}
+
+
+def test_run_polled_no_sentinel_litter_for_self_terminating(tmp_path):
+    """A command that exits on its own (robustrelax) must not leave the
+    stop sentinel behind — stale sentinels poisoned every rerun in the
+    2026-07-22 tree. Also: a PRE-existing stale sentinel is removed
+    before launch."""
+    (tmp_path / "stop").write_text("stale\n")
+    rc = runner.run_polled(
+        ["bash", "-c", "test ! -e stop && echo clean"],
+        cwd=tmp_path, log=tmp_path / "p.log",
+        done_when=lambda _d: False,     # never satisfied -> exit path
+        stop_sentinel="stop", poll_interval=0.05, timeout=10)
+    assert rc == 0
+    assert not (tmp_path / "stop").exists()
+    assert "clean" in (tmp_path / "p.log").read_text()  # stale removed
+
+
+def test_run_polled_kills_whole_process_group(tmp_path):
+    """Killing only the shell parent orphaned mpiexec children (the
+    UCX 'failed to create UD QP' node exhaustion of 2026-07-22). The
+    poller must take down the entire process group."""
+    import time as _t
+    # parent spawns a child that would outlive a parent-only terminate
+    marker = tmp_path / "child_alive"
+    cmd = ["bash", "-c",
+           f"(sleep 3 && touch {marker}) & sleep 30"]
+    t0 = _t.time()
+    runner.run_polled(cmd, cwd=tmp_path, log=tmp_path / "k.log",
+                      done_when=lambda _d: True,   # done immediately
+                      stop_sentinel="stop", poll_interval=0.05,
+                      timeout=10)
+    assert _t.time() - t0 < 20
+    _t.sleep(3.5)          # give the (killed) child time to NOT appear
+    assert not marker.exists(), \
+        "child survived the kill — process group not terminated"
+
+
 def test_robustrelax_normal_runs_mk_first(tmp_path, monkeypatch):
     """method='normal' must be preceded by robustrelax_vasp -mk."""
     rec = _RecCalls()
@@ -648,6 +759,40 @@ def test_static_point_gets_launcher(tmp_path, monkeypatch):
     assert e == -5.0
     assert calls == [
         ["runstruct_vasp", "mpiexec", "-n", "128"]], calls
+
+
+def test_generate_phase_sqs_raises_when_pass2_still_prompts(
+        tmp_path, monkeypatch):
+    """The missing-HCP_A3_small incident (2026-07-22): both sqs2tdb -cp
+    passes printed the 'Edit the file ... and rerun' prompt (lattice
+    absent from $atatdir/data/sqsdb), nothing was generated, and the
+    old work_root fallback aliased the HCP phase onto the OTHER
+    phases' SQS dirs (log showed 'PHASE HCP_A3 ... 10 SQS directories'
+    all living in FCC/BCC). Must raise loudly instead."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        Path(log).write_text("Using species: Co,Cr\nEdit the file "
+                             "HCP_A3_small/species.in (if needed) and "
+                             "rerun the same command.\n")
+        return 0
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    with pytest.raises(RuntimeError, match="missing from .atatdir"):
+        sqsgen.generate_phase_sqs(tmp_path, "HCP_A3",
+                                  elements=["Co", "Cr"])
+
+
+def test_generate_phase_sqs_never_falls_back_to_work_root(
+        tmp_path, monkeypatch):
+    """Clean pass-2 log but no target dir: the work-root fallback is
+    forbidden (it made discovery reprocess every other phase)."""
+    def fake_run(cmd, cwd, log, env_bin=None, timeout=None, check=True):
+        Path(log).write_text("Using species: Co,Cr\nCopied SQSs\n")
+        return 0    # ...but never creates HCP_A3_small/
+
+    monkeypatch.setattr(sqsgen.runner, "run_logged", fake_run)
+    with pytest.raises(RuntimeError, match="never created"):
+        sqsgen.generate_phase_sqs(tmp_path, "HCP_A3",
+                                  elements=["Co", "Cr"])
 
 
 # ---- link-only dirs and wait-marker semantics (per sqs2tdb source) ----------
@@ -2145,3 +2290,153 @@ def test_probe_worker_argv_strips_orchestration_flags(monkeypatch):
     assert "--no-job-arrays" not in argv
     assert argv[:4] == ["--element1", "Co", "--element2", "Cr"]
     assert "--potcars" in argv
+
+
+# ---- refine.py: fit-error mesh refinement + adaptive svib (2026-07-22) -----
+
+import refine
+
+
+def test_parse_fit_energy_and_worst_point(tmp_path):
+    f = tmp_path / "fit_energy.out"
+    f.write_text("# comment\n"
+                 "0.00  -6.900 -6.899\n"
+                 "0.25  -7.100 -7.080\n"     # err 20 meV  <-- worst
+                 "0.50  -7.300 -7.295\n"
+                 "1.00  -8.000 -8.001\n")
+    rows = refine.parse_fit_energy(f)
+    assert len(rows) == 4
+    x_star, err = refine.worst_fit_point(rows)
+    assert x_star == 0.25 and err == pytest.approx(0.020)
+
+
+def test_refinement_targets_bracket_worst_point():
+    xs = [0.0, 0.25, 0.5, 1.0]
+    # midpoints toward BOTH neighbours of x*=0.25
+    assert refine.refinement_targets(xs, 0.25) == [0.125, 0.375]
+    # endmember-adjacent: only one side exists
+    assert refine.refinement_targets(xs, 0.0) == [0.125]
+
+
+def test_select_new_dirs_marks_unchosen(tmp_path):
+    """Freshly generated dirs not bracketing the worst point get
+    refine_skip; discovery must then ignore them."""
+    def mk(name, computed=False):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "str.out").write_text("s\n")
+        if computed:
+            (d / "energy").write_text("-1\n")
+        return d
+
+    mk("sqs_lev=0_a_Co=1", computed=True)          # existing: untouched
+    d125 = mk("sqs_lev=3_a_Co=0.875,a_Cr=0.125")   # x_Cr = 0.125
+    d375 = mk("sqs_lev=3_a_Co=0.625,a_Cr=0.375")   # x_Cr = 0.375
+    d625 = mk("sqs_lev=3_a_Co=0.375,a_Cr=0.625")   # x_Cr = 0.625 (extra)
+
+    chosen = refine.select_new_dirs(tmp_path, [0.125, 0.375], "Cr")
+    assert chosen["0.1250"] == d125.name
+    assert chosen["0.3750"] == d375.name
+    assert (d125 / "refine_pick").is_file()
+    assert (d625 / "refine_skip").is_file()
+    assert not (tmp_path / "sqs_lev=0_a_Co=1" / "refine_skip").exists()
+
+    disc = run_upstream.discover_sqs_dirs(tmp_path)
+    names = {d.name for d in disc}
+    assert d625.name not in names and d125.name in names
+
+
+def _svib_dir(root, name, natoms, svib=None, energy=None):
+    d = root / name
+    d.mkdir()
+    coord = "1 0 0\n0 1 0\n0 0 1\n1 0 0\n0 1 0\n0 0 1\n"
+    atoms = "".join(f"0 0 {i} Co\n" for i in range(natoms))
+    (d / "str.out").write_text(coord + atoms)
+    if svib is not None:
+        (d / "svib_ht").write_text(f"{svib}\n")
+    if energy is not None:
+        (d / "energy").write_text(f"{energy}\n")
+    return d
+
+
+def test_adaptive_svib_linear_holds(tmp_path):
+    """|dev| <= tol: linearity kept, NO lev=2 phonons purchased."""
+    _svib_dir(tmp_path, "sqs_lev=0_a_Co=1", 1, svib=3.0)
+    _svib_dir(tmp_path, "sqs_lev=0_a_Cr=1", 1, svib=4.0)
+    _svib_dir(tmp_path, "sqs_lev=1_a_Co=0.5,a_Cr=0.5", 4,
+              svib=4 * 3.52)                     # per atom 3.52 vs 3.5
+    bought = []
+    out = refine.adaptive_svib_phase(tmp_path, "Cr", bought.append,
+                                     tol=0.1, log=lambda *_: None)
+    assert bought == []
+    assert out["model"]["kind"] == "linear"
+    assert "HOLDS" in out["decision"]
+    assert (tmp_path / "svib_adaptive.json").is_file()
+
+
+def test_adaptive_svib_refuted_buys_stable_side_first(tmp_path):
+    """Refuted linearity: phonons bought on the LOWER-mixing-energy
+    side; quadratic kept when the 4-point RMSE beats the lev=1
+    prediction error at the new point."""
+    _svib_dir(tmp_path, "sqs_lev=0_a_Co=1", 1, svib=3.0, energy=-7.0)
+    _svib_dir(tmp_path, "sqs_lev=0_a_Cr=1", 1, svib=4.0, energy=-9.0)
+    # strongly non-linear midpoint: dev = 4.3 - 3.5 = 0.8 > tol
+    _svib_dir(tmp_path, "sqs_lev=1_a_Co=0.5,a_Cr=0.5", 4,
+              svib=4 * 4.3, energy=4 * -8.5)
+    # Cr-rich side has the lower (more negative) mixing energy:
+    #   e_mix(0.75) = -8.9 - (-8.5)  = -0.4 ;  e_mix(0.25) = +0.1
+    d25 = _svib_dir(tmp_path, "sqs_lev=2_a_Co=0.75,a_Cr=0.25", 4,
+                    energy=4 * -7.4)
+    d75 = _svib_dir(tmp_path, "sqs_lev=2_a_Co=0.25,a_Cr=0.75", 4,
+                    energy=4 * -8.9)
+
+    quad = lambda x: 3.0 + 2.4 * x - 1.9 * x * x   # noqa: E731
+    # exact quadratic through the 3 base points (3.0, 4.3, 3.5):
+    # a=3.0, b=... solve: at .5: a+.5b+.25c=4.3; at 1: a+b+c=4.0
+    # b=2.1? compute inside test instead:
+    def run_phonon(d):
+        x = refine.composition_fraction(d.name, "Cr")
+        # value ON the exact 3-point quadratic -> rmse ~ 0 -> keep
+        import numpy as np
+        A = np.array([[1, 0, 0], [1, .5, .25], [1, 1, 1]], float)
+        a, b, c = np.linalg.solve(A, np.array([3.0, 4.3, 4.0]))
+        s = a + b * x + c * x * x
+        (Path(d) / "svib_ht").write_text(f"{4 * s}\n")
+
+    out = refine.adaptive_svib_phase(tmp_path, "Cr", run_phonon,
+                                     tol=0.1, log=lambda *_: None)
+    assert out["tried"][0]["x"] == 0.75      # stable side first
+    assert (d75 / "svib_ht").is_file()
+    assert not (d25 / "svib_ht").exists()    # other side never bought
+    assert out["model"]["kind"] == "quadratic"
+    assert out["model"]["rmse"] < 0.05
+
+
+def test_adaptive_svib_falls_back_to_other_side(tmp_path):
+    """If the first side's 4-point quadratic fits WORSE than the lev=1
+    prediction error, the other lev=2 side is computed and the lower-
+    RMSE fit wins (user spec)."""
+    _svib_dir(tmp_path, "sqs_lev=0_a_Co=1", 1, svib=3.0, energy=-7.0)
+    _svib_dir(tmp_path, "sqs_lev=0_a_Cr=1", 1, svib=4.0, energy=-9.0)
+    _svib_dir(tmp_path, "sqs_lev=1_a_Co=0.5,a_Cr=0.5", 4,
+              svib=4 * 4.3, energy=4 * -8.5)
+    _svib_dir(tmp_path, "sqs_lev=2_a_Co=0.75,a_Cr=0.25", 4,
+              energy=4 * -7.4)
+    _svib_dir(tmp_path, "sqs_lev=2_a_Co=0.25,a_Cr=0.75", 4,
+              energy=4 * -8.9)
+
+    def run_phonon(d):
+        x = refine.composition_fraction(d.name, "Cr")
+        # first (stable, x=0.75) side: WILD outlier -> bad quadratic;
+        # second side (x=0.25): on-model value
+        s = 20.0 if x == 0.75 else 3.9
+        (Path(d) / "svib_ht").write_text(f"{4 * s}\n")
+
+    out = refine.adaptive_svib_phase(tmp_path, "Cr", run_phonon,
+                                     tol=0.1, log=lambda *_: None)
+    assert [t["x"] for t in out["tried"]] == [0.75, 0.25]
+    assert out["model"]["kind"] == "quadratic"
+    # the kept fit is the second side's (lower RMSE)
+    assert out["tried"][1]["quad4_rmse"] < out["tried"][0]["quad4_rmse"]
+    assert out["model"]["rmse"] == pytest.approx(
+        out["tried"][1]["quad4_rmse"])

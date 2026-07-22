@@ -214,6 +214,7 @@ ELS = ("Co", "Cr", "Ni")              # fixed leading columns, per request
 
 
 def write_csv(rows: List[RunRow], out: Path) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
     width = max((len(r.inner_counts) for r in rows), default=0)
     head = ([f"X_{e}" for e in ELS]
             + ["phase", "system", "ISPIN", "NELM", "n_ionic_steps",
@@ -234,6 +235,7 @@ def write_csv(rows: List[RunRow], out: Path) -> None:
 
 def write_md(rows: List[RunRow], out: Path, max_steps: int = 12) -> None:
     """Colleague-friendly markdown table; long runs elide middle steps."""
+    out.parent.mkdir(parents=True, exist_ok=True)
     head = [f"X_{e}" for e in ELS] + ["Phase"] \
         + [f"Ion {i}" for i in range(1, max_steps + 1)] + ["…", "Comments"]
     lines = ["| " + " | ".join(head) + " |",

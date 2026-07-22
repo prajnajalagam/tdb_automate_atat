@@ -66,6 +66,41 @@ def write_relax_wrap(calc_dir: Path,
 INFDET_NORMAL_TERMINATION = "infdet terminated normally"
 
 
+def robustrelax_complete(calc_dir: Path) -> bool:
+    """True only when robustrelax_vasp has finished an ENTIRE branch.
+
+    THE 2026-07-22 CoCr POSTMORTEM: the old done_when was 'str_relax.out
+    exists' — but robustrelax's STEP 1 (the full relaxation) already
+    writes str_relax.out, so the poller declared victory and killed
+    robustrelax right as it entered the 00/ volume relax. 01/ (the
+    actual inflection detection) never ran on a single mixing SQS, the
+    kill orphaned the mpiexec children ("vaspvol keeps running"), and
+    on every restart the pre-existing str_relax.out re-triggered the
+    kill 60 s after launch. checkrelax on the step-1 geometry is NOT a
+    completion (or success) signal for robustrelax — only for plain
+    runstruct full relaxations.
+
+    True completion, from the robustrelax_vasp source:
+      stable branch   (drift <= -c cutoff): `energy` rescaled from
+          `energy_sup` — both present at the end, no energy_end.
+      unstable branch (-id engaged): `energy_end` written at branch
+          entry; done only when 01/cstr_relax.out exists (infdet
+          finished) AND `energy` was rewritten from 01/energy (the
+          inflection-point energy, the LAST file the branch writes
+          before updating str_relax.out).
+    The step-1 transient (str_relax.out + runstruct's own `energy`,
+    neither energy_sup nor energy_end yet) matches NEITHER arm, so the
+    poller keeps waiting and robustrelax simply runs to completion —
+    it self-terminates, unlike pollmach.
+    """
+    d = Path(calc_dir)
+    stable = (d / "energy_sup").is_file() and (d / "energy").is_file()
+    unstable = ((d / "energy_end").is_file()
+                and (d / "01" / "cstr_relax.out").is_file()
+                and (d / "energy").is_file())
+    return stable or unstable
+
+
 def infdet_status(calc_dir: Path) -> "tuple[bool, bool, str]":
     """(engaged, ok, detail) for a ``robustrelax_vasp -id`` run.
 
@@ -194,6 +229,14 @@ def relax_structure(calc_dir: Path,
         ["robustrelax_vasp", "-mk"], cwd=calc_dir,
         log=calc_dir / "robustrelax_mk.log",
         env_bin=env_bin, timeout=timeout)
+    # Rerun hygiene: stale `error` makes robustrelax bail immediately
+    # after step 1 ("Error during relaxation run"); stale `stop` kills
+    # the 01/ infdet loop on sight. Both were littered across the
+    # 2026-07-22 tree by the premature-kill bug.
+    for stale in ("error", "stop"):
+        f = calc_dir / stale
+        if f.is_file():
+            f.unlink()
 
     if method == "infdet":
         cmd = ["robustrelax_vasp", "-id"]
@@ -210,15 +253,16 @@ def relax_structure(calc_dir: Path,
         cmd += runner.split_prefix(relax_opts)
     cmd += vasp_launch          # VASP launch command LAST, per ATAT usage
 
-    # robustrelax stops on a 'stop' sentinel; poll until str_relax.out
-    # appears.
+    # robustrelax self-terminates; the predicate must describe FULL
+    # branch completion, NOT str_relax.out (which step 1 already
+    # writes — see robustrelax_complete for the 2026-07-22 postmortem).
     runner.run_polled(
         cmd, cwd=calc_dir,
         log=calc_dir / f"robustrelax_{method}.log",
-        done_when=runner.all_have_file([calc_dir], "str_relax.out"),
+        done_when=lambda _cwd: robustrelax_complete(calc_dir),
         stop_sentinel="stop",
         env_bin=env_bin, timeout=timeout,
         work_dirs=[calc_dir], natoms=_natoms, kind="relax",
-        done_file="str_relax.out")
+        done_file="energy")
 
     return calc_dir / "str_relax.out"

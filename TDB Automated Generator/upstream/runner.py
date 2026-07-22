@@ -134,12 +134,33 @@ def run_polled(cmd: Sequence[str],
     cwd = Path(cwd)
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
+    # Rerun hygiene: a sentinel left by a previous (killed) invocation
+    # makes pollmach stop instantly and pollutes robustrelax reruns —
+    # the 2026-07-22 CoCr tree had stale `stop` files in every SQS dir.
+    try:
+        (cwd / stop_sentinel).unlink()
+    except OSError:
+        pass
     fh = open(log, "w")
     fh.write(f"$ cd {cwd}\n$ {' '.join(cmd)} &\n{'-'*60}\n")
     fh.flush()
+    # start_new_session: the command gets its own process GROUP so that
+    # a kill reaches its CHILDREN too. Killing only the shell-script
+    # parent (the old behaviour) orphaned the running `mpiexec -n 128`
+    # VASP underneath — by the SIGMA phase of the 2026-07-22 CoCr run
+    # the node had accumulated enough orphaned ranks that every new
+    # MPI_Init died with UCX "failed to create UD QP: Cannot allocate
+    # memory", failing all 8 endmembers.
     proc = subprocess.Popen(
         list(cmd), cwd=str(cwd), env=_env_with_bin(env_bin),
-        stdout=fh, stderr=subprocess.STDOUT, text=True)
+        stdout=fh, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True)
+
+    def _kill_group() -> None:
+        try:
+            os.killpg(proc.pid, 15)          # SIGTERM to the whole tree
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
     t0 = time.time()
     rc = 0
@@ -148,7 +169,8 @@ def run_polled(cmd: Sequence[str],
             if done_when(cwd):
                 break
             if proc.poll() is not None:
-                # pollmach exited on its own (e.g. nothing left to do).
+                # Command exited on its own (robustrelax_vasp always
+                # does; pollmach when nothing is left to do).
                 rc = proc.returncode or 0
                 break
             if time.time() - t0 > timeout:
@@ -157,15 +179,29 @@ def run_polled(cmd: Sequence[str],
                 break
             time.sleep(poll_interval)
     finally:
-        # Ask pollmach to stop, then ensure the process is gone.
-        try:
-            (cwd / stop_sentinel).touch()
-        except OSError:
-            pass
+        # Self-terminating commands (robustrelax) need no sentinel; only
+        # ask a still-running manager (pollmach) to stop.
+        if proc.poll() is None:
+            try:
+                (cwd / stop_sentinel).touch()
+            except OSError:
+                pass
         try:
             proc.wait(timeout=poll_interval * 2)
         except subprocess.TimeoutExpired:
-            proc.terminate()
+            _kill_group()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 9)
+                except OSError:
+                    pass
+        # Never leave the sentinel behind for the next invocation.
+        try:
+            (cwd / stop_sentinel).unlink()
+        except OSError:
+            pass
         fh.close()
     return rc
 
