@@ -29,6 +29,11 @@ JOB_MODEL="mil_ait"              # node model for submitted jobs
 JOB_QUEUE="normal"               # devel's job limit unfits it for fan-out
 JOB_MAX_INFLIGHT="16"            # compute-cost throttle
 JOB_RETRIES="1"
+JOB_DRY_RUN="no"                 # "yes": render qjob_*.pbs scripts but
+                                 # submit NOTHING — inspect them, then
+                                 # flip back and rerun (first-time
+                                 # sanity check; this mode has not yet
+                                 # been exercised on real hardware)
 
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
@@ -58,6 +63,9 @@ EOF
 # Front-end environment for the orchestrator itself (fitfc/sqs2tdb glue).
 source "${JOB_ENV}"
 
+EXTRA=()
+[ "${JOB_DRY_RUN}" = "yes" ] && EXTRA+=(--job-dry-run)
+
 nohup python3 -u "${SCRIPT_DIR}/run_upstream.py" \
     --element1 "${ELEMENT_A}" --element2 "${ELEMENT_B}" \
     --work-root "${WORK_ROOT}" \
@@ -72,6 +80,7 @@ nohup python3 -u "${SCRIPT_DIR}/run_upstream.py" \
     --job-queue "${JOB_QUEUE}" \
     --job-max-inflight "${JOB_MAX_INFLIGHT}" \
     --job-retries "${JOB_RETRIES}" \
+    "${EXTRA[@]}" \
     > "${WORK_ROOT}/orchestrator.log" 2>&1 &
 
 echo "orchestrator PID $! — logs:"
