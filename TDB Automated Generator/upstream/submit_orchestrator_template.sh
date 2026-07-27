@@ -48,6 +48,15 @@ mkdir -p "${WORK_ROOT}"
 # loads is why this is generated, not hand-copied).
 JOB_ENV="${WORK_ROOT}/job_env.sh"
 cat > "${JOB_ENV}" <<EOF
+# Self-initializing: 'module' is a shell FUNCTION defined by the
+# profile — absent in non-login bash (e.g. 'bash script.sh' from a
+# tcsh session on pfe, 2026-07-23: "module: command not found").
+if ! type module >/dev/null 2>&1; then
+    for _mi in /usr/share/Modules/init/bash \\
+               /usr/share/modules/init/bash /etc/profile.d/modules.sh; do
+        [ -r "\$_mi" ] && . "\$_mi" && break
+    done
+fi
 module purge
 module load python3
 module load gcc
