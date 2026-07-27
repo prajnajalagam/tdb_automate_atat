@@ -58,6 +58,10 @@ source ${VENV_ACTIVATE}
 export PATH="${ATAT_BIN}:${VASP_BIN}:\$PATH"
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
+# No core dumps: a crashing 128-rank VASP writes core files whose
+# APPARENT size is the whole address space (the 107TB core.44471 of
+# 2025-03) — they poison tar/rsync/audits forever after.
+ulimit -c 0
 EOF
 
 # Front-end environment for the orchestrator itself (fitfc/sqs2tdb glue).
