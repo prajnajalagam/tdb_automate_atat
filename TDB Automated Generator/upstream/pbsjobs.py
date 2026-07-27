@@ -60,12 +60,20 @@ from typing import Callable, Dict, List, Optional, Sequence
 # on NAS regardless of ranks, so the savings lever is WALLTIME (and
 # model choice, which is a Broker field) — but matching ranks to the
 # cell also avoids the small-cell decomposition crashes.
+#
+# TIER BOUNDARIES MUST MATCH vaspwrap.parallel_overrides (<=4 and <=12
+# atoms get reduced NCORE/KPAR; ABOVE 12 the wrap keeps the production
+# NCORE=8 x KPAR=4 = 32-rank decomposition). The 2026-07-27 dry run
+# caught a 16-atom cell sized at 16 cpus while its wrap assumed 32
+# ranks — hence the >12-atom tier starts at 32 cpus. Walltimes are
+# generous on purpose: NAS charges ACTUAL usage, and the observed
+# 16-atom infdet relaxations ran ~4-5 h end to end.
 SIZING = {
-    "relax": [(4, 8, "01:00:00"), (16, 16, "02:00:00"),
-              (48, 32, "04:00:00"), (10**9, 64, "08:00:00")],
-    "force": [(16, 16, "00:30:00"), (48, 32, "01:00:00"),
-              (10**9, 64, "02:00:00")],
-    "probe": [(10**9, 32, "04:00:00")],   # adaptive sweeps, sequential
+    "relax": [(4, 8, "02:00:00"), (12, 16, "04:00:00"),
+              (48, 32, "06:00:00"), (10**9, 64, "12:00:00")],
+    "force": [(12, 16, "00:30:00"), (48, 32, "02:00:00"),
+              (10**9, 64, "04:00:00")],
+    "probe": [(10**9, 32, "06:00:00")],   # adaptive sweeps, sequential
     "generic": [(10**9, 32, "04:00:00")],
 }
 
