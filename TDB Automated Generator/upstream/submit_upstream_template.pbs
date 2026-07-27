@@ -165,6 +165,9 @@ export OMP_NUM_THREADS=1
 # Live logging: without this, Python buffers stdout when piped and the
 # job looks dead until buffers flush. Belt-and-braces with `python3 -u`.
 export PYTHONUNBUFFERED=1
+# No core dumps — crashed MPI ranks leave core files with multi-TB
+# APPARENT sizes (sparse), which poison tar/rsync/audits.
+ulimit -c 0
 
 if ! command -v sqs2tdb  >/dev/null 2>&1; then echo "no sqs2tdb on PATH";  exit 1; fi
 if ! command -v fitfc    >/dev/null 2>&1; then echo "no fitfc on PATH";    exit 1; fi
