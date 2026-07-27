@@ -2155,6 +2155,14 @@ def test_sizing_and_launcher_retarget():
     assert pbsjobs.size_for(30, "relax")["ncpus"] == 32
     assert pbsjobs.size_for(100, "force")["ncpus"] == 64
     assert pbsjobs.size_for(None, "relax")["ncpus"] == 64  # unknown->big
+    # tier boundary must MATCH vaspwrap.parallel_overrides: >12 atoms
+    # keeps the production NCORE=8 x KPAR=4 (=32-rank) wrap, so a
+    # 16-atom cell needs 32 cpus, NOT 16 (2026-07-27 dry-run catch)
+    assert pbsjobs.size_for(16, "relax")["ncpus"] == 32
+    assert pbsjobs.size_for(16, "force")["ncpus"] == 32
+    assert pbsjobs.size_for(12, "relax")["ncpus"] == 16
+    assert vaspwrap.parallel_overrides(12, ranks=16) != {}
+    assert vaspwrap.parallel_overrides(16, ranks=32) == {}
     cmd = ["robustrelax_vasp", "-id", "-c", "0.05", "mpiexec", "-n", "128"]
     out = pbsjobs.retarget_launcher(cmd, 16)
     assert out[-3:] == ["mpiexec", "-n", "16"]
