@@ -25,6 +25,12 @@ POTCARS="/home1/zwu6/vasp/POTPAW_PBE.64/${ELEMENT_A}/POTCAR,/home1/zwu6/vasp/POT
 PHASES="FCC_A1,BCC_A2,HCP_A3,SIGMA_D8B"
 SQS_LEVEL="2"
 
+# Converged settings from a previous run: skips the probe jobs
+# entirely and uses these everywhere (2026-07-20 CoCr probes:
+# ENCUT=454, KPPRA=7000). Leave BOTH empty to re-probe.
+PRESET_ENCUT="454"
+PRESET_KPPRA="7000"
+
 JOB_MODEL="mil_ait"              # node model for submitted jobs
 JOB_QUEUE="normal"               # devel's job limit unfits it for fan-out
 JOB_MAX_INFLIGHT="16"            # compute-cost throttle
@@ -78,6 +84,8 @@ source "${JOB_ENV}"
 
 EXTRA=()
 [ "${JOB_DRY_RUN}" = "yes" ] && EXTRA+=(--job-dry-run)
+[ -n "${PRESET_ENCUT}" ] && [ -n "${PRESET_KPPRA}" ] && \
+    EXTRA+=(--preset-encut "${PRESET_ENCUT}" --preset-kppra "${PRESET_KPPRA}")
 
 nohup python3 -u "${SCRIPT_DIR}/run_upstream.py" \
     --element1 "${ELEMENT_A}" --element2 "${ELEMENT_B}" \
