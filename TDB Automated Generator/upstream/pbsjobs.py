@@ -141,7 +141,23 @@ class Broker:
         ]
         if array_n >= 2:
             lines.append(f"#PBS -J 0-{array_n - 1}")
-        lines += ["", "set -uo pipefail", self.site_env, ""]
+        # NO `set -u` here: Environment-Modules init scripts (sourced
+        # via site_env) reference unbound variables and would kill the
+        # job before any environment exists — prime suspect in the
+        # 2026-07-27 fan-out failure where every VASP launch died in
+        # ~1 min while ATAT kept running. The sanity block makes the
+        # job log self-diagnosing either way.
+        lines += ["", "set -o pipefail", self.site_env, "",
+                  "echo '== job env sanity =='",
+                  "module list 2>&1 | head -15",
+                  "for b in runstruct_vasp robustrelax_vasp fitfc "
+                  "ezvasp mpiexec vasp_std; do",
+                  "  printf '%-18s %s\\n' \"$b\" "
+                  "\"$(command -v $b || echo MISSING)\"",
+                  "done",
+                  "mpiexec -n 2 hostname 2>&1 | head -4 "
+                  "|| echo 'MPI LAUNCH FAILED'",
+                  "echo '== end sanity =='", ""]
         return "\n".join(lines)
 
     def qsub(self, script: Path) -> str:
