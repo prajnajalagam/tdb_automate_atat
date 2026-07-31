@@ -43,7 +43,7 @@ JOB_DRY_RUN="no"                 # "yes": render qjob_*.pbs scripts but
 
 VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
 ATAT_BIN="/home7/pjalagam/bin"
-VASP_BIN="/home1/zwu6/vasp/6.6.0/bin_PFE"
+VASP_BIN="/home1/zwu6/vasp/6.6.1/bin_PFE"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ───────────────────────── END USER CONFIG ──────────────────────────────────
 
