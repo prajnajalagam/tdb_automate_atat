@@ -95,10 +95,19 @@ def setup_one_endmember(phase_dir: Path, sites, assignment,
     if (out_dir / "str.out").is_file():
         return f"skip (exists): {out_name}"
 
-    # 1. per-sublattice spin-pair species.in for THIS endmember
-    lines = [f"{s}={el}+{moment:g},{el}-{moment:g}"
-             for s, el in zip(sites, assignment)]
-    (phase_dir / "species.in").write_text("\n".join(lines) + "\n")
+    # 1. per-sublattice spin-pair species.in for THIS endmember.
+    # REAL sqs2tdb format (verified on NAS 2026-08-07): ONE line, the
+    # sublattices TAB-separated —
+    #     aj=Co,Cr,Ni<TAB>g=Co,Cr,Ni<TAB>ii=Co,Cr,Ni
+    # A newline-per-sublattice file silently registers only its FIRST
+    # line (the failed first attempt generated aj-only SQS).
+    spfile = phase_dir / "species.in"
+    backup = phase_dir / "species.in.orig"
+    if spfile.is_file() and not backup.is_file():
+        shutil.copy2(spfile, backup)       # preserve the original once
+    spfile.write_text("\t".join(
+        f"{s}={el}+{moment:g},{el}-{moment:g}"
+        for s, el in zip(sites, assignment)) + "\n")
 
     # [GUARD] a work-root species.in stalls the two-pass handshake
     stray = work_root / "species.in"
@@ -172,6 +181,14 @@ def main(argv=None) -> int:
                                   args.moment, lattice)
         print(f"  {'-'.join(assignment):12s} {msg}")
         results.append(msg)
+
+    # leave the phase dir the way we found it: restore the original
+    # species.in (backup kept) so non-DLM bookkeeping stays coherent
+    backup = phase_dir / "species.in.orig"
+    if backup.is_file():
+        shutil.copy2(backup, phase_dir / "species.in")
+        print(f"\nrestored original species.in "
+              f"(backup kept: {backup.name})")
 
     n_ok = sum(m.startswith(("OK", "skip")) for m in results)
     print(f"\n{n_ok}/{len(results)} endmembers ready under "
