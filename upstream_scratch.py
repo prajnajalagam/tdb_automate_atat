@@ -104,7 +104,8 @@ def sqs_target_and_level(phase: str) -> tuple:
     """
     if phase in SINGLE_SUBLATTICE:
         return phase + "_small", START_LEVEL_SINGLE
-    return phase, START_LEVEL_MULTI
+    else:
+        return phase, START_LEVEL_MULTI
 
 
 def generate_sqs(workdir: Path) -> None:
