@@ -130,10 +130,14 @@ def setup_one_endmember(phase_dir: Path, sites, assignment,
                     f"{[d.name for d in new]} for {out_name}")
 
     # 4. partial-spin mixtures from this round are junk (a pure El+m
-    #    sublattice is ferromagnetically locked, not DLM)
-    for d in new:
-        if d.exists() and d != out_dir:
-            shutil.rmtree(d)
+    #    sublattice is ferromagnetically locked, not DLM) — but ONLY
+    #    clean up after a SUCCESSFUL round; on failure keep everything
+    #    for inspection (2026-08-07: the cleanup destroyed the very
+    #    dirs needed to diagnose a species.in format mismatch).
+    if full:
+        for d in new:
+            if d.exists() and d != out_dir:
+                shutil.rmtree(d)
     return keep_msg
 
 
