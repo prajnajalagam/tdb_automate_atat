@@ -231,6 +231,19 @@ _SPIN_INCAR: List[Tuple[str, object]] = [
     ("BMIX_MAG", 0.0001),
 ]
 
+# Spin-TAGGED structures (str.out species like Co+2/Co-2 from
+# randomspin / sigma_dlm_setup): ezvasp derives the per-atom MAGMOM
+# directly from the tags and writes it into INCAR itself (user's
+# 2026-08-07 reference wrap), so the wrap must carry ISPIN=2 + mixing
+# ONLY — no SUBATOM/MAGATOM machinery and NO explicit MAGMOM line
+# (an explicit uniform MAGMOM would clobber the +/- pattern).
+_TAGGED_SPIN_INCAR: List[Tuple[str, object]] = [
+    ("AMIX", 0.02),
+    ("BMIX", 0.0001),
+    ("AMIX_MAG", 0.4),
+    ("BMIX_MAG", 0.0001),
+]
+
 # DLM-only INCAR additions (magnetic mixing + symmetry), from the reference.
 _DLM_INCAR: List[Tuple[str, object]] = [
     ("ISYM", 0),
@@ -272,6 +285,7 @@ def build_vasp_wrap(mode: str,
                     natoms: Optional[int] = None,
                     magmom_init: Optional[float] = None,
                     ranks: Optional[int] = None,
+                    spin_tagged: bool = False,
                     extra: Optional[Dict[str, object]] = None) -> str:
     """Return the text of a vasp.wrap file.
 
@@ -343,6 +357,16 @@ def build_vasp_wrap(mode: str,
     if spin is None:
         spin = DEFAULT_SPIN
     dlm_on = dlm is not None and dlm.enabled
+    if spin_tagged:
+        # str.out species already carry +/- moment tags (Co+2/Co-2):
+        # ezvasp derives the per-atom MAGMOM from them and writes it
+        # into INCAR itself. Wrap = ISPIN=2 + magnetic mixing ONLY —
+        # no SUBATOM/MAGATOM, and no explicit MAGMOM (it would clobber
+        # the +/- pattern). Overrides both spin and dlm branches.
+        put("ISPIN", 2)
+        for k, v in _TAGGED_SPIN_INCAR:
+            put(k, v)
+        spin = dlm_on = False
     if spin and not dlm_on:
         # Collinear spin polarization for FM/paramagnetic metals. DLM runs
         # skip this: their spin handling comes from the SUBATOM moment

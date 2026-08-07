@@ -221,6 +221,13 @@ def run_static_point(src_sqs: Path,
             shutil.copy2(s, dst / fn)
 
     natoms = _count_atoms(dst / "str.out")
+    # Spin-TAGGED structure (Co+2/Co-2 species from randomspin /
+    # sigma_dlm_setup): ezvasp derives MAGMOM from the tags itself;
+    # the wrap must carry ISPIN=2 + mixing only (vaspwrap.spin_tagged).
+    import re as _re
+    spin_tagged = bool(_re.search(
+        r"\b[A-Z][a-z]?[+-][0-9.]+\s*$",
+        (dst / "str.out").read_text(), _re.MULTILINE))
     # High-precision statics for SWEEP points (2026-07-17): at
     # PREC=Normal + LREAL=Auto the point-to-point noise is ~0.3-0.5
     # meV/atom (FFT grid changes with ENCUT; real-space projectors
@@ -231,6 +238,7 @@ def run_static_point(src_sqs: Path,
     wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
                            dlm=dlm, algo=algo, natoms=natoms,
                            ranks=ranks_from_prefix(cmd_prefix),
+                           spin_tagged=spin_tagged,
                            extra={"PREC": "Accurate",
                                   "LREAL": ".FALSE."})
     (dst / "vasp.wrap").write_text(wrap)

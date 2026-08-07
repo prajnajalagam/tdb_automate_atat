@@ -38,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import converge                                          # noqa: E402
 import potcar                                            # noqa: E402
-from phases import DLMConfig                             # noqa: E402
+import vaspwrap                                          # noqa: E402
 from strfile import read_structure, strip_spin_suffix_text  # noqa: E402
 
 DEFAULT_POT_ROOT = Path("/home1/zwu6/vasp/POTPAW_PBE.64")
@@ -93,11 +93,6 @@ def main(argv=None) -> int:
                     help="dir prepended to PATH for ATAT tools")
     ap.add_argument("--timeout", type=int, default=28800,
                     help="per-VASP-point timeout in seconds")
-    ap.add_argument("--dlm-moment", type=float, default=2.0,
-                    help="SUBATOM moment used when a spin-tagged "
-                         "(DLM) str.out is auto-detected (default 2; "
-                         "POTCAR label = plain element — use the "
-                         "pipeline for per-element _pv overrides)")
     args = ap.parse_args(argv)
 
     sqs_dir = args.sqs_dir.resolve()
@@ -107,26 +102,30 @@ def main(argv=None) -> int:
     potcar_paths = resolve_potcars(args, sqs_dir)
     enmax = potcar.max_enmax(potcar_paths)
 
-    # DLM auto-detection: a spin-tagged str.out (Co+2/Co-2 pseudo-
-    # species from randomspin / sigma_dlm_setup) needs the DLM wrap —
-    # SUBATOM lines mapping each pseudo-species back to its element
-    # with the +/- moment — or ezvasp cannot resolve the species.
-    dlm = None
+    # Spin handling (2026-08-07 user directive: NO SUBATOM machinery):
+    #  * spin-TAGGED str.out (Co+2/Co-2 from randomspin /
+    #    sigma_dlm_setup): ezvasp derives per-atom MAGMOM from the
+    #    tags; converge.run_static_point auto-detects this and writes
+    #    an ISPIN=2 + magnetic-mixing wrap (no MAGMOM, no SUBATOM).
+    #  * plain str.out with magnetic elements: standard FM spin —
+    #    ISPIN=2 + uniform MAGMOM (same auto-on rule as the pipeline).
     struct = read_structure(sqs_dir / "str.out")
-    if any(("+" in sp or "-" in sp) for sp in struct.species()):
-        els = elements_in(sqs_dir)
-        dlm = DLMConfig(enabled=True,
-                        subatom={el: (el, args.dlm_moment)
-                                 for el in els})
-        print(f"[dlm] spin-tagged str.out detected — DLM wrap enabled "
-              f"(SUBATOM moment {args.dlm_moment:g} for {els})")
+    tagged = any(("+" in sp or "-" in sp) for sp in struct.species())
+    els = elements_in(sqs_dir)
+    if tagged:
+        print(f"[spin] tagged str.out (DLM) — ezvasp derives MAGMOM; "
+              f"wrap gets ISPIN=2 + magnetic mixing only")
+    elif vaspwrap.wants_spin(els):
+        vaspwrap.DEFAULT_SPIN = True
+        print(f"[spin] magnetic elements {els} — ISPIN=2 + uniform "
+              f"MAGMOM (FM) enabled for the sweep statics")
     print(f"[sweep] dir     : {sqs_dir}")
     print(f"[sweep] max ENMAX {enmax:.1f} eV; tol "
           f"{args.tol_ev * 1e3:.2f} meV/atom; ALGO {args.algo}")
 
     encut, kppra, kres, eres = converge.converge_sqs(
         sqs_dir, sqs_dir / "convergence", potcar_paths,
-        dlm=dlm, algo=args.algo, tol_ev=args.tol_ev,
+        dlm=None, algo=args.algo, tol_ev=args.tol_ev,
         env_bin=args.env_bin, timeout=args.timeout,
         cmd_prefix=args.cmd_prefix)
 
