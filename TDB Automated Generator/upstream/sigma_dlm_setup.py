@@ -23,20 +23,24 @@ assignments for a binary):
   1. writes <phase>/species.in with the per-sublattice spin pairs;
   2. runs `sqs2tdb -cp -lv=3 -l=SIGMA_D8B` twice (the usual two-pass
      habit; with species.in pre-planted pass 1 already copies);
-  3. locates the FULLY-mixed lev=3 dir (every sublattice carries both
-     +/- tokens at 0.5) and moves it to
-         <phase>/dlm_endmembers/sqs_lev=0_aj_Co=1,g_Cr=1,ii_Cr=1_dlm/
-     with an `endmem` marker;
-  4. deletes the other dirs of that generation round (partial-spin
-     lev<3 mixtures — a sublattice locked to pure El+2 is fully
-     polarized, not DLM: junk).
+  3. the FULLY-mixed lev=3 dir (every sublattice carries both +/-
+     tokens at 0.5) IS the DLM endmember: it is KEPT IN PLACE under
+     its native sqs2tdb name (renaming/moving would break other ATAT
+     tooling) and given an `endmem` marker;
+  4. the other dirs of that round (partial-spin lev<3 mixtures — a
+     sublattice locked to pure El+2 is polarized, not DLM) are
+     removed, but only after a successful round.
+
+All output (both sqs2tdb passes per endmember + a final SUMMARY of
+what succeeded) goes to ONE file: <phase>/sigma_dlm_setup.log, append
+mode across reruns. No per-round log clutter.
 
 Usage:
     cd <WORKDIR>/SIGMA_D8B            # or pass the dir as an argument
-    python3 /path/to/sigma_dlm_setup.py
-    python3 sigma_dlm_setup.py --elements Co,Cr --moment 2
+    python3 /path/to/sigma_dlm_setup.py        # elements auto-detected
+    python3 sigma_dlm_setup.py --elements Co,Cr,Ni --moment 2
 
-Idempotent: endmembers whose dlm_endmembers/ output already exists are
+Idempotent: assignments whose fully-mixed dir already exists are
 skipped. sqs2tdb must be on PATH (it is inside your usual job/pfe env).
 """
 
@@ -58,14 +62,15 @@ DEFAULT_SITES = ("aj", "g", "ii")
 _TOKEN = re.compile(r"([a-z]+)_([A-Za-z+\-0-9.]+?)=([0-9.]+)")
 
 
-def run2(cmd, cwd: Path, log_base: Path) -> None:
-    """The two-pass sqs2tdb habit, each pass logged."""
+def run2(cmd, cwd: Path, log_fh) -> None:
+    """The two-pass sqs2tdb habit, both passes appended to the ONE
+    shared log (no per-round pass files — user directive 2026-08-07)."""
     for n in (1, 2):
-        with open(f"{log_base}.pass{n}.log", "w") as fh:
-            fh.write(f"$ cd {cwd}\n$ {' '.join(cmd)}\n{'-' * 60}\n")
-            fh.flush()
-            subprocess.run(cmd, cwd=str(cwd), stdout=fh,
-                           stderr=subprocess.STDOUT, text=True)
+        log_fh.write(f"$ cd {cwd}\n$ {' '.join(cmd)}   # pass {n}\n")
+        log_fh.flush()
+        subprocess.run(cmd, cwd=str(cwd), stdout=log_fh,
+                       stderr=subprocess.STDOUT, text=True)
+        log_fh.flush()
 
 
 def name_tokens(dirname: str):
@@ -86,14 +91,19 @@ def is_full_spin_mix(dirname: str, sites, assignment, moment) -> bool:
 
 
 def setup_one_endmember(phase_dir: Path, sites, assignment,
-                        moment: float, lattice: str) -> str:
+                        moment: float, lattice: str, log_fh) -> str:
+    """One endmember round. The DLM SQS KEEPS its native sqs2tdb name
+    and stays IN the phase dir (renaming/moving breaks other ATAT
+    tooling — user directive 2026-08-07); it gets an `endmem` marker.
+    """
     work_root = phase_dir.parent
-    dlm_root = phase_dir / "dlm_endmembers"
-    out_name = "sqs_lev=0_" + ",".join(
-        f"{s}_{el}=1" for s, el in zip(sites, assignment)) + "_dlm"
-    out_dir = dlm_root / out_name
-    if (out_dir / "str.out").is_file():
-        return f"skip (exists): {out_name}"
+    label = "-".join(assignment)
+    # idempotence: the fully-mixed dir for this assignment already here?
+    existing = [d for d in phase_dir.glob("sqs_lev=*") if d.is_dir()
+                and is_full_spin_mix(d.name, sites, assignment, moment)
+                and (d / "str.out").is_file()]
+    if existing:
+        return f"skip (exists): {existing[0].name}"
 
     # 1. per-sublattice spin-pair species.in for THIS endmember.
     # REAL sqs2tdb format (verified on NAS 2026-08-07): ONE line, the
@@ -115,28 +125,27 @@ def setup_one_endmember(phase_dir: Path, sites, assignment,
         stray.rename(work_root / "species.in.stray")
 
     # 2. generate at lev=3 (NO -sp: sqs2tdb must use the species.in we
-    #    just wrote, not overwrite it from the command line)
+    #    just wrote, not overwrite it from the command line). Both
+    #    passes' output goes to the single shared log.
+    log_fh.write(f"\n== endmember {label} ==\n")
     before = {d.name for d in phase_dir.glob("sqs_lev=*") if d.is_dir()}
-    run2(["sqs2tdb", "-cp", "-lv=3", f"-l={lattice}"], work_root,
-         phase_dir / f"sqs2tdb_dlm_{'_'.join(assignment)}")
+    run2(["sqs2tdb", "-cp", "-lv=3", f"-l={lattice}"], work_root, log_fh)
     new = [d for d in phase_dir.glob("sqs_lev=*")
            if d.is_dir() and d.name not in before]
     if not new:
-        return (f"FAILED: sqs2tdb generated nothing for {out_name} — "
-                f"check {phase_dir}/sqs2tdb_dlm_*.log (does the sqsdb "
-                f"SIGMA entry provide lev=3?)")
+        return (f"FAILED: sqs2tdb generated nothing for {label} — see "
+                f"the log (does the sqsdb SIGMA entry provide lev=3?)")
 
-    # 3. the fully-mixed lev=3 dir is the DLM endmember
+    # 3. the fully-mixed lev=3 dir is the DLM endmember: KEEP IT IN
+    #    PLACE under its native name; just mark it as an endmember.
     full = [d for d in new
             if is_full_spin_mix(d.name, sites, assignment, moment)]
-    keep_msg = f"OK: {out_name}"
     if full:
-        dlm_root.mkdir(exist_ok=True)
-        shutil.move(str(full[0]), str(out_dir))
-        (out_dir / "endmem").write_text("")
+        (full[0] / "endmem").write_text("")
+        keep_msg = f"OK: {full[0].name}"
     else:
         keep_msg = (f"FAILED: no fully-mixed lev=3 dir among "
-                    f"{[d.name for d in new]} for {out_name}")
+                    f"{[d.name for d in new]} for {label}")
 
     # 4. partial-spin mixtures from this round are junk (a pure El+m
     #    sublattice is ferromagnetically locked, not DLM) — but ONLY
@@ -145,7 +154,7 @@ def setup_one_endmember(phase_dir: Path, sites, assignment,
     #    dirs needed to diagnose a species.in format mismatch).
     if full:
         for d in new:
-            if d.exists() and d != out_dir:
+            if d.exists() and d != full[0]:
                 shutil.rmtree(d)
     return keep_msg
 
@@ -193,25 +202,40 @@ def main(argv=None) -> int:
               f"-> {len(els) ** len(DEFAULT_SITES)} endmembers")
     sites = tuple(s.strip() for s in args.sites.split(","))
 
-    # all sublattice->element assignments: 2^3 endmembers for a binary
+    # ONE log for everything (user directive: no per-round pass-file
+    # clutter). Append mode: reruns extend the history.
+    import datetime
+    log_path = phase_dir / "sigma_dlm_setup.log"
     results = []
-    for assignment in itertools.product(els, repeat=len(sites)):
-        msg = setup_one_endmember(phase_dir, sites, assignment,
-                                  args.moment, lattice)
-        print(f"  {'-'.join(assignment):12s} {msg}")
-        results.append(msg)
+    with open(log_path, "a") as log_fh:
+        log_fh.write(f"\n{'=' * 66}\nsigma_dlm_setup run "
+                     f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} — "
+                     f"elements {els}, moment {args.moment:g}\n")
+        # all sublattice->element assignments: N^3 endmembers
+        for assignment in itertools.product(els, repeat=len(sites)):
+            msg = setup_one_endmember(phase_dir, sites, assignment,
+                                      args.moment, lattice, log_fh)
+            print(f"  {'-'.join(assignment):12s} {msg}")
+            results.append((assignment, msg))
 
-    # leave the phase dir the way we found it: restore the original
-    # species.in (backup kept) so non-DLM bookkeeping stays coherent
-    backup = phase_dir / "species.in.orig"
-    if backup.is_file():
-        shutil.copy2(backup, phase_dir / "species.in")
-        print(f"\nrestored original species.in "
-              f"(backup kept: {backup.name})")
+        # leave the phase dir the way we found it: restore the original
+        # species.in (backup kept) so non-DLM bookkeeping stays coherent
+        backup = phase_dir / "species.in.orig"
+        if backup.is_file():
+            shutil.copy2(backup, phase_dir / "species.in")
 
-    n_ok = sum(m.startswith(("OK", "skip")) for m in results)
-    print(f"\n{n_ok}/{len(results)} endmembers ready under "
-          f"{phase_dir / 'dlm_endmembers'}")
+        # summary block — the "what has succeeded" record
+        log_fh.write(f"\n{'-' * 66}\nSUMMARY "
+                     f"({datetime.datetime.now():%Y-%m-%d %H:%M:%S})\n")
+        for assignment, msg in results:
+            log_fh.write(f"  {'-'.join(assignment):12s} {msg}\n")
+        n_ok = sum(m.startswith(("OK", "skip")) for _a, m in results)
+        log_fh.write(f"{n_ok}/{len(results)} endmembers DLM-ready "
+                     f"(native names, in place, endmem-marked)\n")
+
+    print(f"\n{n_ok}/{len(results)} endmembers DLM-ready in "
+          f"{phase_dir} (native sqs2tdb names, endmem-marked)")
+    print(f"log: {log_path}")
     print("VASP side: use a DLM vasp.wrap (SUBATOM lines mapping "
           "El+2/El-2 -> El with +/- MAGMOM — vaspwrap.build_vasp_wrap"
           "(dlm=...) writes exactly that).")
