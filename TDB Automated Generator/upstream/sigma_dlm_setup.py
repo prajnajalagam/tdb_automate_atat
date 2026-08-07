@@ -23,13 +23,15 @@ assignments for a binary):
   1. writes <phase>/species.in with the per-sublattice spin pairs;
   2. runs `sqs2tdb -cp -lv=3 -l=SIGMA_D8B` twice (the usual two-pass
      habit; with species.in pre-planted pass 1 already copies);
-  3. the FULLY-mixed lev=3 dir (every sublattice carries both +/-
-     tokens at 0.5) IS the DLM endmember: it is KEPT IN PLACE under
-     its native sqs2tdb name (renaming/moving would break other ATAT
-     tooling) and given an `endmem` marker;
-  4. the other dirs of that round (partial-spin lev<3 mixtures — a
-     sublattice locked to pure El+2 is polarized, not DLM) are
-     removed, but only after a successful round.
+  3. the FULLY-mixed lev=3 dir's str.out (every sublattice both +/-
+     tokens at 0.5) IS the DLM endmember structure: it is harvested
+     INTO the ORIGINAL lev=0 endmember directory
+     (sqs_lev=0_aj_Co=1,g_Cr=1,ii_Cr=1/str.out — these ARE endmembers
+     and the fit reads the lev=0 names; the previous str.out is kept
+     once as str.out.nonmag, and an endmem marker is ensured);
+  4. ALL generated lev=3 scaffolding is then deleted (its names are
+     unreadable to the fit); on a failed round it is kept for
+     inspection instead.
 
 All output (both sqs2tdb passes per endmember + a final SUMMARY of
 what succeeded) goes to ONE file: <phase>/sigma_dlm_setup.log, append
@@ -92,18 +94,24 @@ def is_full_spin_mix(dirname: str, sites, assignment, moment) -> bool:
 
 def setup_one_endmember(phase_dir: Path, sites, assignment,
                         moment: float, lattice: str, log_fh) -> str:
-    """One endmember round. The DLM SQS KEEPS its native sqs2tdb name
-    and stays IN the phase dir (renaming/moving breaks other ATAT
-    tooling — user directive 2026-08-07); it gets an `endmem` marker.
+    """One endmember round (user directive 2026-08-07, corrected):
+    these ARE endmembers, so the result must live under the ORIGINAL
+    lev=0 endmember directory name — that is what sqs2tdb's fitting
+    reads. The lev=3 generation is only scaffolding: its fully-mixed
+    str.out (the spin-SQS) is harvested INTO the lev=0 dir's str.out
+    (original backed up once as str.out.nonmag), and every generated
+    lev=3 dir is removed afterwards.
     """
     work_root = phase_dir.parent
     label = "-".join(assignment)
-    # idempotence: the fully-mixed dir for this assignment already here?
-    existing = [d for d in phase_dir.glob("sqs_lev=*") if d.is_dir()
-                and is_full_spin_mix(d.name, sites, assignment, moment)
-                and (d / "str.out").is_file()]
-    if existing:
-        return f"skip (exists): {existing[0].name}"
+    # the canonical lev=0 endmember dir for this assignment
+    target = phase_dir / ("sqs_lev=0_" + ",".join(
+        f"{s}_{el}=1" for s, el in zip(sites, assignment)))
+    target.mkdir(exist_ok=True)          # normally pre-existing
+    # idempotence: target already carries a spin-decorated str.out?
+    tstr = target / "str.out"
+    if tstr.is_file() and ("+" in tstr.read_text()):
+        return f"skip (already DLM): {target.name}"
 
     # 1. per-sublattice spin-pair species.in for THIS endmember.
     # REAL sqs2tdb format (verified on NAS 2026-08-07): ONE line, the
@@ -136,25 +144,31 @@ def setup_one_endmember(phase_dir: Path, sites, assignment,
         return (f"FAILED: sqs2tdb generated nothing for {label} — see "
                 f"the log (does the sqsdb SIGMA entry provide lev=3?)")
 
-    # 3. the fully-mixed lev=3 dir is the DLM endmember: KEEP IT IN
-    #    PLACE under its native name; just mark it as an endmember.
+    # 3. harvest: the fully-mixed lev=3 dir's str.out IS the DLM
+    #    endmember structure -> copy it into the lev=0 dir (original
+    #    str.out backed up once as str.out.nonmag).
     full = [d for d in new
-            if is_full_spin_mix(d.name, sites, assignment, moment)]
+            if is_full_spin_mix(d.name, sites, assignment, moment)
+            and (d / "str.out").is_file()]
     if full:
-        (full[0] / "endmem").write_text("")
-        keep_msg = f"OK: {full[0].name}"
+        if tstr.is_file() and not (target / "str.out.nonmag").is_file():
+            shutil.copy2(tstr, target / "str.out.nonmag")
+        shutil.copy2(full[0] / "str.out", tstr)
+        if not (target / "endmem").is_file():
+            (target / "endmem").write_text("")
+        keep_msg = (f"OK: {target.name}  (str.out <- lev=3 spin-SQS, "
+                    f"original saved as str.out.nonmag)")
     else:
         keep_msg = (f"FAILED: no fully-mixed lev=3 dir among "
                     f"{[d.name for d in new]} for {label}")
 
-    # 4. partial-spin mixtures from this round are junk (a pure El+m
-    #    sublattice is ferromagnetically locked, not DLM) — but ONLY
-    #    clean up after a SUCCESSFUL round; on failure keep everything
-    #    for inspection (2026-08-07: the cleanup destroyed the very
-    #    dirs needed to diagnose a species.in format mismatch).
+    # 4. ALL generated lev=3 scaffolding is removed after a successful
+    #    harvest (lev=3 names are unreadable to the fit; the result
+    #    lives in the lev=0 dir). On failure keep everything for
+    #    inspection.
     if full:
         for d in new:
-            if d.exists() and d != full[0]:
+            if d.exists():
                 shutil.rmtree(d)
     return keep_msg
 
@@ -230,11 +244,12 @@ def main(argv=None) -> int:
         for assignment, msg in results:
             log_fh.write(f"  {'-'.join(assignment):12s} {msg}\n")
         n_ok = sum(m.startswith(("OK", "skip")) for _a, m in results)
-        log_fh.write(f"{n_ok}/{len(results)} endmembers DLM-ready "
-                     f"(native names, in place, endmem-marked)\n")
+        log_fh.write(f"{n_ok}/{len(results)} endmembers DLM-ready in "
+                     f"their lev=0 dirs (originals: str.out.nonmag)\n")
 
-    print(f"\n{n_ok}/{len(results)} endmembers DLM-ready in "
-          f"{phase_dir} (native sqs2tdb names, endmem-marked)")
+    print(f"\n{n_ok}/{len(results)} endmembers DLM-ready in their "
+          f"ORIGINAL lev=0 dirs under {phase_dir} "
+          f"(pre-DLM str.out kept as str.out.nonmag)")
     print(f"log: {log_path}")
     print("VASP side: use a DLM vasp.wrap (SUBATOM lines mapping "
           "El+2/El-2 -> El with +/- MAGMOM — vaspwrap.build_vasp_wrap"
