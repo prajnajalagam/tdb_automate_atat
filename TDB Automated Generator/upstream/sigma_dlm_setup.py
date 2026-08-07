@@ -156,9 +156,10 @@ def main(argv=None) -> int:
                     "spin-SQS route.")
     ap.add_argument("phase_dir", nargs="?", default=".", type=Path,
                     help="the SIGMA_D8B directory (default: cwd)")
-    ap.add_argument("--elements", default="Co,Cr",
-                    help="binary elements, comma-separated (default "
-                         "Co,Cr)")
+    ap.add_argument("--elements", default=None,
+                    help="elements, comma-separated (default: AUTO — "
+                         "scraped from the existing sqs_lev=0 "
+                         "endmember dir names in the phase dir)")
     ap.add_argument("--moment", type=float, default=2.0,
                     help="spin pseudo-species magnitude (default 2 -> "
                          "El+2/El-2)")
@@ -171,7 +172,25 @@ def main(argv=None) -> int:
     lattice = phase_dir.name                     # e.g. SIGMA_D8B
     if not phase_dir.is_dir():
         raise SystemExit(f"{phase_dir} is not a directory")
-    els = [e.strip() for e in args.elements.split(",")]
+    if args.elements:
+        els = [e.strip() for e in args.elements.split(",")]
+    else:
+        # AUTO-DETECT from the existing endmember dir names, e.g.
+        # sqs_lev=0_aj_Co=1,g_Ni=1,ii_Cr=1 -> {Co, Cr, Ni}. Spin-
+        # tagged tokens (Co+2) from previous DLM rounds are excluded.
+        found = set()
+        el_re = re.compile(r"^[A-Z][a-z]?$")   # a real element symbol
+        for d in phase_dir.glob("sqs_lev=0_*"):
+            for _site, sp, _v in name_tokens(d.name):
+                if el_re.match(sp):            # excludes Co+2 and the
+                    found.add(sp)              # 'lev' of sqs_lev=0
+        if not found:
+            raise SystemExit(
+                "could not auto-detect elements (no plain sqs_lev=0_* "
+                "endmember dirs here) — pass --elements El1,El2[,El3]")
+        els = sorted(found)
+        print(f"[auto] elements from endmember dir names: {els} "
+              f"-> {len(els) ** len(DEFAULT_SITES)} endmembers")
     sites = tuple(s.strip() for s in args.sites.split(","))
 
     # all sublattice->element assignments: 2^3 endmembers for a binary
