@@ -1,0 +1,89 @@
+#!/bin/bash
+#PBS -S /bin/bash
+#PBS -N converge_here
+#PBS -q long
+#PBS -l select=1:ncpus=32:mpiprocs=32:model=mil_ait
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o converge_here_pbs.log
+#PBS -W group_list=a1485
+
+# ============================================================================
+#  Standalone ENCUT/KPPRA convergence tests (converge_here.py) on a list
+#  of SQS dirs, serial. Each dir gets convergence_result.json; a summary
+#  with the elementwise max prints at the end of this job's log.
+#
+#  Restart-safe: resubmitting skips already-computed sweep points.
+#  NOTE (2026-08-11): converge on FM cells, not DLM/spin-tagged ones —
+#  DLM SCF multistability oscillates ~1-3 meV/atom and no sweep rule
+#  can terminate on it (converge.py now aborts such extensions). Basis
+#  quality is spin-configuration independent: reuse the FM values.
+# ============================================================================
+set -uo pipefail
+
+# ───────────────────────── USER CONFIG (edit me) ────────────────────────────
+UPSTREAM="$HOME/tdb_automate_atat/TDB Automated Generator/upstream"
+DIRS=(
+  "/nobackup/pjalagam/CoCrNi_fullpipeline/FM/FCC_A1_small/sqs_lev=2_a_Cr=0.25,a_Ni=0.75"
+  "/nobackup/pjalagam/CoCrNi_fullpipeline/FM/BCC_A2_small/sqs_lev=2_c_Co=0.25,c_Cr=0.75"
+  "/nobackup/pjalagam/CoCrNi_fullpipeline/FM/HCP_A3_small/sqs_lev=2_c_Co=0.75,c_Cr=0.25"
+  "/nobackup/pjalagam/CoCrNi_fullpipeline/FM/SIGMA_D8B/sqs_lev=0_aj_Ni=1,g_Co=1,ii_Co=1"
+)
+# Optional: sweep with YOUR wrap instead of the generated one (only its
+# ENCUT/KPPRA lines are replaced per point; everything else verbatim,
+# no automatic settings injected). Leave empty for the default.
+VASP_WRAP=""
+
+VENV_ACTIVATE="$HOME/venvs/biniter/bin/activate"
+ATAT_BIN="/home7/pjalagam/bin"
+VASP_BIN="/home1/zwu6/vasp/6.6.1/bin_PFE"
+# ───────────────────────── END USER CONFIG ──────────────────────────────────
+
+module purge
+module load python3
+module load gcc
+module load comp-intel/2023.2.1
+module use -a /nasa/modulefiles/testing
+module load mpi-intel/2021.16
+source "$VENV_ACTIVATE"
+export PATH="${ATAT_BIN}:${VASP_BIN}:$PATH"
+export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+ulimit -c 0
+
+EXTRA=()
+[ -n "$VASP_WRAP" ] && EXTRA+=(--vasp-wrap "$VASP_WRAP")
+
+RC_ALL=0
+for d in "${DIRS[@]}"; do
+    echo ""
+    echo "############ $d ############"
+    python3 "$UPSTREAM/converge_here.py" "$d" \
+        --cmd-prefix "mpiexec -n ${NCPUS:-32}" \
+        --env-bin "$ATAT_BIN" "${EXTRA[@]}" || RC_ALL=1
+done
+
+echo ""
+echo "==================== SUMMARY ===================="
+DIRS_JSON=$(printf '%s\n' "${DIRS[@]}")
+python3 - <<EOF
+import json
+from pathlib import Path
+dirs = """${DIRS_JSON}""".strip().splitlines()
+rows = []
+for d in dirs:
+    f = Path(d) / "convergence_result.json"
+    if f.is_file():
+        r = json.loads(f.read_text())
+        rows.append((Path(d).name, r["encut"], r["kppra"],
+                     r["encut_rule"] or "NOT CONV",
+                     r["kppra_rule"] or "NOT CONV"))
+    else:
+        rows.append((Path(d).name, None, None, "MISSING", "MISSING"))
+for name, e, k, er, kr in rows:
+    print(f"  {name:45s} ENCUT={e}  KPPRA={k}  ({er}/{kr})")
+done = [r for r in rows if r[1]]
+if done:
+    print(f"\nGLOBAL (elementwise max over completed): "
+          f"ENCUT={max(r[1] for r in done)}  KPPRA={max(r[2] for r in done)}")
+EOF
+exit $RC_ALL
