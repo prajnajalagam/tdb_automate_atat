@@ -314,8 +314,35 @@ def run_sweep(parameter: str,
     # criterion is met). extend_step > 0 enables it; extend_max is a
     # runaway guard, not a convergence ceiling: hitting it prints a
     # loud warning and falls back to the highest computed setting.
+    def _noise_dominated() -> bool:
+        # 2026-08-11 DLM postmortem: a multistable-SCF sweep OSCILLATES
+        # (sign-alternating steps, magnitudes >> tol, e.g. +-1-3.6
+        # meV/atom on the 16-atom DLM FCC cell) and would extend for a
+        # day toward the guard. Abort when the last NOISE_WINDOW steps
+        # both alternate heavily (>= 4 sign changes) AND their median
+        # magnitude exceeds 5x tol. A genuine slow drift (the FCC-Co
+        # Pulay hump: monotonic, few sign changes) never trips this.
+        NOISE_WINDOW = 8
+        vals = [(s, e) for s, e in zip(settings, e_pa) if e is not None]
+        if len(vals) < NOISE_WINDOW + 1:
+            return False
+        vals.sort(key=lambda p: p[0])
+        steps = [vals[i + 1][1] - vals[i][1]
+                 for i in range(len(vals) - 1)][-NOISE_WINDOW:]
+        flips = sum(1 for a, b in zip(steps, steps[1:]) if a * b < 0)
+        med = sorted(abs(s) for s in steps)[len(steps) // 2]
+        return flips >= 4 and med > 5 * tol_ev
+
     while not converged and extend_step > 0 \
             and settings[-1] + extend_step <= extend_max:
+        if _noise_dominated():
+            print(f"    ABORT {parameter} extension: sweep is NOISE-"
+                  f"DOMINATED (sign-alternating steps with median >> "
+                  f"tol) — for spin-tagged/DLM cells this is magnetic "
+                  f"MULTISTABILITY, not basis error. Converge on the "
+                  f"FM counterpart and REUSE the settings; more points "
+                  f"cannot help.")
+            break
         nxt = settings[-1] + extend_step
         settings.append(nxt)
         e_pa.append(_point(nxt))
