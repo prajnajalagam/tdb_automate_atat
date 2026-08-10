@@ -38,6 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import converge                                          # noqa: E402
 import potcar                                            # noqa: E402
+import vaspwrap                                          # noqa: E402
 from strfile import read_structure, strip_spin_suffix_text  # noqa: E402
 
 DEFAULT_POT_ROOT = Path("/home1/zwu6/vasp/POTPAW_PBE.64")
@@ -92,6 +93,12 @@ def main(argv=None) -> int:
                     help="dir prepended to PATH for ATAT tools")
     ap.add_argument("--timeout", type=int, default=28800,
                     help="per-VASP-point timeout in seconds")
+    ap.add_argument("--vasp-wrap", type=Path, default=None,
+                    help="use THIS vasp.wrap for every sweep point "
+                         "(only its ENCUT/KPPRA lines are replaced "
+                         "per point; spin/mixing/PREC etc. are your "
+                         "file's, and no automatic settings are "
+                         "injected). Default: the generated wrap.")
     args = ap.parse_args(argv)
 
     sqs_dir = args.sqs_dir.resolve()
@@ -100,6 +107,29 @@ def main(argv=None) -> int:
 
     potcar_paths = resolve_potcars(args, sqs_dir)
     enmax = potcar.max_enmax(potcar_paths)
+
+    # Spin handling (2026-08-07 user directive: NO SUBATOM machinery):
+    #  * spin-TAGGED str.out (Co+2/Co-2 from randomspin /
+    #    sigma_dlm_setup): ezvasp derives per-atom MAGMOM from the
+    #    tags; converge.run_static_point auto-detects this and writes
+    #    an ISPIN=2 + magnetic-mixing wrap (no MAGMOM, no SUBATOM).
+    #  * plain str.out with magnetic elements: standard FM spin —
+    #    ISPIN=2 + uniform MAGMOM (same auto-on rule as the pipeline).
+    struct = read_structure(sqs_dir / "str.out")
+    tagged = any(("+" in sp or "-" in sp) for sp in struct.species())
+    els = elements_in(sqs_dir)
+    if args.vasp_wrap:
+        if not args.vasp_wrap.is_file():
+            raise SystemExit(f"--vasp-wrap {args.vasp_wrap}: not found")
+        print(f"[wrap] using {args.vasp_wrap} for every point "
+              f"(ENCUT/KPPRA replaced per point; no auto settings)")
+    elif tagged:
+        print(f"[spin] tagged str.out (DLM) — ezvasp derives MAGMOM; "
+              f"wrap gets ISPIN=2 + magnetic mixing only")
+    elif vaspwrap.wants_spin(els):
+        vaspwrap.DEFAULT_SPIN = True
+        print(f"[spin] magnetic elements {els} — ISPIN=2 + uniform "
+              f"MAGMOM (FM) enabled for the sweep statics")
     print(f"[sweep] dir     : {sqs_dir}")
     print(f"[sweep] max ENMAX {enmax:.1f} eV; tol "
           f"{args.tol_ev * 1e3:.2f} meV/atom; ALGO {args.algo}")
@@ -108,7 +138,7 @@ def main(argv=None) -> int:
         sqs_dir, sqs_dir / "convergence", potcar_paths,
         dlm=None, algo=args.algo, tol_ev=args.tol_ev,
         env_bin=args.env_bin, timeout=args.timeout,
-        cmd_prefix=args.cmd_prefix)
+        cmd_prefix=args.cmd_prefix, wrap_template=args.vasp_wrap)
 
     print(kres.table())
     print(eres.table())
@@ -128,7 +158,8 @@ def main(argv=None) -> int:
            "relax_encut_pulay": relax_encut,
            "kppra_converged": kres.converged, "kppra_rule": kres.rule,
            "encut_converged": eres.converged, "encut_rule": eres.rule,
-           "tol_ev": args.tol_ev, "algo": args.algo}
+           "tol_ev": args.tol_ev, "algo": args.algo,
+           "vasp_wrap": str(args.vasp_wrap) if args.vasp_wrap else "generated"}
     (sqs_dir / "convergence_result.json").write_text(
         json.dumps(out, indent=2))
     print(f"[sweep] written: {sqs_dir / 'convergence_result.json'}")
