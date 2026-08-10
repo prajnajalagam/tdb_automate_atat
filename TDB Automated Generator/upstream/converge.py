@@ -21,6 +21,7 @@ orchestration (run_static_point / run_*_sweep) only runs on a real node.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -182,6 +183,18 @@ def select_converged(settings: List[int],
 # VASP-driving orchestration (real node only)
 # ---------------------------------------------------------------------------
 
+def render_wrap_template(template_text: str, encut: int,
+                         kppra: int) -> str:
+    """A user-supplied vasp.wrap, with ONLY the two swept parameters
+    replaced: any existing ENCUT/KPPRA lines are dropped and the
+    point's values appended. Everything else (spin, mixing, ALGO,
+    PREC, ...) is the user's file, verbatim."""
+    kept = [ln for ln in template_text.splitlines()
+            if not re.match(r"\s*(ENCUT|KPPRA)\s*=", ln, re.IGNORECASE)]
+    kept += [f"ENCUT = {int(encut)}", f"KPPRA = {int(kppra)}"]
+    return "\n".join(kept) + "\n"
+
+
 def run_static_point(src_sqs: Path,
                      dst: Path,
                      encut: int,
@@ -190,7 +203,8 @@ def run_static_point(src_sqs: Path,
                      algo: str = "All",
                      env_bin: Optional[str] = None,
                      timeout: int = 7200,
-                     cmd_prefix: str = "") -> Optional[float]:
+                     cmd_prefix: str = "",
+                     wrap_template: Optional[Path] = None) -> Optional[float]:
     """Set up and run one static VASP point at (encut, kppra); return eV/atom.
 
     Copies str.out (and any POTCAR/species files) from src_sqs into dst, writes
@@ -235,12 +249,20 @@ def run_static_point(src_sqs: Path,
     # the 31-point FCC-Co sweep wandered to 760 eV on noise. Sweep
     # cells are small, so the accurate settings cost little here and
     # do NOT apply to production relax/phonon runs.
-    wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
-                           dlm=dlm, algo=algo, natoms=natoms,
-                           ranks=ranks_from_prefix(cmd_prefix),
-                           spin_tagged=spin_tagged,
-                           extra={"PREC": "Accurate",
-                                  "LREAL": ".FALSE."})
+    if wrap_template is not None:
+        # user-supplied wrap: THEIR settings verbatim, only the two
+        # swept parameters injected per point. Note the sweep-quality
+        # extras (PREC=Accurate/LREAL=.FALSE.) are NOT added — the
+        # template owns every non-swept key.
+        wrap = render_wrap_template(Path(wrap_template).read_text(),
+                                    encut, kppra)
+    else:
+        wrap = build_vasp_wrap("static", encut=encut, kppra=kppra,
+                               dlm=dlm, algo=algo, natoms=natoms,
+                               ranks=ranks_from_prefix(cmd_prefix),
+                               spin_tagged=spin_tagged,
+                               extra={"PREC": "Accurate",
+                                      "LREAL": ".FALSE."})
     (dst / "vasp.wrap").write_text(wrap)
 
     runner.run_logged(["runstruct_vasp"] + runner.split_prefix(cmd_prefix),
@@ -262,7 +284,8 @@ def run_sweep(parameter: str,
               timeout: int = 7200,
               cmd_prefix: str = "",
               extend_step: int = 0,
-              extend_max: int = 0) -> ConvergenceResult:
+              extend_max: int = 0,
+              wrap_template: Optional[Path] = None) -> ConvergenceResult:
     """Run a 1-D convergence sweep over `settings` for ENCUT or KPPRA.
 
     parameter   "ENCUT" or "KPPRA". The other parameter is held at
@@ -284,7 +307,7 @@ def run_sweep(parameter: str,
         return run_static_point(
             src_sqs, dst, encut=encut, kppra=kppra,
             dlm=dlm, algo=algo, env_bin=env_bin, timeout=timeout,
-            cmd_prefix=cmd_prefix)
+            cmd_prefix=cmd_prefix, wrap_template=wrap_template)
 
     # Incremental evaluation with EARLY TERMINATION (2026-07-20): points
     # run one at a time, cheapest first, and the sweep STOPS the moment
@@ -368,7 +391,8 @@ def converge_sqs(src_sqs: Path,
                  tol_ev: float = DEFAULT_TOL_EV,
                  env_bin: Optional[str] = None,
                  timeout: int = 7200,
-                 cmd_prefix: str = ""
+                 cmd_prefix: str = "",
+                 wrap_template: Optional[Path] = None
                  ) -> Tuple[int, int, ConvergenceResult, ConvergenceResult]:
     """Full per-SQS convergence: KPPRA sweep first, then ENCUT sweep.
 
@@ -385,7 +409,8 @@ def converge_sqs(src_sqs: Path,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
         env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix,
         extend_step=potcar.KPPRA_STEP,
-        extend_max=potcar.KPPRA_EXTEND_MAX)
+        extend_max=potcar.KPPRA_EXTEND_MAX,
+        wrap_template=wrap_template)
     chosen_kppra = kppra_res.chosen
 
     # ENCUT sweep has NO convergence ceiling (2026-07-16): the initial
@@ -400,7 +425,8 @@ def converge_sqs(src_sqs: Path,
         dlm=dlm, algo=algo, tol_ev=tol_ev,
         env_bin=env_bin, timeout=timeout, cmd_prefix=cmd_prefix,
         extend_step=egrid_step,
-        extend_max=int(potcar.ENCUT_GUARD_FACTOR * max_e))
+        extend_max=int(potcar.ENCUT_GUARD_FACTOR * max_e),
+        wrap_template=wrap_template)
     chosen_encut = encut_res.chosen
 
     return chosen_encut, chosen_kppra, kppra_res, encut_res
