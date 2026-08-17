@@ -151,6 +151,70 @@ def parse_poscar_species(path):
     return None
 
 
+def parse_outcar_magnetization(path, tail_bytes=20_000_000):
+    """Per-ion moments from the OUTCAR `magnetization (x[/y/z])` tables.
+
+    Used for COLLINEAR runs (ISPIN=2), where OSZICAR carries only the scalar
+    `mag=` total. Requires LORBIT>=10. Returns a list of 3-vectors: collinear
+    moments come back as (0, 0, m) so downstream metrics are shared with the
+    noncollinear path. Reads only the tail, so OUTCAR size is irrelevant.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    text = read_tail(path, tail_bytes)
+    comps = {}
+    for comp in ("x", "y", "z"):
+        starts = [m.end() for m in
+                  re.finditer(r"magnetization \(%s\)" % comp, text)]
+        if not starts:
+            continue
+        rows = []
+        for line in text[starts[-1]:].split("\n"):
+            tok = line.split()
+            if len(tok) >= 3 and tok[0].isdigit():
+                try:
+                    rows.append(float(tok[-1]))     # `tot` column
+                except ValueError:
+                    break
+            elif rows:
+                break
+        if rows:
+            comps[comp] = rows
+    if "x" not in comps:
+        return None
+    n = len(comps["x"])
+    if "y" in comps and "z" in comps:                # noncollinear tables
+        return [[comps["x"][i], comps["y"][i], comps["z"][i]]
+                for i in range(n)]
+    return [[0.0, 0.0, comps["x"][i]] for i in range(n)]   # collinear
+
+
+def beta_star(species, mags):
+    """Xiong et al., CALPHAD 39 (2012) 11-20, Eqs. (9)-(10).
+
+        S_max = R ln(beta* + 1) = R sum_i x_i ln(beta_i + 1)
+        beta* = prod_i (beta_i + 1)^x_i - 1
+
+    beta_i is the LOCAL moment of component i (mean |m| over that species'
+    sites), x_i its mole fraction. Note a species whose moment collapses
+    contributes ln(1) = 0 to the entropy, which is the correct limit --
+    cf. the paper's remark that bcc Cr is assigned beta = 0.008 muB in
+    CALPHAD databases precisely because its moment is ill-defined.
+    """
+    if not species:
+        return None, None, None
+    n = len(species)
+    betas, ln_sum = {}, 0.0
+    for el in sorted(set(species)):
+        sel = [m for m, s in zip(mags, species) if s == el]
+        b = sum(sel) / len(sel)                      # mean local moment
+        betas[el] = b
+        ln_sum += (len(sel) / n) * math.log(b + 1.0)
+    bstar = math.exp(ln_sum) - 1.0
+    s_max = 8.314462618 * math.log(bstar + 1.0)      # J/(mol*K)
+    return bstar, s_max, betas
+
+
 def parse_vector_tag(value, natoms):
     try:
         nums = [float(x) for x in value.split()]
@@ -201,23 +265,53 @@ def survey(d, args):
 
     incar = parse_incar(os.path.join(d, "INCAR"))
     ncl = incar.get("LNONCOLLINEAR", "").upper().startswith(".T")
+    ispin = int(float(incar.get("ISPIN", 1) or 1))
     r["constrained"] = incar.get("I_CONSTRAINED_M", "-")
     r["lambda"] = incar.get("LAMBDA", "-")
-    if not ncl:
-        r["status"] = "NOT_NCL"
-        r["note"] = "no LNONCOLLINEAR in INCAR"
-        return r
+    r["mode"] = "NCL" if ncl else ("COLLINEAR" if ispin == 2 else "NM")
 
-    head, tail = read_head(osz), read_tail(osz)
-    first = parse_ion_block(head, "first")
-    last = parse_ion_block(tail, "last")
-    if not last:
-        r["status"] = "RUNNING"
-        r["note"] = "no complete constraint block in OSZICAR"
+    tail = read_tail(osz)
+    m_init = None
+    if ncl:
+        # constrained-noncollinear: per-site vectors live in the OSZICAR
+        head = read_head(osz)
+        first = parse_ion_block(head, "first")
+        last = parse_ion_block(tail, "last")
+        if not last:
+            r["status"] = "RUNNING"
+            r["note"] = "no complete constraint block in OSZICAR"
+            return r
+        m_final = [v[1] for v in last]
+        if first:
+            m_init = [v[1] for v in first]
+    elif ispin == 2:
+        # collinear (FM or DLM): per-site moments only exist in the OUTCAR
+        m_final = parse_outcar_magnetization(os.path.join(d, "OUTCAR"),
+                                             args.outcar_tail)
+        if not m_final:
+            r["status"] = "RUNNING"
+            r["note"] = ("no magnetization table in OUTCAR "
+                         "(still running, or LORBIT<10)")
+            return r
+        init = parse_vector_tag("", 0)
+        try:                                    # scalar MAGMOM -> z-vectors
+            vals = []
+            for tokn in incar.get("MAGMOM", "").split():
+                if "*" in tokn:
+                    c, v = tokn.split("*")
+                    vals.extend([float(v)] * int(c))
+                else:
+                    vals.append(float(tokn))
+            if len(vals) == len(m_final):
+                m_init = [[0.0, 0.0, v] for v in vals]
+        except ValueError:
+            pass
+    else:
+        r["status"] = "NOT_NCL"
+        r["note"] = "neither LNONCOLLINEAR nor ISPIN=2 (nonmagnetic run)"
         return r
 
     species = parse_poscar_species(os.path.join(d, "POSCAR"))
-    m_final = [v[1] for v in last]
     r["natoms"] = len(m_final)
     if species and len(species) == len(m_final):
         r["composition"] = ",".join(
@@ -231,26 +325,52 @@ def survey(d, args):
     r["mean_final"] = stats_f["mean"]
     r["net_per_atom"] = stats_f["net_per_atom"]
     r["per_species_rms"] = stats_f.get("per_species_rms", {})
-    if first:
-        stats_i, _ = moment_stats([v[1] for v in first], species)
+    if m_init:
+        stats_i, _ = moment_stats(m_init, species)
         r["rms_init"] = stats_i["rms"]
     else:
         r["rms_init"] = float("nan")
 
     r["n_collapsed"] = sum(1 for m in mags_f if m < args.collapse_mag)
 
+    # --- Xiong effective magnetic moment (CALPHAD 39 (2012) 11-20, Eq. 10)
+    bstar, s_max, betas = beta_star(species, mags_f)
+    r["beta_star"] = bstar if bstar is not None else float("nan")
+    r["S_max_J_molK"] = s_max if s_max is not None else float("nan")
+    r["beta_per_species"] = betas or {}
+
     # --- direction fidelity, surviving sites only
-    mc = parse_vector_tag(incar.get("M_CONSTR", ""), len(m_final))
+    #
+    # IMPORTANT: with I_CONSTRAINED_M = 1 the penalty is
+    #     E_p = lambda * sum_I |M_I - e_I (M_I . e_I)|^2
+    # i.e. it penalises only the component PERPENDICULAR to the target, and
+    # is therefore invariant under M_I -> -M_I. Mode 1 constrains the AXIS,
+    # not the sense. A moment may flip 180 deg at zero penalty cost, which
+    # silently destroys the vanishing pair correlations the SQS was built to
+    # enforce. So report the two separately:
+    #   axis_dev  = max angle folded into [0,90] -> is the constraint holding?
+    #   n_flipped = sites past 90 deg          -> how many flipped sense?
+    mc = parse_vector_tag(incar.get("M_CONSTR", ""), len(m_final)) if ncl \
+        else None
     if mc:
-        angs = [a for a in (angle_deg(m, t) for m, t in zip(m_final, mc))
-                if a is not None]
-        angs = [a for a, m in zip(angs, mags_f) if m >= args.collapse_mag]
-        r["max_angle_deg"] = max(angs) if angs else float("nan")
+        pairs = [(angle_deg(m, t), mag) for m, t, mag
+                 in zip(m_final, mc, mags_f)]
+        live = [(a, mag) for a, mag in pairs
+                if a is not None and mag >= args.collapse_mag]
+        if live:
+            r["max_angle_deg"] = max(a for a, _ in live)
+            r["axis_dev_deg"] = max(min(a, 180.0 - a) for a, _ in live)
+            r["n_flipped"] = sum(1 for a, _ in live if a > 90.0)
+            r["n_live"] = len(live)
+        else:
+            r["max_angle_deg"] = r["axis_dev_deg"] = float("nan")
+            r["n_flipped"], r["n_live"] = 0, 0
     else:
-        r["max_angle_deg"] = float("nan")
+        r["max_angle_deg"] = r["axis_dev_deg"] = float("nan")
+        r["n_flipped"], r["n_live"] = 0, 0
 
     # --- energies / penalty
-    eps = EP_RE.findall(tail) or EP_RE.findall(head)
+    eps = EP_RE.findall(tail) if ncl else []
     r["E_p"] = float(eps[-1].replace("D", "E")) if eps else float("nan")
     fl = FLINE_RE.findall(tail.replace("\r", ""))
     if not fl:
@@ -293,6 +413,13 @@ def survey(d, args):
     r["ep_corrected"] = os.path.exists(os.path.join(d, "energy.raw"))
     r["waiting"] = os.path.exists(os.path.join(d, "wait"))
 
+    # --- has the cell drifted toward magnetic ORDER?
+    # For a properly disordered cell of N sites the net moment is a random
+    # walk: |sum m| / N ~ RMS|m| / sqrt(N). Substantially more than that means
+    # the spins have aligned and this is no longer a paramagnetic sample.
+    expect = r["rms_final"] / math.sqrt(r["natoms"]) if r["natoms"] else 0.0
+    r["net_ratio"] = (r["net_per_atom"] / expect) if expect > 1e-9 else 0.0
+
     # --- verdict
     frac_dead = r["n_collapsed"] / r["natoms"]
     if not finished:
@@ -305,11 +432,20 @@ def survey(d, args):
     elif frac_dead >= args.collapse_frac:
         r["status"] = "COLLAPSED"
         r["note"] = f"{r['n_collapsed']}/{r['natoms']} sites < {args.collapse_mag} muB"
+    elif r["net_ratio"] > args.order_ratio:
+        r["status"] = "ORDERED"
+        r["note"] = (f"net moment {r['net_ratio']:.1f}x the random-walk value"
+                     f", {r['n_flipped']}/{r['n_live']} spins flipped sense"
+                     " -- not a paramagnetic state")
     elif frac_dead > 0:
         r["status"] = "WEAK"
         r["note"] = f"{r['n_collapsed']}/{r['natoms']} sites collapsed"
     else:
         r["status"] = "OK"
+    if r["n_flipped"] and r["status"] in ("OK", "WEAK"):
+        r["note"] = (r["note"] + "; " if r["note"] else "") + \
+            f"{r['n_flipped']}/{r['n_live']} spins flipped sense (mode-1 " \
+            f"penalty is axis-only)"
     return r
 
 
@@ -337,6 +473,13 @@ def main():
     ap.add_argument("--collapse-frac", type=float, default=0.5,
                     help="fraction of dead sites at which the run is called "
                          "COLLAPSED (default: 0.5)")
+    ap.add_argument("--outcar-tail", type=int, default=20_000_000,
+                    help="bytes of OUTCAR tail scanned for the collinear "
+                         "magnetization table (default: 20MB)")
+    ap.add_argument("--order-ratio", type=float, default=2.5,
+                    help="call the cell ORDERED when its net moment exceeds "
+                         "this multiple of the random-walk expectation "
+                         "RMS|m|/sqrt(N) (default: 2.5)")
     ap.add_argument("--csv", default=None, help="also write a CSV here")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="per-species detail for each run")
@@ -352,7 +495,8 @@ def main():
     base = os.path.abspath(args.root)
 
     hdr = (f"{'STATUS':<12}{'RMS|m| init->final':<22}{'dead':>6}"
-           f"{'E_p(meV)':>10}{'ang':>6}{'ionic':>7}  run")
+           f"{'E_p(meV)':>10}{'axis':>6}{'flip':>7}{'net/rw':>8}"
+           f"{'beta*':>7}{'ionic':>7}  run")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -365,14 +509,20 @@ def main():
         rms = f"{r.get('rms_init', float('nan')):.3f} -> {r.get('rms_final', float('nan')):.3f}"
         dead = f"{r.get('n_collapsed','?')}/{r.get('natoms','?')}"
         ep = r.get("E_p", float("nan")) * 1000
-        ang = r.get("max_angle_deg", float("nan"))
+        axis = r.get("axis_dev_deg", float("nan"))
+        flip = f"{r.get('n_flipped', 0)}/{r.get('n_live', 0)}"
         print(f"{r['status']:<12}{rms:<22}{dead:>6}{ep:>10.3f}"
-              f"{ang:>6.1f}{r.get('n_ionic',0):>7}  {name}")
+              f"{axis:>6.1f}{flip:>7}{r.get('net_ratio', 0.0):>8.1f}"
+              f"{r.get('beta_star', float('nan')):>7.3f}"
+              f"{r.get('n_ionic',0):>7}  {name}")
         if args.verbose:
-            per = r.get("per_species_rms", {})
+            per = r.get("beta_per_species", {})
             if per:
-                print("            per-species RMS|m|: " +
-                      "  ".join(f"{k}={v:.3f}" for k, v in per.items()))
+                print("            beta_i (mean local |m|, muB): " +
+                      "  ".join(f"{k}={v:.3f}" for k, v in per.items())
+                      + f"   -> beta*={r.get('beta_star', float('nan')):.4f}"
+                      f", S_max={r.get('S_max_J_molK', float('nan')):.3f}"
+                      " J/(mol K)")
             print(f"            F = {r.get('F_eV', float('nan')):.5f} eV"
                   f"   net|m|/atom = {r.get('net_per_atom', float('nan')):.4f}"
                   f"   energy={'y' if r.get('has_energy') else 'n'}"
@@ -391,9 +541,11 @@ def main():
         print(f"usable for the moment/energy harvest: {len(ok)}")
 
     if args.csv:
-        cols = ["dir", "status", "note", "composition", "natoms", "rms_init",
-                "rms_final", "mean_final", "net_per_atom", "n_collapsed",
-                "max_angle_deg", "E_p", "F_eV", "n_ionic", "n_elec_last",
+        cols = ["dir", "status", "mode", "note", "composition", "natoms",
+                "beta_star", "S_max_J_molK", "rms_init",
+                "rms_final", "mean_final", "net_per_atom", "net_ratio",
+                "n_collapsed", "max_angle_deg", "axis_dev_deg", "n_flipped",
+                "n_live", "E_p", "F_eV", "n_ionic", "n_elec_last",
                 "finished", "ionic_ok", "has_energy", "ep_corrected",
                 "waiting", "constrained", "lambda"]
         with open(args.csv, "w", newline="") as fh:

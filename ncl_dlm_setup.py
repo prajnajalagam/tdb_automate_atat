@@ -20,14 +20,30 @@ What `setup` does:
                      <e_i . e_j> ~ 0  (noncollinear DLM),
       --mode rotate  keep the collinear +/- partition but rotate the common
                      axis randomly (sanity check: same physics as collinear),
-  * rewrites INCAR: 3N-component MAGMOM, M_CONSTR (unit vectors),
-    LNONCOLLINEAR/GGA_COMPAT/ISYM/I_CONSTRAINED_M=1/LAMBDA/RWIGS and
+  * rewrites INCAR: 3N-component MAGMOM, M_CONSTR, plus
+    LNONCOLLINEAR/GGA_COMPAT/ISYM/I_CONSTRAINED_M/LAMBDA/RWIGS/LWAVE and
     conservative mixing tags; removes ISPIN/NBANDS. Original INCAR is
     backed up to INCAR.collinear.
 
+Choosing the constraint mode (--constraint, default 2)
+------------------------------------------------------
+  1 = axis only. The penalty is lambda*sum_I |M_I - e_I(M_I.e_I)|^2, which
+      touches ONLY the component perpendicular to the target: magnitudes are
+      free AND a 180 deg flip costs nothing. Under an ISIF=3 relaxation this
+      is a one-way ratchet -- a moment shrinks, the cell contracts toward the
+      NM volume, and the moment can never recover -- so the "relaxed PM"
+      structure is really a relaxed NM one. Empirically this collapsed or
+      reordered every Co-Cr-Ni cell tested.
+  2 = full vector. Magnitudes are held through the relaxation, so ISIF=3
+      relaxes on the paramagnetic surface, which is what the thermodynamics
+      needs. Pair it with --from-collinear so the imposed magnitudes are the
+      self-consistent DLM moments rather than invented ones, and verify
+      E_p -> 0 afterwards (a residual penalty contaminates forces/stress).
+
 What `fixenergy` does:
-  * reads the last penalty energy E_p from OUTCAR and rewrites the ATAT
-    `energy` file as (E - E_p), backing up the raw value to energy.raw.
+  * reads the last penalty energy E_p from OSZICAR (VASP writes it there,
+    not to OUTCAR) and rewrites the ATAT `energy` file as (E - E_p),
+    backing up the raw value to energy.raw.
 
 Only numpy is required. Deterministic: the RNG is seeded from the POSCAR
 contents (override with --seed).
@@ -60,6 +76,7 @@ ADD_IF_MISSING = {    # only added when the tag is not already in INCAR
     "AMIX_MAG": "0.8",
     "BMIX_MAG": "0.0001",
     "LMAXMIX": "4",
+    "LWAVE": ".TRUE.",      # needed to restart and to ramp LAMBDA in stages
 }
 REMOVE_TAGS = {"ISPIN", "NBANDS", "MAGMOM", "M_CONSTR"}
 
@@ -91,6 +108,89 @@ def read_poscar(path):
     else:
         pos = pos * scale
     return cell, pos, counts
+
+
+def collinear_moments(path, tail_bytes=20_000_000):
+    """Per-ion |m| from the last `magnetization (x)` table of a COLLINEAR
+    OUTCAR (needs LORBIT>=10).
+
+    Used by --from-collinear: the self-consistent DLM local moments are the
+    defensible source for the constrained magnitudes, since that run relaxed
+    freely in its own magnetic state. Reads only the tail of the file.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - tail_bytes))
+        text = fh.read().decode("utf-8", "replace")
+    starts = [m.end() for m in re.finditer(r"magnetization \(x\)", text)]
+    if not starts:
+        return None
+    rows = []
+    for line in text[starts[-1]:].split("\n"):
+        tok = line.split()
+        if len(tok) >= 3 and tok[0].isdigit():
+            try:
+                rows.append(abs(float(tok[-1])))     # |tot| column
+            except ValueError:
+                break
+        elif rows:
+            break
+    return rows or None
+
+
+def seed_geometry(poscar_p, src_dir):
+    """Overwrite POSCAR's cell+coordinates from a converged CONTCAR, keeping
+    ezvasp's trailing per-site labels (`Cr_pv+1.5`) intact.
+
+    Starting the ISIF=3 relaxation from the collinear-DLM relaxed geometry
+    means the cell begins at (near) the paramagnetic volume instead of
+    travelling there from the ideal lattice -- which is the leg of the
+    relaxation where moments were being squeezed out. Saves ionic steps too.
+    """
+    src = src_dir if src_dir.endswith("CONTCAR") else os.path.join(src_dir,
+                                                                  "CONTCAR")
+    if not os.path.exists(src):
+        sys.exit(f"ERROR: {src} not found (--seed-geometry).")
+    with open(poscar_p) as fh:
+        dst_lines = fh.read().split("\n")
+    with open(src) as fh:
+        src_lines = fh.read().split("\n")
+
+    def layout(lines):
+        i = 5
+        tok = lines[i].split()
+        if tok and not tok[0].lstrip("+-").isdigit():
+            i += 1
+            tok = lines[i].split()
+        counts = [int(t) for t in tok]
+        j = i + 1
+        if lines[j].strip().lower().startswith("s"):
+            j += 1
+        return counts, j            # j = the Direct/Cartesian line
+
+    dc, dj = layout(dst_lines)
+    sc, sj = layout(src_lines)
+    if sum(dc) != sum(sc):
+        sys.exit(f"ERROR: {src} has {sum(sc)} atoms, POSCAR has {sum(dc)}.")
+    n = sum(dc)
+    labels = []
+    for k in range(n):
+        parts = dst_lines[dj + 1 + k].split()
+        labels.append(parts[3] if len(parts) > 3 else "")
+
+    out = list(dst_lines)
+    out[1] = src_lines[1]                       # scale
+    for k in range(3):                          # lattice vectors
+        out[2 + k] = src_lines[2 + k]
+    out[dj] = src_lines[sj]                     # Direct / Cartesian
+    for k in range(n):
+        coord = " ".join(src_lines[sj + 1 + k].split()[:3])
+        out[dj + 1 + k] = f"{coord}    {labels[k]}".rstrip()
+    with open(poscar_p, "w") as fh:
+        fh.write("\n".join(out))
+    print(f"  geometry seeded from {src} (labels preserved)")
 
 
 def read_potcar_species(path):
@@ -208,6 +308,8 @@ def cmd_setup(args):
     if "LNONCOLLINEAR" in tags and not args.force:
         sys.exit("INCAR already noncollinear; use --force to redo.")
 
+    if args.seed_geometry:
+        seed_geometry(poscar_p, args.seed_geometry)
     cell, pos, counts = read_poscar(poscar_p)
     n = len(pos)
     species = read_potcar_species(potcar_p)
@@ -230,6 +332,33 @@ def cmd_setup(args):
                  "MAGATOM?) and no --mag given.")
     mags = np.array([abs(float(mag_over.get(s, m_col[i])))
                      for i, s in enumerate(site_species)])
+
+    # --- magnitudes from a converged COLLINEAR DLM run (preferred for
+    #     I_CONSTRAINED_M=2: don't invent moments, inherit self-consistent
+    #     ones from a run that relaxed freely in its own magnetic state)
+    if args.from_collinear:
+        src = args.from_collinear
+        if os.path.isdir(src):
+            src = os.path.join(src, "OUTCAR")
+        ref = collinear_moments(src)
+        if not ref:
+            sys.exit(f"ERROR: no magnetization table in {src} "
+                     f"(LORBIT>=10 required).")
+        if len(ref) != n:
+            sys.exit(f"ERROR: {src} has {len(ref)} ions, this cell has {n}.")
+        per_el = {}
+        for s, m in zip(site_species, ref):
+            per_el.setdefault(s, []).append(m)
+        per_el = {k: sum(v) / len(v) for k, v in per_el.items()}
+        mags = np.array([per_el[s] for s in site_species])
+        print("  magnitudes from collinear DLM: " +
+              "  ".join(f"{k}={v:.3f}" for k, v in sorted(per_el.items())))
+        for k, v in sorted(per_el.items()):
+            if v < 0.05:
+                print(f"  NOTE: {k} local moment is {v:.3f} muB in the "
+                      f"collinear run -- constraining it is not meaningful; "
+                      f"it will be left unconstrained.")
+
     signs = np.sign(m_col) if "MAGMOM" in tags else np.ones(n)
     active = mags > 1e-6
 
@@ -249,7 +378,9 @@ def cmd_setup(args):
     print(f"  orientations: mode={args.mode}, {corr_note}")
 
     magmom = np.round(e * mags[:, None], 6)
-    mconstr = np.round(e, 6)
+    # mode 1 constrains only the axis -> unit vectors suffice.
+    # mode 2 constrains the FULL vector -> M_CONSTR must carry the magnitude.
+    mconstr = np.round(magmom if args.constraint == 2 else e, 6)
 
     # ---- rebuild INCAR
     shutil.copy2(incar_p, incar_p + ".collinear")
@@ -265,6 +396,7 @@ def cmd_setup(args):
         rwigs.append(f"{float(r):.3f}")
 
     new = dict(NCL_TAGS)
+    new["I_CONSTRAINED_M"] = str(args.constraint)
     new["LAMBDA"] = str(args.lam)
     new["RWIGS"] = " ".join(rwigs)
     new["MAGMOM"] = fmt(magmom)
@@ -299,23 +431,35 @@ def cmd_setup(args):
 
 def cmd_fixenergy(args):
     d = args.dir
-    outcar_p = os.path.join(d, "OUTCAR")
     energy_p = os.path.join(d, "energy")
     if not os.path.exists(energy_p):
         sys.exit("ERROR: no `energy` file -- run `runstruct_vasp -ex` first.")
+    if os.path.exists(energy_p + ".raw"):
+        print("  energy.raw already exists -- this directory was already "
+              "penalty-corrected; refusing to subtract E_p twice.")
+        return
     if args.ep is not None:
         ep = args.ep
     else:
+        # NOTE: VASP writes the constrained-moment penalty to OSZICAR
+        # (`E_p = ... lambda = ...`), NOT to OUTCAR. Check OSZICAR first.
         ep, hits = None, []
-        with open(outcar_p, errors="ignore") as fh:
-            for line in fh:
-                m = re.search(r"E_?p\s*=\s*([-+0-9.EeDd]+)", line)
-                if m:
-                    hits.append(float(m.group(1).replace("D", "E")))
+        for fname in ("OSZICAR", "OUTCAR"):
+            p = os.path.join(d, fname)
+            if not os.path.exists(p):
+                continue
+            with open(p, errors="ignore") as fh:
+                for line in fh:
+                    m = re.search(r"E_?p\s*=\s*([-+0-9.EeDd]+)", line)
+                    if m:
+                        hits.append(float(m.group(1).replace("D", "E")))
+            if hits:
+                print(f"  E_p read from {fname}")
+                break
         if hits:
             ep = hits[-1]
     if ep is None:
-        print("  WARNING: no E_p found in OUTCAR (unconstrained run?); "
+        print("  WARNING: no E_p found in OSZICAR/OUTCAR (unconstrained run?); "
               "`energy` left unchanged.")
         return
     with open(energy_p) as fh:
@@ -341,6 +485,19 @@ def main():
     s.add_argument("--dir", default=".", help="structure directory")
     s.add_argument("--mode", choices=["random", "rotate"], default="random")
     s.add_argument("--lambda", dest="lam", type=float, default=10)
+    s.add_argument("--constraint", type=int, choices=[1, 2], default=2,
+                   help="I_CONSTRAINED_M: 1 = axis only (magnitudes free, "
+                        "and a 180 deg flip costs nothing -- moments collapse "
+                        "or reorder during an ISIF=3 relaxation); "
+                        "2 = full vector, magnitudes held (default)")
+    s.add_argument("--seed-geometry", default="",
+                   help="directory (or CONTCAR) of the converged collinear "
+                        "DLM run; its relaxed cell/coordinates replace the "
+                        "ideal-lattice POSCAR, keeping ezvasp site labels")
+    s.add_argument("--from-collinear", default="",
+                   help="directory or OUTCAR of the converged COLLINEAR DLM "
+                        "run at this composition; per-species mean local "
+                        "moments are used as the constrained magnitudes")
     s.add_argument("--rwigs", default="", help="override, e.g. Co=1.30,Cr=1.32")
     s.add_argument("--mag", default="", help="seed moment override per "
                                              "species, e.g. Ni=0.6")
