@@ -41,6 +41,7 @@ STATUS values
 
 import argparse
 import csv
+import gzip
 import math
 import os
 import re
@@ -56,16 +57,55 @@ FLINE_RE = re.compile(r"^\s*(\d+)\s+F=\s*([-+0-9.EeDd]+)")
 
 
 # --------------------------------------------------------------- io helpers
+def _open(path):
+    return gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
+
+
 def read_head(path, n=HEAD_BYTES):
-    with open(path, "rb") as fh:
+    with _open(path) as fh:
         return fh.read(n).decode("utf-8", "replace")
 
 
 def read_tail(path, n=TAIL_BYTES):
-    size = os.path.getsize(path)
-    with open(path, "rb") as fh:
-        fh.seek(max(0, size - n))
-        return fh.read().decode("utf-8", "replace")
+    """Last n bytes. Plain files seek; .gz is streamed with a rolling buffer
+    (gzip cannot seek from the end), so size stays bounded either way."""
+    if not path.endswith(".gz"):
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - n))
+            return fh.read().decode("utf-8", "replace")
+    buf = b""
+    with gzip.open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            buf = (buf + chunk)[-n:]
+    return buf.decode("utf-8", "replace")
+
+
+# robustrelax_vasp promotes finished results to the SQS directory with
+# .static / .relax suffixes (and gzips OUTCARs); the bare names belong to a
+# plain runstruct_vasp run. Prefer the STATIC result -- it is the final
+# single-point on the relaxed geometry, which is the magnetic state we want.
+CANDIDATES = {
+    "OSZICAR": ["OSZICAR.static", "OSZICAR", "OSZICAR.relax"],
+    "OUTCAR": ["OUTCAR.static.gz", "OUTCAR.static", "OUTCAR.gz", "OUTCAR",
+               "OUTCAR.relax.gz", "OUTCAR.relax"],
+    "INCAR": ["INCAR.static", "INCAR", "INCAR.relax"],
+    "LABELS": ["POSCAR.relax", "POSCAR"],          # ezvasp per-site labels
+    "GEOM": ["CONTCAR.static", "POSCAR.static", "CONTCAR", "POSCAR"],
+    "ENERGY": ["energy", "energy_end"],
+}
+
+
+def resolve(d, kind):
+    """First existing candidate file of this kind in directory d."""
+    for name in CANDIDATES[kind]:
+        p = os.path.join(d, name)
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    return None
 
 
 # ------------------------------------------------------------- file parsing
@@ -189,6 +229,92 @@ def parse_outcar_magnetization(path, tail_bytes=20_000_000):
     return [[0.0, 0.0, comps["x"][i]] for i in range(n)]   # collinear
 
 
+def parse_poscar_geometry(path):
+    """(cell 3x3, fractional coords) -- stdlib only, no numpy."""
+    if not os.path.exists(path):
+        return None, None
+    with open(path, errors="replace") as fh:
+        lines = fh.read().split("\n")
+    try:
+        scale = float(lines[1].split()[0])
+        cell = [[float(x) * scale for x in lines[2 + k].split()[:3]]
+                for k in range(3)]
+        i = 5
+        tok = lines[i].split()
+        if tok and not tok[0].lstrip("+-").isdigit():
+            i += 1
+            tok = lines[i].split()
+        counts = [int(t) for t in tok]
+        n = sum(counts)
+        i += 1
+        if lines[i].strip().lower().startswith("s"):
+            i += 1
+        cartesian = lines[i].strip().lower().startswith(("c", "k"))
+        i += 1
+        pos = [[float(x) for x in lines[i + j].split()[:3]] for j in range(n)]
+    except (ValueError, IndexError):
+        return None, None
+    if cartesian:                       # convert to fractional
+        det = (cell[0][0] * (cell[1][1] * cell[2][2] - cell[1][2] * cell[2][1])
+               - cell[0][1] * (cell[1][0] * cell[2][2] - cell[1][2] * cell[2][0])
+               + cell[0][2] * (cell[1][0] * cell[2][1] - cell[1][1] * cell[2][0]))
+        if abs(det) < 1e-12:
+            return None, None
+        inv = [[0.0] * 3 for _ in range(3)]
+        for a in range(3):
+            for b in range(3):
+                m = [[cell[r][c] for c in range(3) if c != a]
+                     for r in range(3) if r != b]
+                cof = m[0][0] * m[1][1] - m[0][1] * m[1][0]
+                inv[a][b] = ((-1) ** (a + b)) * cof / det
+        pos = [[sum(p[k] * inv[k][c] for k in range(3)) for c in range(3)]
+               for p in pos]
+    return cell, pos
+
+
+def nn_spin_correlation(cell, frac, vectors, mags, min_mag, tol=1.05):
+    """Mean <e_i . e_j> over the nearest-neighbour shell, live sites only.
+
+    THE defining test of a paramagnetic sample: an ideal DLM cell has
+    vanishing pair correlations. Near 0 = disordered; toward +1 = the spins
+    aligned (ferromagnetic drift); negative = antiferromagnetic order. A
+    small NET moment is necessary but NOT sufficient -- sense flips can
+    scramble the designed SQS arrangement while leaving the net near zero.
+    """
+    if not cell or not frac or len(frac) != len(vectors):
+        return None, 0
+    n = len(frac)
+    dists, disp = {}, {}
+    for a in range(n):
+        for b in range(a + 1, n):
+            best = None
+            for sx in (-1, 0, 1):
+                for sy in (-1, 0, 1):
+                    for sz in (-1, 0, 1):
+                        df = [frac[b][k] - frac[a][k] + (sx, sy, sz)[k]
+                              for k in range(3)]
+                        cart = [sum(df[k] * cell[k][c] for k in range(3))
+                                for c in range(3)]
+                        d = math.sqrt(sum(x * x for x in cart))
+                        if best is None or d < best:
+                            best = d
+            dists[(a, b)] = best
+    if not dists:
+        return None, 0
+    dmin = min(dists.values())
+    dots = []
+    for (a, b), d in dists.items():
+        if d > dmin * tol:
+            continue
+        if mags[a] < min_mag or mags[b] < min_mag:
+            continue
+        dots.append(sum(vectors[a][k] * vectors[b][k] for k in range(3))
+                    / (mags[a] * mags[b]))
+    if not dots:
+        return None, 0
+    return sum(dots) / len(dots), len(dots)
+
+
 def beta_star(species, mags):
     """Xiong et al., CALPHAD 39 (2012) 11-20, Eqs. (9)-(10).
 
@@ -259,11 +385,12 @@ def moment_stats(vectors, species):
 # ------------------------------------------------------------ one directory
 def survey(d, args):
     r = {"dir": d, "status": "NO_DATA", "note": ""}
-    osz = os.path.join(d, "OSZICAR")
-    if not os.path.exists(osz) or os.path.getsize(osz) == 0:
+    osz = resolve(d, "OSZICAR")
+    if not osz:
         return r
+    r["src"] = os.path.basename(osz)
 
-    incar = parse_incar(os.path.join(d, "INCAR"))
+    incar = parse_incar(resolve(d, "INCAR") or os.path.join(d, "INCAR"))
     ncl = incar.get("LNONCOLLINEAR", "").upper().startswith(".T")
     ispin = int(float(incar.get("ISPIN", 1) or 1))
     r["constrained"] = incar.get("I_CONSTRAINED_M", "-")
@@ -286,8 +413,9 @@ def survey(d, args):
             m_init = [v[1] for v in first]
     elif ispin == 2:
         # collinear (FM or DLM): per-site moments only exist in the OUTCAR
-        m_final = parse_outcar_magnetization(os.path.join(d, "OUTCAR"),
-                                             args.outcar_tail)
+        out_p = resolve(d, "OUTCAR")
+        m_final = parse_outcar_magnetization(out_p, args.outcar_tail) \
+            if out_p else None
         if not m_final:
             r["status"] = "RUNNING"
             r["note"] = ("no magnetization table in OUTCAR "
@@ -311,7 +439,8 @@ def survey(d, args):
         r["note"] = "neither LNONCOLLINEAR nor ISPIN=2 (nonmagnetic run)"
         return r
 
-    species = parse_poscar_species(os.path.join(d, "POSCAR"))
+    species = parse_poscar_species(resolve(d, "LABELS") or
+                                   os.path.join(d, "POSCAR"))
     r["natoms"] = len(m_final)
     if species and len(species) == len(m_final):
         r["composition"] = ",".join(
@@ -332,6 +461,14 @@ def survey(d, args):
         r["rms_init"] = float("nan")
 
     r["n_collapsed"] = sum(1 for m in mags_f if m < args.collapse_mag)
+
+    # --- pair correlation of the CONVERGED spin arrangement
+    cell, frac = parse_poscar_geometry(resolve(d, "GEOM") or
+                                       os.path.join(d, "POSCAR"))
+    corr, npair = nn_spin_correlation(cell, frac, m_final, mags_f,
+                                      args.collapse_mag)
+    r["nn_corr"] = corr if corr is not None else float("nan")
+    r["nn_pairs"] = npair
 
     # --- Xiong effective magnetic moment (CALPHAD 39 (2012) 11-20, Eq. 10)
     bstar, s_max, betas = beta_star(species, mags_f)
@@ -398,9 +535,9 @@ def survey(d, args):
         r["n_elec_last"], elec_ok = 0, False
 
     # --- VASP termination + ionic accuracy (small tail read of OUTCAR)
-    out_p = os.path.join(d, "OUTCAR")
+    out_p = resolve(d, "OUTCAR")
     finished = ionic_ok = False
-    if os.path.exists(out_p) and os.path.getsize(out_p) > 0:
+    if out_p:
         otail = read_tail(out_p, OUTCAR_TAIL)
         finished = "General timing and accounting" in otail
         ionic_ok = "reached required accuracy" in otail
@@ -409,7 +546,7 @@ def survey(d, args):
     r["ionic_ok"] = ionic_ok or nsw <= 1
 
     # --- ATAT bookkeeping
-    r["has_energy"] = os.path.exists(os.path.join(d, "energy"))
+    r["has_energy"] = resolve(d, "ENERGY") is not None
     r["ep_corrected"] = os.path.exists(os.path.join(d, "energy.raw"))
     r["waiting"] = os.path.exists(os.path.join(d, "wait"))
 
@@ -432,6 +569,11 @@ def survey(d, args):
     elif frac_dead >= args.collapse_frac:
         r["status"] = "COLLAPSED"
         r["note"] = f"{r['n_collapsed']}/{r['natoms']} sites < {args.collapse_mag} muB"
+    elif (r["nn_corr"] == r["nn_corr"]                     # not NaN
+          and abs(r["nn_corr"]) > args.max_corr):
+        r["status"] = "ORDERED"
+        r["note"] = (f"NN spin correlation <e.e> = {r['nn_corr']:+.3f} over "
+                     f"{r['nn_pairs']} pairs -- not a paramagnetic sample")
     elif r["net_ratio"] > args.order_ratio:
         r["status"] = "ORDERED"
         r["note"] = (f"net moment {r['net_ratio']:.1f}x the random-walk value"
@@ -450,12 +592,28 @@ def survey(d, args):
 
 
 # ------------------------------------------------------------------- driver
-def find_dirs(root):
+SKIP_PARTS = ("convergence", "encut_sweep", "kppra_sweep", "sweep")
+
+
+def find_dirs(root, skip_sweeps=True):
+    """Directories holding a finished (or running) VASP result.
+
+    robustrelax_vasp leaves numbered stage dirs (00/, 01/) beneath each SQS
+    directory and promotes the finished OSZICAR/OUTCAR to the parent, so a
+    parent that has results prunes its children -- otherwise every SQS is
+    counted several times and the half-finished stage wins.
+    """
     hits = []
     for dp, dn, fn in os.walk(root):
-        if "OSZICAR" in fn or "INCAR" in fn:
+        parts = [q.lower() for q in dp.split(os.sep)]
+        if skip_sweeps and any(any(sk in q for sk in SKIP_PARTS)
+                               for q in parts):
+            dn[:] = []
+            continue
+        if any(f in fn for f in
+               ("OSZICAR.static", "OSZICAR", "OSZICAR.relax")):
             hits.append(dp)
-            dn[:] = []                       # do not recurse into a run dir
+            dn[:] = []                       # promoted result wins
     return sorted(hits)
 
 
@@ -476,6 +634,13 @@ def main():
     ap.add_argument("--outcar-tail", type=int, default=20_000_000,
                     help="bytes of OUTCAR tail scanned for the collinear "
                          "magnetization table (default: 20MB)")
+    ap.add_argument("--include-sweeps", action="store_true",
+                    help="also survey convergence/encut_sweep directories "
+                         "(skipped by default)")
+    ap.add_argument("--max-corr", type=float, default=0.15,
+                    help="|<e_i.e_j>| over the NN shell above which the cell "
+                         "is called ORDERED rather than paramagnetic "
+                         "(default: 0.15)")
     ap.add_argument("--order-ratio", type=float, default=2.5,
                     help="call the cell ORDERED when its net moment exceeds "
                          "this multiple of the random-walk expectation "
@@ -487,7 +652,8 @@ def main():
                     help="print only rows with this status (e.g. OK)")
     args = ap.parse_args()
 
-    dirs = [args.dir] if args.dir else find_dirs(args.root)
+    dirs = [args.dir] if args.dir else find_dirs(args.root,
+                                                 not args.include_sweeps)
     if not dirs:
         sys.exit(f"no run directories found under {args.root}")
 
@@ -496,7 +662,7 @@ def main():
 
     hdr = (f"{'STATUS':<12}{'RMS|m| init->final':<22}{'dead':>6}"
            f"{'E_p(meV)':>10}{'axis':>6}{'flip':>7}{'net/rw':>8}"
-           f"{'beta*':>7}{'ionic':>7}  run")
+           f"{'<e.e>':>8}{'beta*':>7}{'ionic':>7}  run")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -513,6 +679,7 @@ def main():
         flip = f"{r.get('n_flipped', 0)}/{r.get('n_live', 0)}"
         print(f"{r['status']:<12}{rms:<22}{dead:>6}{ep:>10.3f}"
               f"{axis:>6.1f}{flip:>7}{r.get('net_ratio', 0.0):>8.1f}"
+              f"{r.get('nn_corr', float('nan')):>+8.3f}"
               f"{r.get('beta_star', float('nan')):>7.3f}"
               f"{r.get('n_ionic',0):>7}  {name}")
         if args.verbose:
@@ -541,9 +708,10 @@ def main():
         print(f"usable for the moment/energy harvest: {len(ok)}")
 
     if args.csv:
-        cols = ["dir", "status", "mode", "note", "composition", "natoms",
+        cols = ["dir", "status", "mode", "src", "note", "composition", "natoms",
                 "beta_star", "S_max_J_molK", "rms_init",
                 "rms_final", "mean_final", "net_per_atom", "net_ratio",
+                "nn_corr", "nn_pairs",
                 "n_collapsed", "max_angle_deg", "axis_dev_deg", "n_flipped",
                 "n_live", "E_p", "F_eV", "n_ionic", "n_elec_last",
                 "finished", "ionic_ok", "has_energy", "ep_corrected",
