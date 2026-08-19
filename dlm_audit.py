@@ -409,6 +409,18 @@ def looks_like_run(d, files, subdirs):
             pass
     return False
 
+COLS = ["dir", "role", "parent_run", "lattice", "lattice_full", "system",
+        "composition", "x_Co", "x_Cr", "x_Ni", "n_Co", "n_Cr", "n_Ni",
+        "n_species", "dlm_ok", "reason", "lorbit_ok", "incar_src", "has_wrap",
+        "geom_src", "moment_src", "magmom_old", "elements", "natoms", "n_up",
+        "n_dn", "poscar_signed", "magmom_absmax", "magmom_absmean", "rms_init",
+        "rms_final", "mean_final", "n_collapsed", "n_live", "net_per_atom",
+        "beta_star", "beta_per_species", "eff_magmom_file", "corr_init",
+        "corr_init_pairs", "corr_final", "corr_final_pairs", "null_mean",
+        "null_std", "corr_z", "nn_pairs_all", "d_nn", "energy"] + \
+       [t.lower() for t in SETTING_TAGS]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -426,6 +438,9 @@ def main():
     ap.add_argument("--no-corr", action="store_true",
                     help="skip pair correlations (much faster)")
     ap.add_argument("--include-sweeps", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="append to an existing CSV, skipping directories "
+                         "already recorded in it")
     ap.add_argument("--max-depth", type=int, default=0,
                     help="stop descending below this depth (0 = no limit)")
     ap.add_argument("--max-atoms", type=int, default=80,
@@ -479,22 +494,52 @@ def main():
           + (f"; {nvol} vol_* dirs skipped)" if nvol else ")"))
 
     keep = [e.strip() for e in args.elements.split(",") if e.strip()]
-    rows = []
-    for i, d in enumerate(runs, 1):
-        if i % 25 == 0: print(f"  ...{i}/{len(runs)}", file=sys.stderr)
-        try: r = audit_dir(d, args)
-        except Exception as e:
-            r = {"dir": d, "dlm_ok": 0, "reason": f"audit error {type(e).__name__}: {e}"}
-        if not r: continue
-        r["role"] = role_of(d)
-        r["parent_run"] = (os.path.dirname(os.path.abspath(d))
-                           if r["role"] == "stage" else "")
-        if keep and r.get("elements"):
-            if not set(r["elements"].split(",")).issubset(set(keep)):
-                continue
-        rows.append(r)
 
-    cols = ["dir", "role", "parent_run", "lattice", "lattice_full", "system", "composition",
+    # --- resume: skip directories already present in the CSV
+    done = set()
+    if args.resume and os.path.exists(args.csv):
+        try:
+            with open(args.csv, newline="") as fh:
+                for row in csv.DictReader(fh):
+                    if row.get("dir"): done.add(row["dir"])
+            print(f"  resuming: {len(done)} directories already in {args.csv}")
+        except Exception:
+            done = set()
+
+    rows = []
+    fh_out = open(args.csv, "a" if done else "w", newline="")
+    writer = None
+    try:
+        for i, d in enumerate(runs, 1):
+            if i % 25 == 0:
+                print(f"  ...{i}/{len(runs)}", file=sys.stderr)
+            if d in done:
+                continue
+            try: r = audit_dir(d, args)
+            except Exception as e:
+                r = {"dir": d, "dlm_ok": 0,
+                     "reason": f"audit error {type(e).__name__}: {e}"}
+            if not r: continue
+            r["role"] = role_of(d)
+            r["parent_run"] = (os.path.dirname(os.path.abspath(d))
+                               if r["role"] == "stage" else "")
+            if keep and r.get("elements"):
+                if not set(r["elements"].split(",")).issubset(set(keep)):
+                    continue
+            rows.append(r)
+            # write through immediately: a killed run loses nothing, and
+            # --resume picks up exactly where it stopped
+            if writer is None:
+                writer = csv.DictWriter(fh_out, fieldnames=COLS,
+                                        extrasaction="ignore")
+                if not done: writer.writeheader()
+            writer.writerow(r)
+            if i % 20 == 0: fh_out.flush()
+    finally:
+        fh_out.flush(); fh_out.close()
+
+    cols = COLS
+    _unused = ["dir", "role", "parent_run", "lattice", "lattice_full", "system", "composition",
             "x_Co", "x_Cr", "x_Ni", "n_Co", "n_Cr", "n_Ni", "n_species",
             "dlm_ok", "reason", "lorbit_ok", "incar_src", "has_wrap",
             "geom_src", "moment_src", "magmom_old", "elements",
@@ -505,10 +550,6 @@ def main():
             "corr_init_pairs", "corr_final", "corr_final_pairs", "null_mean",
             "null_std", "corr_z", "nn_pairs_all", "d_nn", "energy"] + \
            [t.lower() for t in SETTING_TAGS]
-    with open(args.csv, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        for r in rows: w.writerow(r)
 
     primary = [r for r in rows if r.get("role") != "stage"]
     dlm = [r for r in primary if r["dlm_ok"]]
