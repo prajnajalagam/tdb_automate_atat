@@ -386,9 +386,28 @@ def audit_dir(d, args):
         except (ValueError, IndexError): pass
     return r
 
-def looks_like_run(d, files):
-    return any(f.startswith(("INCAR", "OSZICAR", "OUTCAR")) for f in files) \
-        or "vasp.wrap" in files
+VASP_FILES = ("INCAR", "OSZICAR", "OUTCAR")
+
+
+def looks_like_run(d, files, subdirs):
+    """A genuine calculation directory.
+
+    A stray vasp.wrap is NOT enough -- template wrap files sit at the top of
+    a project tree, and treating the root as a run stops the walk dead. Need
+    real VASP files here, or in a numbered stage dir belonging to this one
+    (robustrelax puts them there before promoting them to the parent).
+    """
+    if any(f.startswith(VASP_FILES) for f in files):
+        return True
+    for sd in subdirs:
+        if not re.fullmatch(r"\d+", sd):
+            continue
+        try:
+            if any(f.startswith(VASP_FILES) for f in os.listdir(os.path.join(d, sd))):
+                return True
+        except OSError:
+            pass
+    return False
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
@@ -407,23 +426,57 @@ def main():
     ap.add_argument("--no-corr", action="store_true",
                     help="skip pair correlations (much faster)")
     ap.add_argument("--include-sweeps", action="store_true")
+    ap.add_argument("--max-depth", type=int, default=0,
+                    help="stop descending below this depth (0 = no limit)")
     ap.add_argument("--max-atoms", type=int, default=80,
                     help="skip correlation maths on cells larger than this")
     args = ap.parse_args()
 
-    SKIP = ("sweep", "convergence", ".git", "__pycache__")
+    # vol_<n> are ATAT volume-scan directories (E-V curves / phonons), not
+    # production DLM runs -- excluded from the audit entirely, per instruction.
+    VOL_RE = re.compile(r"^vol_\d+$", re.IGNORECASE)
+    SKIP = ("sweep", "convergence", ".git", "__pycache__", "/venv", "site-packages")
     runs = []
-    for dp, dn, fn in os.walk(args.root):
-        low = dp.lower()
+    def _werr(e):
+        print(f"  (skipping {getattr(e, 'filename', '?')}: {e.strerror})",
+              file=sys.stderr)
+    nseen = 0
+    nvol = 0
+    for dp, dn, fn in os.walk(args.root, onerror=_werr, followlinks=False):
+        nseen += 1
+        if nseen % 2000 == 0:
+            print(f"  ...scanned {nseen} dirs, {len(runs)} runs so far",
+                  file=sys.stderr)
+        low = dp.lower().replace(os.sep, "/")
         if not args.include_sweeps and any(s in low for s in SKIP):
             dn[:] = []; continue
-        if looks_like_run(dp, fn):
+        if args.max_depth and dp[len(args.root):].count(os.sep) > args.max_depth:
+            dn[:] = []; continue
+        if any(VOL_RE.match(q) for q in dp.split(os.sep)):
+            nvol += 1
+            dn[:] = []                 # volume scans: skip the whole subtree
+            continue
+        dn[:] = [x for x in dn if not VOL_RE.match(x)]
+        if looks_like_run(dp, fn, dn):
             runs.append(dp)
-            # the SQS directory OWNS its numbered stage dirs -- audit_dir reads
-            # them for the final geometry, so do not report them separately
-            dn[:] = []
+            # NOTHING is pruned here. Numbered stage dirs are still walked and
+            # still recorded; they are simply LABELLED role="stage" below and
+            # left out of the summary statistics, so the audit hides nothing
+            # while the per-SQS counts stay honest.
     runs = sorted(set(runs))
-    print(f"found {len(runs)} candidate run directories under {args.root}")
+    runset = set(os.path.abspath(x) for x in runs)
+
+    def role_of(d):
+        ad = os.path.abspath(d)
+        if re.fullmatch(r"\d+", os.path.basename(ad)) and \
+           os.path.dirname(ad) in runset:
+            return "stage"
+        return "sqs"
+
+    print(f"found {len(runs)} candidate run directories under {args.root}"
+          f"   ({sum(1 for d in runs if role_of(d)=='sqs')} SQS, "
+          f"{sum(1 for d in runs if role_of(d)=='stage')} stage subdirs"
+          + (f"; {nvol} vol_* dirs skipped)" if nvol else ")"))
 
     keep = [e.strip() for e in args.elements.split(",") if e.strip()]
     rows = []
@@ -433,12 +486,15 @@ def main():
         except Exception as e:
             r = {"dir": d, "dlm_ok": 0, "reason": f"audit error {type(e).__name__}: {e}"}
         if not r: continue
+        r["role"] = role_of(d)
+        r["parent_run"] = (os.path.dirname(os.path.abspath(d))
+                           if r["role"] == "stage" else "")
         if keep and r.get("elements"):
             if not set(r["elements"].split(",")).issubset(set(keep)):
                 continue
         rows.append(r)
 
-    cols = ["dir", "lattice", "lattice_full", "system", "composition",
+    cols = ["dir", "role", "parent_run", "lattice", "lattice_full", "system", "composition",
             "x_Co", "x_Cr", "x_Ni", "n_Co", "n_Cr", "n_Ni", "n_species",
             "dlm_ok", "reason", "lorbit_ok", "incar_src", "has_wrap",
             "geom_src", "moment_src", "magmom_old", "elements",
@@ -454,13 +510,17 @@ def main():
         w.writeheader()
         for r in rows: w.writerow(r)
 
-    dlm = [r for r in rows if r["dlm_ok"]]
-    print(f"\n{len(rows)} runs kept ({args.elements or 'all elements'})")
+    primary = [r for r in rows if r.get("role") != "stage"]
+    dlm = [r for r in primary if r["dlm_ok"]]
+    print(f"\n{len(rows)} rows written "
+          f"({len(primary)} SQS + {len(rows)-len(primary)} stage) "
+          f"({args.elements or 'all elements'})")
+    print("  summary below counts SQS rows only; stage rows are in the CSV")
     print(f"  qualify as DLM (balanced mixed-sign MAGMOM): {len(dlm)}")
     print(f"  LORBIT>=10 (per-ion moments available):      "
-          f"{sum(1 for r in rows if r['lorbit_ok'])}")
+          f"{sum(1 for r in primary if r['lorbit_ok'])}")
     why = {}
-    for r in rows:
+    for r in primary:
         if not r["dlm_ok"]:
             why[r["reason"] or "?"] = why.get(r["reason"] or "?", 0) + 1
     if why:
