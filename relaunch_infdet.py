@@ -46,11 +46,11 @@ CURV_RE = re.compile(r"mincurv=\s*([-0-9.eE]+)\s+energy=\s*([-0-9.eE]+)"
                      r"\s+grad_norm=\s*([-0-9.eE]+)")
 
 ACTIONS = {                       # class -> (action, walltime, queue)
-    "CROSSED_NEAR_CONV": ("continue", "120:00:00", "long"),
-    "CROSSED_SLOW":      ("continue", "120:00:00", "long"),
-    "STUCK_NEGATIVE":    ("symbreak", "120:00:00", "long"),
-    "POSITIVE_ONLY":     ("gate",     "120:00:00", "long"),
-    "BARELY_STARTED":    ("gate",     "120:00:00", "long"),
+    "CROSSED_NEAR_CONV": ("continue", "08:00:00", "normal"),
+    "CROSSED_SLOW":      ("continue", "24:00:00", "long"),
+    "STUCK_NEGATIVE":    ("symbreak", "24:00:00", "long"),
+    "POSITIVE_ONLY":     ("gate",     "08:00:00", "normal"),
+    "BARELY_STARTED":    ("gate",     "24:00:00", "long"),
 }
 
 PBS = """#!/bin/bash
@@ -93,8 +93,20 @@ fi
 exit $RC
 """
 
+SEMA = """# --- clear semaphores left by the killed job -------------------------------
+# infdet writes `busy` to tell the external program "run VASP now" and waits
+# for it to be deleted. A job killed at walltime leaves it behind; if it is
+# still there on restart the loop can sit waiting for a step that already
+# died. `wait`/`running` are ATAT's queueing markers and are equally stale.
+# Nothing here holds results -- only these zero-byte flags are removed.
+for f in 01/busy busy running; do
+    [ -f "$f" ] && rm -f "$f" && echo ">> cleared stale semaphore $f"
+done
+
+"""
+
 PREP = {
-    "continue": "# continue the previous ID run in place; nothing is deleted\n",
+    "continue": "# continue the previous ID run in place; nothing else is touched\n",
     "gate":     "# -c 0.05 gates ID on the relaxation magnitude (default 0 = always on)\n",
     "symbreak": """# break symmetry so the soft mode has a direction to relax along.
 # cellcvrt jitters atoms and cell while PRESERVING the SQS/DLM decoration.
@@ -150,18 +162,50 @@ def classify(pts):
 
 
 def finished(d):
-    """Completed: an `energy` file and no live semaphore."""
+    """Inflection detection completed.
+
+    robustrelax step 7: "Report the energy found in 6 in the file energy and
+    the corresponding geometry in str_relax.out" -- so a populated `energy`
+    IS the completion marker for the whole -id workflow. infdet's own
+    `01/cenergy.out` / `01/cstr_relax.out` are accepted as well, for a run
+    that finished the inner stage but died before robustrelax wrote out.
+    """
     e = os.path.join(d, "energy")
-    return (os.path.exists(e) and os.path.getsize(e) > 0
-            and not running(d))
+    if os.path.exists(e) and os.path.getsize(e) > 0:
+        return True
+    for f in ("cenergy.out", "cstr_relax.out"):
+        p = os.path.join(d, "01", f)
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return True
+    return False
 
 
-def running(d):
-    """`busy` is written by infdet while an external VASP step is in flight,
-    so a directory holding one may still be attached to a live job -- never
-    resubmit on top of it. A stale `wait` alone does NOT mean running: a
-    killed job leaves it behind, which is exactly the case we relaunch."""
-    return os.path.exists(os.path.join(d, "01", "busy"))
+def newest_mtime(d):
+    """Most recent modification anywhere in the run dir or its 01/ stage."""
+    newest = 0.0
+    for base in (d, os.path.join(d, "01")):
+        try:
+            for f in os.listdir(base):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(base, f)))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return newest
+
+
+def running(d, stale_minutes):
+    """Is a job actually alive here?
+
+    `busy` is NOT the test -- infdet writes it before handing off to VASP, and
+    a job killed at walltime leaves it behind, which is the single most common
+    state among the runs we want to relaunch. A live run touches OSZICAR /
+    vasp.out constantly, so recent file activity is the honest signal.
+    """
+    import time
+    age_min = (time.time() - newest_mtime(d)) / 60.0
+    return age_min < stale_minutes
 
 
 def short_name(d, i):
@@ -192,6 +236,12 @@ def main():
     ap.add_argument("--include-lev4", action="store_true",
                     help="include sqs_lev=4 cells (excluded by default -- their "
                          "random spin configurations are not trusted)")
+    ap.add_argument("--stale-minutes", type=float, default=60.0,
+                    help="a run whose newest file is older than this is "
+                         "treated as dead and eligible for relaunch "
+                         "(default: 60)")
+    ap.add_argument("--force", action="store_true",
+                    help="relaunch even if files were touched recently")
     ap.add_argument("--jobfile", default="relaunch_id.pbs")
     args = ap.parse_args()
 
@@ -205,10 +255,13 @@ def main():
         found += 1
         if not args.include_lev4 and re.search(r"lev=4", dp):
             skipped.append((dp, "lev=4 excluded")); continue
-        if running(dp):
-            skipped.append((dp, "01/busy present - job may be live")); continue
         if finished(dp):
-            skipped.append((dp, "already has energy")); continue
+            skipped.append((dp, "ID complete (energy written)")); continue
+        if running(dp, args.stale_minutes) and not args.force:
+            import time
+            age = (time.time() - newest_mtime(dp)) / 60.0
+            skipped.append((dp, f"active {age:.0f} min ago - may be live"))
+            continue
         pts = parse_log(log)
         if not pts:
             skipped.append((dp, "no mincurv lines in infdet.log")); continue
@@ -238,15 +291,19 @@ def main():
             logname=f"relaunch_id_{i:02d}.log", rundir=os.path.abspath(d),
             atat_bin=args.atat_bin, vasp_bin=args.vasp_bin, cls=cls, why=why,
             c0=c[0], cN=c[-1], gN=g[-1], n=len(c),
-            prep=PREP[act].format(ja=args.ja, jc=args.jc),
+            prep=SEMA + PREP[act].format(ja=args.ja, jc=args.jc),
             flags=FLAGS[act].format(c=args.cutoff, ja=args.ja, jc=args.jc))
         path = os.path.join(d, args.jobfile)
         with open(path, "w") as fh:
             fh.write(body)
         os.chmod(path, 0o755)
         rel = os.path.relpath(d, args.root)
-        flag = "  (stale `wait` present)" if os.path.exists(
-            os.path.join(d, "wait")) else ""
+        marks = []
+        if os.path.exists(os.path.join(d, "01", "busy")):
+            marks.append("stale busy")
+        if os.path.exists(os.path.join(d, "wait")):
+            marks.append("stale wait")
+        flag = ("  [" + ", ".join(marks) + "]") if marks else ""
         print(f"  [{i:02d}] {cls:<18s} {act:<9s} {queue:<7s} {wall}  {rel}{flag}")
         if args.submit:
             r = subprocess.run(["qsub", args.jobfile], cwd=d,
