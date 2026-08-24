@@ -46,11 +46,11 @@ CURV_RE = re.compile(r"mincurv=\s*([-0-9.eE]+)\s+energy=\s*([-0-9.eE]+)"
                      r"\s+grad_norm=\s*([-0-9.eE]+)")
 
 ACTIONS = {                       # class -> (action, walltime, queue)
-    "CROSSED_NEAR_CONV": ("continue", "08:00:00", "normal"),
-    "CROSSED_SLOW":      ("continue", "24:00:00", "long"),
-    "STUCK_NEGATIVE":    ("symbreak", "24:00:00", "long"),
-    "POSITIVE_ONLY":     ("gate",     "08:00:00", "normal"),
-    "BARELY_STARTED":    ("gate",     "24:00:00", "long"),
+    "CROSSED_NEAR_CONV": ("continue", "120:00:00", "long"),
+    "CROSSED_SLOW":      ("continue", "120:00:00", "long"),
+    "STUCK_NEGATIVE":    ("symbreak", "120:00:00", "long"),
+    "POSITIVE_ONLY":     ("gate",     "120:00:00", "long"),
+    "BARELY_STARTED":    ("gate",     "120:00:00", "long"),
 }
 
 PBS = """#!/bin/bash
