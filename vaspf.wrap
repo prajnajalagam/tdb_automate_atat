@@ -1,0 +1,72 @@
+[INCAR]
+# ============================================================================
+#  Force calculations for the fitfc perturbations.
+#  Used as:  runstruct_vasp -lu -w vaspf.wrap   (ATAT phonon workflow step ii)
+#
+#  These are STATIC single points on deliberately displaced atoms. Only the
+#  accuracy of the FORCES matters. Matches the production DLM settings
+#  (ENCUT/KPPRA/smearing/magnetism) so the vibrational entropy pairs with
+#  energies computed in the same state.
+# ============================================================================
+PREC = Accurate
+ENCUT = 460
+KPPRA = 5000
+USEPOT = PAWPBE
+
+# --- static: the displacement IS the measurement -------------------------
+# IBRION=-1 with NSW=0 means no ionic motion. If anything ever reintroduced
+# NSW>0 the displacement would relax away and the force constants would come
+# back as zero, with no error raised.
+IBRION = -1
+NSW = 0
+ISIF = 2
+
+# --- force accuracy -------------------------------------------------------
+# -dr=0.04 (the value recommended in the ATAT CALPHAD paper) gives small
+# forces, so EDIFF is tightened from the 1E-5 used for relaxations. NELMIN
+# keeps the SCF depth consistent across perturbations rather than varying
+# with how easily each one converges.
+EDIFF = 1E-6
+ADDGRID = .TRUE.
+NELM = 200
+NELMIN = 6
+
+# LREAL: ATAT's own sample vaspf.wrap uses AUTO, for speed on large
+# supercells. Standard phonon practice is .FALSE., since real-space
+# projection introduces systematic force errors that do not average out.
+# At -dr=0.04 this is a genuine cost/accuracy trade -- BENCHMARK IT: run two
+# or three perturbations both ways and compare force.out before committing
+# to 400+ calculations. Declared ONCE here, whichever you choose.
+LREAL = AUTO
+
+# --- restart: leave ISTART/ICHARG unset ----------------------------------
+# `runstruct_vasp -lu` looks one directory up for a WAVECAR. With both unset,
+# VASP picks ISTART=1 when it finds one and ISTART=0 when it does not --
+# correct either way. Setting ICHARG=1 explicitly would hard-fail whenever
+# no CHGCAR is present.
+LWAVE = .FALSE.
+LCHARG = .FALSE.
+
+# --- same electronic/magnetic state as the energies ----------------------
+ISMEAR = 1
+SIGMA = 0.08
+ISPIN = 2
+NUPDOWN = 0
+LORBIT = 11
+AMIX = 0.02
+BMIX = 0.0001
+AMIX_MAG = 0.4
+BMIX_MAG = 0.0001
+
+ALGO = All
+NCORE = 8
+KPAR = 4
+
+# --- DLM decoration: expand the +/- labels carried in str_ideal.out -------
+MAGATOM =
+SUBATOM = s/Co+2/Co+1.8/g
+SUBATOM = s/Co-2/Co-1.8/g
+SUBATOM = s/Ni+2/Ni+0.7/g
+SUBATOM = s/Ni-2/Ni-0.7/g
+SUBATOM = s/Cr+2/Cr_pv+1.5/g
+SUBATOM = s/Cr-2/Cr_pv-1.5/g
