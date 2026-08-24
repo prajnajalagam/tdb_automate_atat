@@ -63,28 +63,58 @@ DIRS=(
 {dirlist}
 )
 
-ok=0; fail=0; skip=0
+# ============================================================================
+#  Time-aware loop. A 160-atom spin-polarised static point with AMIX=0.02 is
+#  ~1-2 h on {ncpus} cores, and that estimate is soft -- so rather than trust it,
+#  measure the first calculation and stop starting new ones when there is not
+#  enough walltime left for another. Unfinished directories keep their `wait`
+#  marker, so resubmitting this identical file continues where it stopped.
+# ============================================================================
+WALL_SECONDS={wall_seconds}
+RESERVE=1800                    # leave this much slack before the hard limit
+START=$SECONDS
+
+ok=0; fail=0; skip=0; left=0
 for d in "${{DIRS[@]}}"; do
+    elapsed=$(( SECONDS - START ))
+    remain=$(( WALL_SECONDS - RESERVE - elapsed ))
+    if [ $ok -gt 0 ]; then
+        avg=$(( elapsed / ok ))
+        need=$(( avg + avg / 5 ))          # average + 20% margin
+        if [ $remain -lt $need ]; then
+            echo ">> stopping early: ${{remain}}s left, need ~${{need}}s for one more"
+            left=$(( left + 1 )); continue
+        fi
+    elif [ $remain -lt 3600 ]; then
+        echo ">> stopping early: under an hour left and no timing sample yet"
+        left=$(( left + 1 )); continue
+    fi
+
     cd "$d" || {{ echo "SKIP (no dir): $d"; skip=$((skip+1)); continue; }}
     if [ -s energy ]; then
         echo "SKIP (done): $d"; skip=$((skip+1)); continue
     fi
-    echo "=== $d"
-    # -lu looks one directory up for a WAVECAR to start from
+    echo "=== [$(( ok + fail + 1 ))/${{#DIRS[@]}}] $d   (${{elapsed}}s elapsed)"
+    t0=$SECONDS
     runstruct_vasp -lu -w "$WRAP" mpiexec -n {ncpus} > runstruct.out 2>&1
     rc=$?
+    dt=$(( SECONDS - t0 ))
     if [ $rc -eq 0 ] && [ -s energy ] && [ -s force.out ]; then
         rm -f wait
-        echo "    ok   energy=$(cat energy)"
+        echo "    ok   ${{dt}}s   energy=$(cat energy)"
         ok=$((ok+1))
     else
-        echo "    FAIL rc=$rc  (wait kept; see $d/runstruct.out)"
+        echo "    FAIL rc=$rc after ${{dt}}s  (wait kept; see $d/runstruct.out)"
         fail=$((fail+1))
     fi
 done
 
 echo
-echo ">> done: $ok ok, $fail failed, $skip skipped"
+echo ">> $ok done, $fail failed, $skip already complete, $left not attempted"
+if [ $left -gt 0 ]; then
+    echo ">> RESUBMIT THIS SAME FILE to continue: qsub $(basename "$0")"
+    exit 3
+fi
 [ $fail -eq 0 ] || exit 2
 """
 
@@ -131,15 +161,18 @@ def main():
     ap.add_argument("--submit", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--group", choices=["endmember", "chunk", "perturbation"],
-                    default="endmember")
-    ap.add_argument("--chunk-size", type=int, default=12)
+                    default="chunk")
+    ap.add_argument("--chunk-size", type=int, default=0,
+                    help="perturbations per job; 0 = fit them to the walltime")
     ap.add_argument("--ncpus", type=int, default=128)
     ap.add_argument("--model", default="mil_ait")
     ap.add_argument("--group-list", default="a1485")
     ap.add_argument("--queue", default="long")
-    ap.add_argument("--walltime", default="")
-    ap.add_argument("--minutes-per-pert", type=float, default=15.0,
-                    help="estimate used to size walltime (default: 15)")
+    ap.add_argument("--walltime", default="24:00:00")
+    ap.add_argument("--minutes-per-pert", type=float, default=90.0,
+                    help="per-perturbation estimate used to size chunks and "
+                         "walltime. 90 min suits a ~160-atom spin-polarised "
+                         "static point on 128 cores; measure yours and adjust")
     ap.add_argument("--atat-bin", default="/home7/pjalagam/bin")
     ap.add_argument("--vasp-bin", default="/home1/zwu6/vasp/6.6.1/bin_PFE")
     ap.add_argument("--wrap", default="",
@@ -161,8 +194,11 @@ def main():
         if args.group == "endmember":
             batches = [pert]
         elif args.group == "chunk":
-            batches = [pert[i:i + args.chunk_size]
-                       for i in range(0, len(pert), args.chunk_size)]
+            hh, mm, _ss = (int(x) for x in args.walltime.split(":"))
+            usable = hh * 60 + mm - 30                 # minus the reserve
+            n = max(1, int(usable // args.minutes_per_pert))
+            n = args.chunk_size or n
+            batches = [pert[i:i + n] for i in range(0, len(pert), n)]
         else:
             batches = [[p] for p in pert]
         for k, b in enumerate(batches, 1):
@@ -178,15 +214,13 @@ def main():
 
     for em, k, batch in jobs:
         wrap = args.wrap or os.path.abspath(os.path.join(em, "vaspf.wrap"))
-        if args.walltime:
-            wall = args.walltime
-        else:
-            mins = max(60, int(len(batch) * args.minutes_per_pert * 1.5))
-            wall = f"{min(mins // 60, 120):02d}:{mins % 60:02d}:00"
+        wall = args.walltime
         name = short(em, k)
         path = os.path.join(em, f"phonon_{k:02d}.pbs")
         with open(path, "w") as fh:
+            hh, mm, ss = (int(x) for x in wall.split(":"))
             fh.write(PBS.format(
+                wall_seconds=hh * 3600 + mm * 60 + ss,
                 name=name, queue=args.queue, ncpus=args.ncpus,
                 model=args.model, walltime=wall, group=args.group_list,
                 logname=f"phonon_{k:02d}.log", ndirs=len(batch),
