@@ -46,11 +46,11 @@ CURV_RE = re.compile(r"mincurv=\s*([-0-9.eE]+)\s+energy=\s*([-0-9.eE]+)"
                      r"\s+grad_norm=\s*([-0-9.eE]+)")
 
 ACTIONS = {                       # class -> (action, walltime, queue)
-    "CROSSED_NEAR_CONV": ("continue", "120:00:00", "long"),
-    "CROSSED_SLOW":      ("continue", "120:00:00", "long"),
-    "STUCK_NEGATIVE":    ("symbreak", "120:00:00", "long"),
-    "POSITIVE_ONLY":     ("gate",     "120:00:00", "long"),
-    "BARELY_STARTED":    ("gate",     "120:00:00", "long"),
+    "CROSSED_NEAR_CONV": ("continue", "08:00:00", "normal"),
+    "CROSSED_SLOW":      ("continue", "24:00:00", "long"),
+    "STUCK_NEGATIVE":    ("symbreak", "24:00:00", "long"),
+    "POSITIVE_ONLY":     ("gate",     "08:00:00", "normal"),
+    "BARELY_STARTED":    ("gate",     "24:00:00", "long"),
 }
 
 PBS = """#!/bin/bash
@@ -110,9 +110,17 @@ PREP = {
     "gate":     "# -c 0.05 gates ID on the relaxation magnitude (default 0 = always on)\n",
     "symbreak": """# break symmetry so the soft mode has a direction to relax along.
 # cellcvrt jitters atoms and cell while PRESERVING the SQS/DLM decoration.
+#
+# BASE STRUCTURE: str_relax.out when it exists, NOT str.out. The ATAT manual
+# says `cellcvrt ... < str.out`, but that assumes a fresh directory. Applied
+# to a run that has already relaxed, jittering the ideal lattice throws the
+# relaxation away -- observed to send grad_norm from ~17 to ~4500 and the
+# energy up by ~1 eV/atom. Jittering the relaxed geometry keeps the work.
 if [ ! -s str_hint.out ]; then
-    cellcvrt -ja={ja} -jc={jc} < str.out > str_hint.out || exit 1
-    echo ">> wrote str_hint.out (jitter ja={ja} jc={jc})"
+    BASE=str.out
+    [ -s str_relax.out ] && BASE=str_relax.out
+    cellcvrt -ja={ja} -jc={jc} < "$BASE" > str_hint.out || exit 1
+    echo ">> wrote str_hint.out from $BASE (jitter ja={ja} jc={jc})"
 fi
 # manual: "str_beg.out and str_end.out contain the extremities of the path.
 #          If you want to restart from scratch, delete these files."
@@ -127,6 +135,13 @@ FLAGS = {
     "gate":     "-id -c {c}",
     "symbreak": "-id -c {c} -ja {ja} -jc {jc}",
 }
+# Documented lower-accuracy path (ATAT CALPHAD paper): "call robustrelax_xxxx
+# without the -id option. In this case, the code simply calculates the energy
+# profile between the unrelaxed and fully relaxed geometries via a linear
+# interpolation and computes the inflection point along this one-dimensional
+# cross-section." For runs the epicycle will not converge.
+FLAGS_NOID = {k: v.replace("-cip -id", "-cip").replace("-id ", "")
+              for k, v in FLAGS.items()}
 
 
 def parse_log(path):
@@ -240,6 +255,10 @@ def main():
                     help="a run whose newest file is older than this is "
                          "treated as dead and eligible for relaunch "
                          "(default: 60)")
+    ap.add_argument("--no-id", action="store_true",
+                    help="drop -id: use the documented linear-interpolation "
+                         "inflection instead of the epicycle. Lower accuracy, "
+                         "much cheaper -- for runs -id will not converge")
     ap.add_argument("--force", action="store_true",
                     help="relaunch even if files were touched recently")
     ap.add_argument("--jobfile", default="relaunch_id.pbs")
@@ -292,7 +311,7 @@ def main():
             atat_bin=args.atat_bin, vasp_bin=args.vasp_bin, cls=cls, why=why,
             c0=c[0], cN=c[-1], gN=g[-1], n=len(c),
             prep=SEMA + PREP[act].format(ja=args.ja, jc=args.jc),
-            flags=FLAGS[act].format(c=args.cutoff, ja=args.ja, jc=args.jc))
+            flags=(FLAGS_NOID if args.no_id else FLAGS)[act].format(c=args.cutoff, ja=args.ja, jc=args.jc))
         path = os.path.join(d, args.jobfile)
         with open(path, "w") as fh:
             fh.write(body)
