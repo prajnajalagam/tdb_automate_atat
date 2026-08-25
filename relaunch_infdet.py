@@ -46,11 +46,15 @@ CURV_RE = re.compile(r"mincurv=\s*([-0-9.eE]+)\s+energy=\s*([-0-9.eE]+)"
                      r"\s+grad_norm=\s*([-0-9.eE]+)")
 
 ACTIONS = {                       # class -> (action, walltime, queue)
-    "CROSSED_NEAR_CONV": ("continue", "08:00:00", "normal"),
-    "CROSSED_SLOW":      ("continue", "24:00:00", "long"),
-    "STUCK_NEGATIVE":    ("symbreak", "24:00:00", "long"),
-    "POSITIVE_ONLY":     ("gate",     "08:00:00", "normal"),
-    "BARELY_STARTED":    ("gate",     "24:00:00", "long"),
+    "CROSSED_NEAR_CONV": ("continue", "120:00:00", "long"),
+    "CROSSED_SLOW":      ("continue", "120:00:00", "long"),
+    "STUCK_NEGATIVE":    ("symbreak", "120:00:00", "long"),
+    "POSITIVE_ONLY":     ("gate",     "120:00:00", "long"),
+    "BARELY_STARTED":    ("gate",     "120:00:00", "long"),
+    # infdet.log exists but holds no mincurv lines -- a restart truncated it,
+    # or the epicycle never got far enough to print one. There is nothing to
+    # classify, but a plain restart is still the right action, so do not skip.
+    "NO_TRAJECTORY":     ("gate",     "120:00:00", "long"),
 }
 
 PBS = """#!/bin/bash
@@ -158,10 +162,10 @@ def parse_log(path):
 
 
 def classify(pts):
+    if not pts:
+        return "NO_TRAJECTORY"
     c = [p[0] for p in pts]; g = [p[2] for p in pts]
     n = len(c)
-    if n == 0:
-        return None
     crossed = min(c) < 0 < max(c)
     gt = g[max(0, n - 8):]
     mean_g = sum(gt) / len(gt)
@@ -282,8 +286,6 @@ def main():
             skipped.append((dp, f"active {age:.0f} min ago - may be live"))
             continue
         pts = parse_log(log)
-        if not pts:
-            skipped.append((dp, "no mincurv lines in infdet.log")); continue
         cls = classify(pts)
         if only and cls not in only:
             skipped.append((dp, f"{cls} not selected")); continue
@@ -300,7 +302,8 @@ def main():
     for i, (d, cls, pts) in enumerate(sorted(plan), 1):
         act, wall, queue = ACTIONS[cls]
         counts[act] = counts.get(act, 0) + 1
-        c = [p[0] for p in pts]; g = [p[2] for p in pts]
+        c = [p[0] for p in pts] or [float("nan")]
+        g = [p[2] for p in pts] or [float("nan")]
         why = {"continue": "on track, ran out of walltime -- continue with -cip",
                "symbreak": "soft mode never flattens -- break symmetry and restart",
                "gate":     "may not need ID at all -- gate on -c and restart"}[act]
